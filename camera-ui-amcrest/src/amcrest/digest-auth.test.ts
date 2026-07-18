@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { test } from 'node:test';
 
-import { buildDigestAuthHeader, parseWwwAuthenticate } from './digest-auth.js';
+import { buildDigestAuthHeader, parseWwwAuthenticate, selectQop } from './digest-auth.js';
 
 const md5 = (s: string) => createHash('md5').update(s).digest('hex');
 
@@ -40,4 +40,24 @@ test('buildDigestAuthHeader computes the RFC 2617 response with qop=auth', () =>
   assert.ok(header.includes(`nc=00000001`));
   assert.ok(header.includes(`cnonce="deadbeef"`));
   assert.ok(header.includes(`response="${expectedResponse}"`));
+});
+
+test('selectQop returns auth when only auth is offered', () => {
+  assert.equal(selectQop('auth'), 'auth');
+});
+
+test('selectQop prefers auth over auth-int regardless of order', () => {
+  assert.equal(selectQop('auth-int,auth'), 'auth');
+});
+
+test('selectQop falls back to legacy digest when only auth-int is offered', () => {
+  assert.equal(selectQop('auth-int'), undefined);
+});
+
+test('selectQop returns undefined when no qop is present', () => {
+  assert.equal(selectQop(undefined), undefined);
+});
+
+test('selectQop returns undefined for an empty qop string', () => {
+  assert.equal(selectQop(''), undefined);
 });

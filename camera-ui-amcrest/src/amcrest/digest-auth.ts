@@ -27,6 +27,16 @@ export function parseWwwAuthenticate(header: string): Record<string, string> {
   return out;
 }
 
+export function selectQop(challengeQop: string | undefined): string | undefined {
+  if (!challengeQop) return undefined;
+  const tokens = challengeQop
+    .split(',')
+    .map((t) => t.trim())
+    .filter((t) => t.length > 0);
+  if (tokens.length === 0) return undefined;
+  return tokens.includes('auth') ? 'auth' : undefined;
+}
+
 export function buildDigestAuthHeader(p: DigestParams): string {
   const qop = p.qop;
   const nc = p.nc ?? '00000001';
@@ -85,7 +95,7 @@ export async function digestFetch(opts: DigestFetchOptions): Promise<Response> {
     nonce: c.nonce ?? '',
     method,
     uri,
-    qop: c.qop ? c.qop.split(',')[0].trim() : undefined,
+    qop: selectQop(c.qop),
     opaque: c.opaque,
     algorithm: c.algorithm,
   });
