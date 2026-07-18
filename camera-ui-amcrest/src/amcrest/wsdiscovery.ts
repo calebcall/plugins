@@ -6,6 +6,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { createSocket } from 'node:dgram';
+import { networkInterfaces } from 'node:os';
 
 export interface WsDiscovered {
   ip: string;
@@ -97,35 +98,50 @@ export interface WsDiscoveryLogger {
 
 const PROBE_RESEND_MS = 1200;
 
+function localIPv4Addresses(): string[] {
+  const nifs = networkInterfaces();
+  const addrs: string[] = [];
+  for (const list of Object.values(nifs)) {
+    for (const ni of list ?? []) {
+      if (ni.family === 'IPv4' && !ni.internal) addrs.push(ni.address);
+    }
+  }
+  return addrs;
+}
+
 export async function discoverWs(timeoutMs: number, logger: WsDiscoveryLogger): Promise<WsDiscovered[]> {
   return new Promise((resolvePromise) => {
     const found = new Map<string, WsDiscovered>();
     const seen = new Set<string>();
-    const socket = createSocket({ type: 'udp4', reuseAddr: true });
+    const sockets: ReturnType<typeof createSocket>[] = [];
+    const senders: (() => void)[] = [];
+    const cleanups: (() => void)[] = [];
     let finished = false;
-    let resendTimer: NodeJS.Timeout | undefined;
+
+    // Probe from every non-internal IPv4 interface; a single default-interface
+    // probe misses cameras reachable only via another NIC/VLAN/bridge.
+    const addrs = localIPv4Addresses();
+    logger.log(`WS-Discovery: probing ${addrs.length} interface(s): ${addrs.length ? addrs.join(', ') : '(default only)'}`);
+    const bindTargets: (string | undefined)[] = addrs.length ? addrs : [undefined];
 
     const timer = setTimeout(finish, timeoutMs);
+    cleanups.push(() => clearTimeout(timer));
 
     function finish() {
       if (finished) return;
       finished = true;
-      clearTimeout(timer);
-      if (resendTimer) clearInterval(resendTimer);
-      try {
-        socket.close();
-      } catch {
-        // ignore
+      for (const c of cleanups) c();
+      for (const s of sockets) {
+        try {
+          s.close();
+        } catch {
+          // ignore
+        }
       }
       resolvePromise(Array.from(found.values()));
     }
 
-    socket.on('error', (err) => {
-      logger.debug('WS-Discovery socket error:', err);
-      finish();
-    });
-
-    socket.on('message', (msg) => {
+    function handleMessage(msg: Buffer) {
       const device = parseWsProbeMatch(msg.toString('utf8'));
       if (!device || seen.has(device.ip)) return;
       seen.add(device.ip);
@@ -136,20 +152,36 @@ export async function discoverWs(timeoutMs: number, logger: WsDiscoveryLogger): 
       if (amcrest) {
         found.set(device.ip, device);
       }
-    });
+    }
 
-    socket.bind(() => {
-      // Multicast replies are lossy; resend the probe several times across the
-      // window so slow/missed devices still answer (dedup handles repeats).
-      const send = () => {
+    for (const addr of bindTargets) {
+      const socket = createSocket({ type: 'udp4', reuseAddr: true });
+      sockets.push(socket);
+      // One socket failing (e.g. bind conflict) must not abort the whole scan.
+      socket.on('error', (err) => logger.debug(`WS-Discovery socket error (${addr ?? '*'}):`, err));
+      socket.on('message', handleMessage);
+      socket.bind(addr ? { address: addr, port: 0 } : { port: 0 }, () => {
         try {
-          socket.send(Buffer.from(buildWsDiscoveryProbe(randomUUID()), 'utf8'), WSD_PORT, WSD_ADDR);
+          socket.setBroadcast(true);
+          if (addr) socket.setMulticastInterface(addr);
         } catch (err) {
-          logger.debug('WS-Discovery send failed:', err);
+          logger.debug(`WS-Discovery setup failed (${addr ?? '*'}):`, err);
         }
-      };
-      send();
-      resendTimer = setInterval(send, PROBE_RESEND_MS);
-    });
+        senders.push(() => {
+          try {
+            socket.send(Buffer.from(buildWsDiscoveryProbe(randomUUID()), 'utf8'), WSD_PORT, WSD_ADDR);
+          } catch (err) {
+            logger.debug(`WS-Discovery send failed (${addr ?? '*'}):`, err);
+          }
+        });
+      });
+    }
+
+    // Resend across the window (dedup handles repeats); the first tick gives the
+    // per-interface binds time to register their senders.
+    const sendAll = () => senders.forEach((s) => s());
+    const firstSend = setTimeout(sendAll, 100);
+    const resend = setInterval(sendAll, PROBE_RESEND_MS);
+    cleanups.push(() => clearTimeout(firstSend), () => clearInterval(resend));
   });
 }
