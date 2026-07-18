@@ -1,9 +1,9 @@
 {
   "displayName": "Amcrest",
   "name": "@camera.ui/camera-ui-amcrest",
-  "version": "0.0.1",
+  "version": "1.0.0",
   "description": "Integrates Amcrest and Dahua-compatible IP cameras, doorbells and PTZ cameras into camera.ui via their native CGI API, with discovery, live streaming, two-way audio, PTZ, and motion, object, audio and doorbell events.",
-  "author": "seydx (https://github.com/cameraui/plugins)",
+  "author": "calebcall (https://github.com/calebcall/plugins)",
   "type": "module",
   "main": "./bundle/dist/index.js",
   "scripts": {
@@ -46,10 +46,23 @@
   "os": [],
   "cpu": [],
   "license": "MIT",
-  "keywords": ["camera-ui-plugin", "amcrest", "dahua", "doorbell", "ptz", "discovery"],
-  "bugs": { "url": "https://github.com/cameraui/plugins/issues" },
-  "homepage": "https://github.com/cameraui/plugins/tree/main/camera-ui-amcrest#readme",
-  "repository": { "type": "git", "url": "git+https://github.com/cameraui/plugins.git", "directory": "camera-ui-amcrest" },
+  "keywords": [
+    "camera-ui-plugin",
+    "amcrest",
+    "dahua",
+    "doorbell",
+    "ptz",
+    "discovery"
+  ],
+  "bugs": {
+    "url": "https://github.com/calebcall/plugins/issues"
+  },
+  "homepage": "https://github.com/calebcall/plugins/tree/main/camera-ui-amcrest#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/calebcall/plugins.git",
+    "directory": "camera-ui-amcrest"
+  },
   "allowScripts": {
     "node-av@6.2.0-beta.7": true
   }
