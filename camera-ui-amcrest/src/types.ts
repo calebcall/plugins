@@ -19,6 +19,13 @@ export interface AmcrestInitialSettings {
   httpPort?: number;
 }
 
+// Plugin-level settings form (camera.ui shows these on the plugin's own page).
+// Used to manually register a camera by IP when discovery can't reach it.
+export interface AmcrestPluginStorage {
+  manualHost?: string;
+  manualName?: string;
+}
+
 export interface AmcrestCapabilities {
   deviceType?: string;
   doorbell: boolean;

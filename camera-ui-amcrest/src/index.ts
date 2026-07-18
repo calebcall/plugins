@@ -5,13 +5,14 @@ import { AmcrestClient } from './amcrest/api.js';
 import { discover } from './amcrest/discovery.js';
 import { AmcrestCamera } from './camera.js';
 
-import type { AmcrestInitialSettings } from './types.js';
+import type { AmcrestInitialSettings, AmcrestPluginStorage } from './types.js';
 import type {
   CameraConfig,
   CameraDevice,
   DeviceStorage,
   DiscoveredCamera,
   DiscoveryProvider,
+  JsonSchema,
   JsonSchemaWithoutCallbacks,
   LoggerService,
   PluginAPI,
@@ -21,7 +22,7 @@ const DISCOVERY_TIMEOUT_MS = 5000;
 const DEFAULT_RTSP_PORT = 554;
 const DEFAULT_HTTP_PORT = 80;
 
-export default class AmcrestPlugin extends BasePlugin implements DiscoveryProvider {
+export default class AmcrestPlugin extends BasePlugin<AmcrestPluginStorage> implements DiscoveryProvider {
   private cameras = new Map<string, AmcrestCamera>();
   private existing = new Map<string, CameraDevice>();
   // Adoption-form fields (ip/username/password/channel/port/httpPort) resolved in
@@ -30,9 +31,59 @@ export default class AmcrestPlugin extends BasePlugin implements DiscoveryProvid
   // hands them to AmcrestCamera.initialize() to persist into its own storage.
   private pendingSettings = new Map<string, AmcrestInitialSettings>();
 
-  constructor(logger: LoggerService, api: PluginAPI, storage: DeviceStorage<any>) {
+  constructor(logger: LoggerService, api: PluginAPI, storage: DeviceStorage<AmcrestPluginStorage>) {
     super(logger, api, storage);
     this.api.on(API_EVENT.SHUTDOWN, this.stop.bind(this));
+  }
+
+  // Plugin-level settings form: lets the user register a camera by IP when Dahua
+  // discovery can't reach it. Pressing "Add Camera" pushes it into the adoption
+  // list, where onGetCameraSettings/onAdoptCamera complete the credentials flow.
+  override get storageSchema(): JsonSchema[] {
+    return [
+      {
+        type: 'string',
+        key: 'manualHost',
+        title: 'Add Camera — IP Address',
+        description: 'Enter the camera or doorbell IP (e.g. 192.168.1.50), then press "Add Camera". It will appear in the list of cameras to adopt.',
+        required: false,
+        store: true,
+      },
+      {
+        type: 'string',
+        key: 'manualName',
+        title: 'Add Camera — Name (optional)',
+        description: 'Optional display name for the manually added camera.',
+        required: false,
+        store: true,
+      },
+      {
+        type: 'button',
+        key: 'addManual',
+        title: 'Add Camera',
+        color: 'success',
+        description: 'Register the camera at the IP above so it can be adopted.',
+        onSet: async () => {
+          await this.addManualCamera();
+        },
+      },
+    ];
+  }
+
+  private async addManualCamera(): Promise<void> {
+    const host = String(this.storage.values.manualHost ?? '').trim();
+    if (!host) {
+      this.logger.attention('Enter an IP address before pressing "Add Camera".');
+      return;
+    }
+    const id = `amcrest-${host}`;
+    if (Array.from(this.existing.values()).some((c) => c.nativeId === id)) {
+      this.logger.attention(`A camera for ${host} has already been added.`);
+      return;
+    }
+    const name = String(this.storage.values.manualName ?? '').trim() || `Amcrest (${host})`;
+    await this.api.deviceManager.pushDiscoveredCameras([{ id, name, address: host }]);
+    this.logger.log(`Manual Amcrest camera added: ${name} (${host}). Adopt it from the camera list to enter credentials.`);
   }
 
   async configureCameras(cameras: CameraDevice[]): Promise<void> {
@@ -62,9 +113,9 @@ export default class AmcrestPlugin extends BasePlugin implements DiscoveryProvid
       .map((d) => ({ id: `amcrest-${d.ip}`, name: d.deviceType ? `Amcrest ${d.deviceType}` : `Amcrest (${d.ip})`, model: d.deviceType, address: d.ip }));
   }
 
-  async onGetCameraSettings(_camera: DiscoveredCamera): Promise<JsonSchemaWithoutCallbacks[]> {
+  async onGetCameraSettings(camera: DiscoveredCamera): Promise<JsonSchemaWithoutCallbacks[]> {
     return [
-      { type: 'string', key: 'ip', title: 'IP Address', description: 'Camera IP address, e.g. 192.168.1.50', required: true },
+      { type: 'string', key: 'ip', title: 'IP Address', description: 'Camera IP address, e.g. 192.168.1.50', required: true, defaultValue: camera.address },
       { type: 'string', key: 'username', title: 'Username', description: 'Amcrest account username.', required: true },
       { type: 'string', format: 'password', key: 'password', title: 'Password', description: 'Amcrest account password.', required: true },
       { type: 'number', key: 'channel', title: 'Channel', description: 'Camera channel (default 1).', required: false, defaultValue: 1 },
