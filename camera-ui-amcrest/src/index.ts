@@ -20,7 +20,7 @@ import type {
   PluginAPI,
 } from '@camera.ui/sdk';
 
-const DISCOVERY_TIMEOUT_MS = 5000;
+const DISCOVERY_TIMEOUT_MS = 6000;
 const DEFAULT_RTSP_PORT = 554;
 const DEFAULT_HTTP_PORT = 80;
 
@@ -85,7 +85,7 @@ export default class AmcrestPlugin extends BasePlugin<AmcrestPluginStorage> impl
     }
     const name = (fields.manualName ?? '').trim() || `Amcrest (${host})`;
     try {
-      await this.api.deviceManager.pushDiscoveredCameras([{ id, name, address: host }]);
+      await this.api.deviceManager.pushDiscoveredCameras([{ id, name, manufacturer: 'Amcrest', address: host }]);
     } catch (error) {
       this.logger.error('Failed to add manual Amcrest camera:', error);
       return { toast: { type: 'error', message: `Failed to add camera ${host}: ${String(error)}` } };
@@ -133,20 +133,25 @@ export default class AmcrestPlugin extends BasePlugin<AmcrestPluginStorage> impl
       }),
     ]);
 
-    const byIp = new Map<string, { model?: string; name?: string }>();
+    const byIp = new Map<string, { model?: string }>();
     for (const d of dahua) {
-      byIp.set(d.ip, { model: d.deviceType, name: d.deviceType ? `Amcrest ${d.deviceType}` : undefined });
+      byIp.set(d.ip, { model: d.deviceType });
     }
     for (const d of ws) {
-      const model = d.hardware ?? byIp.get(d.ip)?.model;
-      byIp.set(d.ip, { model, name: d.name ? `Amcrest ${d.name}` : model ? `Amcrest ${model}` : undefined });
+      byIp.set(d.ip, { model: d.hardware ?? byIp.get(d.ip)?.model });
     }
 
     this.logger.log(`Amcrest discovery: ${byIp.size} device(s) found (WS-Discovery: ${ws.length}, DHIP: ${dahua.length})`);
 
     return Array.from(byIp.entries())
       .filter(([ip]) => !Array.from(this.existing.values()).some((c) => c.nativeId === `amcrest-${ip}`))
-      .map(([ip, info]) => ({ id: `amcrest-${ip}`, name: info.name ?? `Amcrest (${ip})`, model: info.model, address: ip }));
+      .map(([ip, info]) => ({
+        id: `amcrest-${ip}`,
+        name: info.model ? `Amcrest ${info.model}` : `Amcrest (${ip})`,
+        manufacturer: 'Amcrest',
+        model: info.model,
+        address: ip,
+      }));
   }
 
   async onGetCameraSettings(camera: DiscoveredCamera): Promise<JsonSchemaWithoutCallbacks[]> {

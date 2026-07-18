@@ -95,11 +95,15 @@ export interface WsDiscoveryLogger {
   log: (...a: unknown[]) => void;
 }
 
+const PROBE_RESEND_MS = 1200;
+
 export async function discoverWs(timeoutMs: number, logger: WsDiscoveryLogger): Promise<WsDiscovered[]> {
   return new Promise((resolvePromise) => {
     const found = new Map<string, WsDiscovered>();
+    const seen = new Set<string>();
     const socket = createSocket({ type: 'udp4', reuseAddr: true });
     let finished = false;
+    let resendTimer: NodeJS.Timeout | undefined;
 
     const timer = setTimeout(finish, timeoutMs);
 
@@ -107,6 +111,7 @@ export async function discoverWs(timeoutMs: number, logger: WsDiscoveryLogger): 
       if (finished) return;
       finished = true;
       clearTimeout(timer);
+      if (resendTimer) clearInterval(resendTimer);
       try {
         socket.close();
       } catch {
@@ -122,23 +127,29 @@ export async function discoverWs(timeoutMs: number, logger: WsDiscoveryLogger): 
 
     socket.on('message', (msg) => {
       const device = parseWsProbeMatch(msg.toString('utf8'));
-      if (!device) return;
+      if (!device || seen.has(device.ip)) return;
+      seen.add(device.ip);
       const amcrest = isAmcrestDevice(device.scopes);
       logger.log(
         `WS-Discovery: ip=${device.ip} manufacturer=${device.manufacturer ?? '?'} name=${device.name ?? '?'} hardware=${device.hardware ?? '?'} amcrest=${amcrest}`,
       );
-      if (amcrest && !found.has(device.ip)) {
+      if (amcrest) {
         found.set(device.ip, device);
       }
     });
 
     socket.bind(() => {
-      try {
-        const probe = Buffer.from(buildWsDiscoveryProbe(randomUUID()), 'utf8');
-        socket.send(probe, WSD_PORT, WSD_ADDR);
-      } catch (err) {
-        logger.debug('WS-Discovery send failed:', err);
-      }
+      // Multicast replies are lossy; resend the probe several times across the
+      // window so slow/missed devices still answer (dedup handles repeats).
+      const send = () => {
+        try {
+          socket.send(Buffer.from(buildWsDiscoveryProbe(randomUUID()), 'utf8'), WSD_PORT, WSD_ADDR);
+        } catch (err) {
+          logger.debug('WS-Discovery send failed:', err);
+        }
+      };
+      send();
+      resendTimer = setInterval(send, PROBE_RESEND_MS);
     });
   });
 }
