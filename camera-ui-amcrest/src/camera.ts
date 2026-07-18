@@ -5,7 +5,7 @@ import { AvSource, BackchannelTranscoder, Relay } from '@seydx/rtsp';
 import { AmcrestClient } from './amcrest/api.js';
 import { classifyAmcrestEvent } from './amcrest/classify.js';
 import { digestFetch } from './amcrest/digest-auth.js';
-import { splitEventMultipart } from './amcrest/event-reader.js';
+import { extractCompleteEvents } from './amcrest/event-reader.js';
 import { parseAmcrestEvent } from './amcrest/events.js';
 import { selectTalkbackTarget } from './amcrest/talkback.js';
 import { AmcrestAudioSensor, AmcrestDoorbellTrigger, AmcrestMotionSensor, AmcrestObjectSensor, AmcrestPTZSensor } from './sensors/index.js';
@@ -141,7 +141,14 @@ export class AmcrestCamera {
       });
       this.transcoderStarting = this.transcoder.start();
     }
-    this.transcoderStarting?.then(() => this.transcoder?.push(rtp)).catch((e) => this.log.error('Talkback transcode failed:', e));
+    this.transcoderStarting
+      ?.then(() => this.transcoder?.push(rtp))
+      .catch((e) => {
+        this.log.error('Talkback transcode failed:', e);
+        // Reset so the next RTP packet re-initializes a fresh transcoder/POST instead
+        // of getting stuck behind the `if (!this.transcoder)` guard forever.
+        this.resetTalkback();
+      });
   }
 
   private openTalkbackPost(contentType: string, body: PassThrough): void {
@@ -157,7 +164,8 @@ export class AmcrestCamera {
   }
 
   private resetTalkback(): void {
-    this.transcoder?.close();
+    // Fire-and-forget: close() failures must not become unhandled rejections.
+    void this.transcoder?.close().catch(() => {});
     this.transcoder = undefined;
     this.transcoderStarting = undefined;
     this.talkbackBody?.end();
@@ -204,11 +212,9 @@ export class AmcrestCamera {
         buffer += decoder.decode(chunk, { stream: true });
         const boundary = this.detectBoundary(buffer);
         if (!boundary) continue;
-        const blobs = splitEventMultipart(buffer, boundary);
+        const { blobs, rest } = extractCompleteEvents(buffer, boundary);
         for (const blob of blobs) this.dispatchEvent(blob);
-        // Keep only the trailing partial section after the last boundary marker.
-        const lastIdx = buffer.lastIndexOf(`--${boundary}`);
-        if (lastIdx > 0) buffer = buffer.substring(lastIdx);
+        buffer = rest;
         if (buffer.length > 1_000_000) buffer = '';
       }
     } catch (error) {

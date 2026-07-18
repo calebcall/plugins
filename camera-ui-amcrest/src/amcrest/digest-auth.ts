@@ -100,10 +100,18 @@ export async function digestFetch(opts: DigestFetchOptions): Promise<Response> {
     algorithm: c.algorithm,
   });
 
-  return fetch(opts.url, {
+  const init: RequestInit & { duplex?: 'half' } = {
     method,
     headers: { ...opts.headers, authorization: authHeader },
     body: opts.body,
     signal: opts.signal,
-  });
+  };
+  // Node's fetch requires an explicit duplex mode whenever a body is present
+  // (e.g. a PassThrough stream for talkback audio); omitting it throws
+  // "duplex option is required when sending a body".
+  if (opts.body) {
+    init.duplex = 'half';
+  }
+
+  return fetch(opts.url, init);
 }
