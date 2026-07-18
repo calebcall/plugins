@@ -5,6 +5,7 @@ import { AmcrestClient } from './amcrest/api.js';
 import { discover } from './amcrest/discovery.js';
 import { AmcrestCamera } from './camera.js';
 
+import type { AmcrestInitialSettings } from './types.js';
 import type {
   CameraConfig,
   CameraDevice,
@@ -17,10 +18,17 @@ import type {
 } from '@camera.ui/sdk';
 
 const DISCOVERY_TIMEOUT_MS = 5000;
+const DEFAULT_RTSP_PORT = 554;
+const DEFAULT_HTTP_PORT = 80;
 
 export default class AmcrestPlugin extends BasePlugin implements DiscoveryProvider {
   private cameras = new Map<string, AmcrestCamera>();
   private existing = new Map<string, CameraDevice>();
+  // Adoption-form fields (ip/username/password/channel/port/httpPort) resolved in
+  // onAdoptCamera. The SDK only persists the CameraConfig returned from onAdoptCamera,
+  // not these settings, so they're bridged here to onCameraAdded -> initCamera, which
+  // hands them to AmcrestCamera.initialize() to persist into its own storage.
+  private pendingSettings = new Map<string, AmcrestInitialSettings>();
 
   constructor(logger: LoggerService, api: PluginAPI, storage: DeviceStorage<any>) {
     super(logger, api, storage);
@@ -36,7 +44,9 @@ export default class AmcrestPlugin extends BasePlugin implements DiscoveryProvid
 
   async onCameraAdded(camera: CameraDevice): Promise<void> {
     this.existing.set(camera.id, camera);
-    await this.initCamera(camera);
+    const initialSettings = camera.nativeId ? this.pendingSettings.get(camera.nativeId) : undefined;
+    await this.initCamera(camera, initialSettings);
+    if (camera.nativeId) this.pendingSettings.delete(camera.nativeId);
   }
 
   async onCameraReleased(cameraId: string): Promise<void> {
@@ -58,6 +68,8 @@ export default class AmcrestPlugin extends BasePlugin implements DiscoveryProvid
       { type: 'string', key: 'username', title: 'Username', description: 'Amcrest account username.', required: true },
       { type: 'string', format: 'password', key: 'password', title: 'Password', description: 'Amcrest account password.', required: true },
       { type: 'number', key: 'channel', title: 'Channel', description: 'Camera channel (default 1).', required: false, defaultValue: 1 },
+      { type: 'number', key: 'port', title: 'RTSP Port', description: 'RTSP port (default 554).', required: false, defaultValue: DEFAULT_RTSP_PORT },
+      { type: 'number', key: 'httpPort', title: 'HTTP Port', description: 'HTTP/CGI port (default 80).', required: false, defaultValue: DEFAULT_HTTP_PORT },
     ];
   }
 
@@ -66,11 +78,13 @@ export default class AmcrestPlugin extends BasePlugin implements DiscoveryProvid
     const username = settings.username as string;
     const password = settings.password as string;
     const channel = (settings.channel as number) || 1;
+    const port = (settings.port as number) || DEFAULT_RTSP_PORT;
+    const httpPort = (settings.httpPort as number) || DEFAULT_HTTP_PORT;
     if (!ip || !username || !password) {
       throw new Error('IP address, username and password are required');
     }
 
-    const client = new AmcrestClient({ ip, username, password });
+    const client = new AmcrestClient({ ip, username, password, port, httpPort });
     const info = await client.getSystemInfo(); // throws 'not amcrest' if wrong device
     const streams = await client.getStreams(channel);
     if (streams.length === 0) {
@@ -78,25 +92,30 @@ export default class AmcrestPlugin extends BasePlugin implements DiscoveryProvid
     }
 
     const name = camera.name || (info.deviceType ? `Amcrest ${info.deviceType}` : `Amcrest (${ip})`);
+    const nativeId = `amcrest-${ip}`;
     const config = buildCameraConfig({
       name,
-      nativeId: `amcrest-${ip}`,
+      nativeId,
       ip,
       username,
       password,
-      port: 554,
+      port,
       channel,
       info: { manufacturer: 'Amcrest', model: info.deviceType, serialNumber: info.serialNumber, firmwareVersion: info.hardwareVersion },
       streams,
     });
+    // Config is returned to the SDK (persisted), but ip/username/password/etc are not
+    // part of it — stash them here so onCameraAdded can hand them to
+    // AmcrestCamera.initialize() to persist into the camera's own storage.
+    this.pendingSettings.set(nativeId, { ip, username, password, channel, port, httpPort });
     this.logger.log(`Amcrest device adopted: ${name} (${streams.length} stream(s))`);
     return config;
   }
 
-  private async initCamera(camera: CameraDevice): Promise<void> {
+  private async initCamera(camera: CameraDevice, initialSettings?: AmcrestInitialSettings): Promise<void> {
     const controller = new AmcrestCamera(camera);
     this.cameras.set(camera.id, controller);
-    await controller.initialize();
+    await controller.initialize(initialSettings);
   }
 
   private async stop(): Promise<void> {

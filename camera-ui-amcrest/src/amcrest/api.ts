@@ -63,6 +63,11 @@ export class AmcrestClient {
     await this.fetch(q);
   }
 
+  async getPtzCaps(channel: number): Promise<string> {
+    const res = await this.fetch(`/cgi-bin/ptz.cgi?action=getCurrentProtocolCaps&channel=${channel}`);
+    return await res.text();
+  }
+
   async attachEvents(signal: AbortSignal): Promise<ReadableStream<Uint8Array>> {
     const res = await this.fetch('/cgi-bin/eventManager.cgi?action=attach&codes=[All]', { signal });
     if (!res.body) {

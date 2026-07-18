@@ -14,3 +14,7 @@ test('unknown device defaults to AAC', () => {
 test('dahua device uses G.711A', () => {
   assert.deepEqual(selectTalkbackTarget('DH-VTO2211'), { codec: 'pcm_alaw', contentType: 'Audio/G.711A', sampleRate: 8000 });
 });
+
+test('plain VTO intercom (no DH- prefix) uses G.711A', () => {
+  assert.deepEqual(selectTalkbackTarget('VTO2211'), { codec: 'pcm_alaw', contentType: 'Audio/G.711A', sampleRate: 8000 });
+});

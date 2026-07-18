@@ -4,13 +4,14 @@ import { AvSource, BackchannelTranscoder, Relay } from '@seydx/rtsp';
 
 import { AmcrestClient } from './amcrest/api.js';
 import { classifyAmcrestEvent } from './amcrest/classify.js';
+import { classifyDevice } from './amcrest/device.js';
 import { digestFetch } from './amcrest/digest-auth.js';
 import { extractCompleteEvents } from './amcrest/event-reader.js';
 import { parseAmcrestEvent } from './amcrest/events.js';
 import { selectTalkbackTarget } from './amcrest/talkback.js';
 import { AmcrestAudioSensor, AmcrestDoorbellTrigger, AmcrestMotionSensor, AmcrestObjectSensor, AmcrestPTZSensor } from './sensors/index.js';
 
-import type { AmcrestCapabilities, AmcrestCameraStorage } from './types.js';
+import type { AmcrestCapabilities, AmcrestCameraStorage, AmcrestInitialSettings } from './types.js';
 import type { CameraDevice, DeviceStorage, LoggerService, SnapshotInterface, StreamingInterface } from '@camera.ui/sdk';
 import type { Logger, RtspServerSink } from '@seydx/rtsp';
 
@@ -32,7 +33,10 @@ class Implementations implements StreamingInterface, SnapshotInterface {
 }
 
 export class AmcrestCamera {
-  private readonly client: AmcrestClient;
+  // Built in initialize(), once real connection settings are known (either freshly
+  // persisted from adoption, or already present in storage on a restart). Never
+  // built from the constructor's empty storage — see initialize() for why.
+  private client!: AmcrestClient;
   private readonly storage: DeviceStorage<AmcrestCameraStorage>;
   private readonly log: LoggerService;
 
@@ -51,6 +55,7 @@ export class AmcrestCamera {
 
   private eventAbort?: AbortController;
   private eventReconnectStreak = 0;
+  private reconnectTimer?: NodeJS.Timeout;
   private stopped = false;
 
   private capabilities: AmcrestCapabilities = {
@@ -65,16 +70,32 @@ export class AmcrestCamera {
   constructor(private readonly cameraDevice: CameraDevice) {
     this.log = cameraDevice.logger;
     this.storage = this.createStorage();
-    const v = this.storage.values;
-    this.client = new AmcrestClient({ ip: v.ip, username: v.username, password: v.password, port: v.port, httpPort: v.httpPort });
   }
 
-  async initialize(): Promise<void> {
+  async initialize(initialSettings?: AmcrestInitialSettings): Promise<void> {
+    // Bridge for the adoption flow: the SDK only persists the CameraConfig returned
+    // from onAdoptCamera, not the settings form fields (ip/username/password/...), so
+    // the plugin hands them to us here to apply and persist to storage ourselves.
+    if (initialSettings) {
+      this.storage.values.ip = initialSettings.ip;
+      this.storage.values.username = initialSettings.username;
+      this.storage.values.password = initialSettings.password;
+      if (initialSettings.channel !== undefined) this.storage.values.channel = initialSettings.channel;
+      if (initialSettings.port !== undefined) this.storage.values.port = initialSettings.port;
+      if (initialSettings.httpPort !== undefined) this.storage.values.httpPort = initialSettings.httpPort;
+      await this.storage.save();
+    }
+
     const v = this.storage.values;
     if (!v.ip || !v.username || !v.password) {
       this.cameraDevice.logger.attention('Please configure the Amcrest connection settings');
       return;
     }
+
+    // Built here, after settings are confirmed present (and persisted, if this is a
+    // fresh adoption) — never in the constructor, where storage.values would still be
+    // empty on a brand-new adoption.
+    this.client = new AmcrestClient({ ip: v.ip, username: v.username, password: v.password, port: v.port, httpPort: v.httpPort });
 
     this.capabilities = await this.detectCapabilities();
     await this.setupStreaming();
@@ -85,12 +106,19 @@ export class AmcrestCamera {
   }
 
   async getStreamUrl(): Promise<string> {
+    // Only reachable once implement() has registered Implementations, which happens
+    // after this.client is built in initialize() — but guard anyway in case the SDK
+    // calls in from an unexpected path.
+    if (!this.client) {
+      throw new Error('Amcrest camera is not configured');
+    }
     if (this.rtspServer) return `${this.rtspServer.url}#timeout=30`;
     // Fallback: direct RTSP (no backchannel) if relay unavailable.
     return this.client.rtspUrl(this.channel, 0);
   }
 
   async getSnapshot(): Promise<ArrayBuffer | undefined> {
+    if (!this.client) return undefined;
     try {
       const buf = await this.client.snapshot(this.channel);
       return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) as ArrayBuffer;
@@ -102,6 +130,10 @@ export class AmcrestCamera {
 
   destroy(): void {
     this.stopped = true;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = undefined;
+    }
     this.eventAbort?.abort();
     this.resetTalkback();
     void this.rtspServer?.shutdown();
@@ -184,8 +216,7 @@ export class AmcrestCamera {
     try {
       const info = await this.client.getSystemInfo();
       caps.deviceType = info.deviceType;
-      const dt = (info.deviceType ?? '').toUpperCase();
-      caps.doorbell = dt.startsWith('AD') || dt.includes('DB') || dt.includes('VTO');
+      caps.doorbell = classifyDevice(info.deviceType).isDoorbell;
     } catch (error) {
       this.log.debug('Capability detection (system info) failed:', error);
     }
@@ -254,7 +285,10 @@ export class AmcrestCamera {
     this.eventReconnectStreak++;
     const delay = Math.min(EVENT_RECONNECT_BASE_MS * 2 ** (this.eventReconnectStreak - 1), EVENT_RECONNECT_MAX_MS);
     this.log.debug(`Reconnecting Amcrest event stream in ${delay}ms`);
-    setTimeout(() => this.startEventLoop(), delay);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = undefined;
+      this.startEventLoop();
+    }, delay);
   }
 
   private detectBoundary(buffer: string): string | undefined {
@@ -305,10 +339,9 @@ export class AmcrestCamera {
 }
 
 async function fetchPtzCaps(client: AmcrestClient, channel: number): Promise<{ ptz: boolean; pan: boolean; tilt: boolean; zoom: boolean }> {
-  const res = await fetch(client.urlFor(`/cgi-bin/ptz.cgi?action=getCurrentProtocolCaps&channel=${channel}`)).catch(() => undefined);
-  // Non-authed probe may 401; treat presence of caps.PTZ or a 401 challenge as "device answered".
-  if (!res) return { ptz: false, pan: false, tilt: false, zoom: false };
-  const text = res.status === 401 ? '' : await res.text().catch(() => '');
+  // Routed through the authenticated client (digest auth) — a raw, unauthenticated
+  // fetch here always gets a 401 from real devices and PTZ never gets detected.
+  const text = await client.getPtzCaps(channel).catch(() => '');
   const hasPanTilt = /Left|Right|Up|Down/i.test(text);
   const hasZoom = /Zoom/i.test(text);
   const ptz = hasPanTilt || hasZoom;
