@@ -12,6 +12,7 @@ function fromAmcrestVideoCodec(codec?: string): string | undefined {
   const c = codec?.trim();
   if (c === 'H.264') return 'h264';
   if (c === 'H.265') return 'h265';
+  // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing -- empty string must collapse to undefined, not be treated as a defined value
   return c || undefined;
 }
 
@@ -21,7 +22,7 @@ export function parseEncodeConfig(text: string, channel: number): AmcrestStream[
   const prefix = `table.Encode[${ch}]`;
   const streams: AmcrestStream[] = [];
 
-  const formats: Array<{ role: 'main' | 'sub'; subtype: number; key: string }> = [
+  const formats: { role: 'main' | 'sub'; subtype: number; key: string }[] = [
     { role: 'main', subtype: 0, key: `${prefix}.MainFormat[0]` },
     { role: 'sub', subtype: 1, key: `${prefix}.ExtraFormat[0]` },
   ];
