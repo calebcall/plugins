@@ -188,6 +188,26 @@ export async function discoverWs(timeoutMs: number, logger: WsDiscoveryLogger): 
       });
     }
 
+    // Some Amcrest units reply to the multicast GROUP (239.255.255.250:3702)
+    // instead of unicast to our source port. Listen on 3702 + join the group on
+    // each interface to catch them. Delivered to all joined members, so this
+    // does not interfere with the ONVIF plugin; degrades gracefully if the bind
+    // or membership fails.
+    const mcastSocket = createSocket({ type: 'udp4', reuseAddr: true });
+    sockets.push(mcastSocket);
+    mcastSocket.on('error', (err) => logger.debug('WS-Discovery multicast socket error:', err));
+    mcastSocket.on('message', handleMessage);
+    mcastSocket.bind(WSD_PORT, () => {
+      const targets = addrs.length ? addrs : [undefined];
+      for (const addr of targets) {
+        try {
+          mcastSocket.addMembership(WSD_ADDR, addr);
+        } catch (err) {
+          logger.debug(`WS-Discovery addMembership failed (${addr ?? '*'}):`, err);
+        }
+      }
+    });
+
     // Resend across the window (dedup handles repeats); the first tick gives the
     // per-interface binds time to register their senders.
     const sendAll = () => senders.forEach((s) => s());
