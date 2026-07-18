@@ -148,7 +148,8 @@ export async function discoverWs(timeoutMs: number, logger: WsDiscoveryLogger): 
         // Diagnostic: a reply we received but could not parse (unexpected format).
         if (!seen.has(src)) {
           seen.add(src);
-          logger.log(`WS-Discovery: unparsed reply from ${src} (len=${msg.length}): ${msg.toString('utf8').slice(0, 200).replace(/\s+/g, ' ')}`);
+          const snippet = msg.toString('utf8').slice(0, 200).replace(/\s+/g, ' ');
+          logger.log(`WS-Discovery: unparsed reply from ${src} (len=${msg.length}): ${snippet}`);
         }
         return;
       }
