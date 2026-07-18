@@ -156,9 +156,10 @@ export async function discoverWs(timeoutMs: number, logger: WsDiscoveryLogger): 
       if (seen.has(device.ip)) return;
       seen.add(device.ip);
       const amcrest = isAmcrestDevice(device.scopes);
-      logger.log(
-        `WS-Discovery: ip=${device.ip} (via ${src}) manufacturer=${device.manufacturer ?? '?'} name=${device.name ?? '?'} hardware=${device.hardware ?? '?'} amcrest=${amcrest}`,
-      );
+      const mfr = device.manufacturer ?? '?';
+      const name = device.name ?? '?';
+      const hw = device.hardware ?? '?';
+      logger.log(`WS-Discovery: ip=${device.ip} (via ${src}) manufacturer=${mfr} name=${name} hardware=${hw} amcrest=${amcrest}`);
       if (amcrest) {
         found.set(device.ip, device);
       }
