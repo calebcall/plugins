@@ -3,6 +3,7 @@ import { API_EVENT, BasePlugin } from '@camera.ui/sdk';
 import { buildCameraConfig } from './adopt.js';
 import { AmcrestClient } from './amcrest/api.js';
 import { discover } from './amcrest/discovery.js';
+import { discoverWs } from './amcrest/wsdiscovery.js';
 import { AmcrestCamera } from './camera.js';
 
 import type { AmcrestInitialSettings, AmcrestPluginStorage } from './types.js';
@@ -114,10 +115,38 @@ export default class AmcrestPlugin extends BasePlugin<AmcrestPluginStorage> impl
   }
 
   async onDiscoverCameras(): Promise<DiscoveredCamera[]> {
-    const devices = await discover(DISCOVERY_TIMEOUT_MS, { debug: (...a: unknown[]) => this.logger.debug(...a) });
-    return devices
-      .filter((d) => !Array.from(this.existing.values()).some((c) => c.nativeId === `amcrest-${d.ip}`))
-      .map((d) => ({ id: `amcrest-${d.ip}`, name: d.deviceType ? `Amcrest ${d.deviceType}` : `Amcrest (${d.ip})`, model: d.deviceType, address: d.ip }));
+    const logger = {
+      debug: (...a: unknown[]) => this.logger.debug(...a),
+      log: (...a: unknown[]) => this.logger.log(...a),
+    };
+
+    // Merge two discovery mechanisms by IP: ONVIF WS-Discovery (which most
+    // Amcrest units answer) and the Dahua DHIP probe (some Dahua-firmware units).
+    const [ws, dahua] = await Promise.all([
+      discoverWs(DISCOVERY_TIMEOUT_MS, logger).catch((e: unknown) => {
+        this.logger.debug('WS-Discovery failed:', e);
+        return [];
+      }),
+      discover(DISCOVERY_TIMEOUT_MS, logger).catch((e: unknown) => {
+        this.logger.debug('Dahua discovery failed:', e);
+        return [];
+      }),
+    ]);
+
+    const byIp = new Map<string, { model?: string; name?: string }>();
+    for (const d of dahua) {
+      byIp.set(d.ip, { model: d.deviceType, name: d.deviceType ? `Amcrest ${d.deviceType}` : undefined });
+    }
+    for (const d of ws) {
+      const model = d.hardware ?? byIp.get(d.ip)?.model;
+      byIp.set(d.ip, { model, name: d.name ? `Amcrest ${d.name}` : model ? `Amcrest ${model}` : undefined });
+    }
+
+    this.logger.log(`Amcrest discovery: ${byIp.size} device(s) found (WS-Discovery: ${ws.length}, DHIP: ${dahua.length})`);
+
+    return Array.from(byIp.entries())
+      .filter(([ip]) => !Array.from(this.existing.values()).some((c) => c.nativeId === `amcrest-${ip}`))
+      .map(([ip, info]) => ({ id: `amcrest-${ip}`, name: info.name ?? `Amcrest (${ip})`, model: info.model, address: ip }));
   }
 
   async onGetCameraSettings(camera: DiscoveredCamera): Promise<JsonSchemaWithoutCallbacks[]> {
