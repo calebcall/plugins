@@ -141,13 +141,22 @@ export async function discoverWs(timeoutMs: number, logger: WsDiscoveryLogger): 
       resolvePromise(Array.from(found.values()));
     }
 
-    function handleMessage(msg: Buffer) {
+    function handleMessage(msg: Buffer, rinfo: { address: string }) {
+      const src = rinfo.address;
       const device = parseWsProbeMatch(msg.toString('utf8'));
-      if (!device || seen.has(device.ip)) return;
+      if (!device) {
+        // Diagnostic: a reply we received but could not parse (unexpected format).
+        if (!seen.has(src)) {
+          seen.add(src);
+          logger.log(`WS-Discovery: unparsed reply from ${src} (len=${msg.length}): ${msg.toString('utf8').slice(0, 200).replace(/\s+/g, ' ')}`);
+        }
+        return;
+      }
+      if (seen.has(device.ip)) return;
       seen.add(device.ip);
       const amcrest = isAmcrestDevice(device.scopes);
       logger.log(
-        `WS-Discovery: ip=${device.ip} manufacturer=${device.manufacturer ?? '?'} name=${device.name ?? '?'} hardware=${device.hardware ?? '?'} amcrest=${amcrest}`,
+        `WS-Discovery: ip=${device.ip} (via ${src}) manufacturer=${device.manufacturer ?? '?'} name=${device.name ?? '?'} hardware=${device.hardware ?? '?'} amcrest=${amcrest}`,
       );
       if (amcrest) {
         found.set(device.ip, device);
