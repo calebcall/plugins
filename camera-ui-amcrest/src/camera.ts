@@ -53,10 +53,16 @@ export class AmcrestCamera {
   private eventReconnectStreak = 0;
   private stopped = false;
 
-  constructor(
-    private readonly cameraDevice: CameraDevice,
-    private readonly capabilities: AmcrestCapabilities,
-  ) {
+  private capabilities: AmcrestCapabilities = {
+    deviceType: undefined,
+    doorbell: false,
+    ptz: false,
+    ptzPan: false,
+    ptzTilt: false,
+    ptzZoom: false,
+  };
+
+  constructor(private readonly cameraDevice: CameraDevice) {
     this.log = cameraDevice.logger;
     this.storage = this.createStorage();
     const v = this.storage.values;
@@ -70,6 +76,7 @@ export class AmcrestCamera {
       return;
     }
 
+    this.capabilities = await this.detectCapabilities();
     await this.setupStreaming();
     await this.cameraDevice.implement(new Implementations(this));
     await this.setupSensors();
@@ -170,6 +177,28 @@ export class AmcrestCamera {
     this.transcoderStarting = undefined;
     this.talkbackBody?.end();
     this.talkbackBody = undefined;
+  }
+
+  private async detectCapabilities(): Promise<AmcrestCapabilities> {
+    const caps: AmcrestCapabilities = { deviceType: undefined, doorbell: false, ptz: false, ptzPan: false, ptzTilt: false, ptzZoom: false };
+    try {
+      const info = await this.client.getSystemInfo();
+      caps.deviceType = info.deviceType;
+      const dt = (info.deviceType ?? '').toUpperCase();
+      caps.doorbell = dt.startsWith('AD') || dt.includes('DB') || dt.includes('VTO');
+    } catch (error) {
+      this.log.debug('Capability detection (system info) failed:', error);
+    }
+    try {
+      const probe = await fetchPtzCaps(this.client, this.channel);
+      caps.ptz = probe.ptz;
+      caps.ptzPan = probe.pan;
+      caps.ptzTilt = probe.tilt;
+      caps.ptzZoom = probe.zoom;
+    } catch (error) {
+      this.log.debug('PTZ capability probe failed:', error);
+    }
+    return caps;
   }
 
   private async setupSensors(): Promise<void> {
@@ -273,4 +302,15 @@ export class AmcrestCamera {
       { type: 'number', key: 'channel', title: 'Channel', description: 'Camera channel (default 1).', store: true, required: false, defaultValue: 1 },
     ]);
   }
+}
+
+async function fetchPtzCaps(client: AmcrestClient, channel: number): Promise<{ ptz: boolean; pan: boolean; tilt: boolean; zoom: boolean }> {
+  const res = await fetch(client.urlFor(`/cgi-bin/ptz.cgi?action=getCurrentProtocolCaps&channel=${channel}`)).catch(() => undefined);
+  // Non-authed probe may 401; treat presence of caps.PTZ or a 401 challenge as "device answered".
+  if (!res) return { ptz: false, pan: false, tilt: false, zoom: false };
+  const text = res.status === 401 ? '' : await res.text().catch(() => '');
+  const hasPanTilt = /Left|Right|Up|Down/i.test(text);
+  const hasZoom = /Zoom/i.test(text);
+  const ptz = hasPanTilt || hasZoom;
+  return { ptz, pan: hasPanTilt, tilt: hasPanTilt, zoom: hasZoom };
 }
