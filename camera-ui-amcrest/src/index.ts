@@ -12,6 +12,7 @@ import type {
   DeviceStorage,
   DiscoveredCamera,
   DiscoveryProvider,
+  FormSubmitResponse,
   JsonSchema,
   JsonSchemaWithoutCallbacks,
   LoggerService,
@@ -58,32 +59,38 @@ export default class AmcrestPlugin extends BasePlugin<AmcrestPluginStorage> impl
         store: true,
       },
       {
-        type: 'button',
+        type: 'submit',
         key: 'addManual',
         title: 'Add Camera',
         color: 'success',
         description: 'Register the camera at the IP above so it can be adopted.',
-        onSet: async () => {
-          await this.addManualCamera();
-        },
+        onClick: async (value) => this.addManualCamera(value),
       },
     ];
   }
 
-  private async addManualCamera(): Promise<void> {
-    const host = String(this.storage.values.manualHost ?? '').trim();
+  private async addManualCamera(value: unknown): Promise<FormSubmitResponse> {
+    // The submit handler receives the live form values. Handle both the flat
+    // shape and a possible { config } wrapper.
+    const raw = (value ?? {}) as Record<string, unknown>;
+    const fields = (raw.config ?? raw) as { manualHost?: string; manualName?: string };
+    const host = (fields.manualHost ?? '').trim();
     if (!host) {
-      this.logger.attention('Enter an IP address before pressing "Add Camera".');
-      return;
+      return { toast: { type: 'warning', message: 'Enter an IP address before pressing "Add Camera".' } };
     }
     const id = `amcrest-${host}`;
     if (Array.from(this.existing.values()).some((c) => c.nativeId === id)) {
-      this.logger.attention(`A camera for ${host} has already been added.`);
-      return;
+      return { toast: { type: 'info', message: `A camera for ${host} has already been added.` } };
     }
-    const name = String(this.storage.values.manualName ?? '').trim() || `Amcrest (${host})`;
-    await this.api.deviceManager.pushDiscoveredCameras([{ id, name, address: host }]);
+    const name = (fields.manualName ?? '').trim() || `Amcrest (${host})`;
+    try {
+      await this.api.deviceManager.pushDiscoveredCameras([{ id, name, address: host }]);
+    } catch (error) {
+      this.logger.error('Failed to add manual Amcrest camera:', error);
+      return { toast: { type: 'error', message: `Failed to add camera ${host}: ${String(error)}` } };
+    }
     this.logger.log(`Manual Amcrest camera added: ${name} (${host}). Adopt it from the camera list to enter credentials.`);
+    return { toast: { type: 'success', message: `${name} added — adopt it from the camera list.` } };
   }
 
   async configureCameras(cameras: CameraDevice[]): Promise<void> {
