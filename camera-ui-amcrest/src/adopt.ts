@@ -25,7 +25,12 @@ export function buildCameraConfig(input: BuildCameraConfigInput): CameraConfig {
       name: 'main',
       role: 'high-resolution',
       urls: [buildRtspUrl({ ip: input.ip, username: input.username, password: input.password, port: input.port, channel: input.channel, subtype: main.subtype })],
-      useForSnapshot: true,
+      // Snapshots are served by the plugin's SnapshotInterface (snapshot.cgi, a
+      // lightweight HTTP JPEG with digest auth). Do NOT mark an RTSP source for
+      // snapshots — that makes camera.ui grab frames via ffmpeg over RTSP, which
+      // competes with live view for the camera's limited connections and fails
+      // under load (ffmpeg "exit status 69/183").
+      useForSnapshot: false,
       hotMode: true,
       preload: true,
     });

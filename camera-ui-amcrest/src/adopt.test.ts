@@ -22,7 +22,8 @@ test('builds a config with main+sub sources and snapshot on main', () => {
   assert.equal(config.name, 'Front Door');
   assert.equal(config.sources.length, 2);
   assert.equal(config.sources[0].role, 'high-resolution');
-  assert.equal(config.sources[0].useForSnapshot, true);
+  // Snapshots come from SnapshotInterface (snapshot.cgi), not ffmpeg-over-RTSP.
+  assert.equal(config.sources[0].useForSnapshot, false);
   assert.ok(config.sources[0].urls?.[0]?.startsWith('rtsp://admin:pw@192.168.1.50:554/cam/realmonitor?channel=1&subtype=0'));
   assert.equal(config.sources[1].role, 'low-resolution');
   assert.equal(config.sources[1].useForSnapshot, false);
@@ -41,5 +42,5 @@ test('falls back to a single main source when only one stream is present', () =>
     streams: [{ role: 'main', subtype: 0, codec: 'h264', width: 1920, height: 1080 }],
   });
   assert.equal(config.sources.length, 1);
-  assert.equal(config.sources[0].useForSnapshot, true);
+  assert.equal(config.sources[0].useForSnapshot, false);
 });
