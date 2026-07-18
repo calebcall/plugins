@@ -18,6 +18,14 @@ export interface AmcrestClientOptions {
   httpPort?: number; // CGI/HTTP port
 }
 
+// Thrown when the device rejects the credentials (HTTP 401 after digest auth).
+export class AmcrestAuthError extends Error {
+  constructor(message = 'Authentication failed — check the username and password') {
+    super(message);
+    this.name = 'AmcrestAuthError';
+  }
+}
+
 export class AmcrestClient {
   constructor(private readonly opts: AmcrestClientOptions) {}
 
@@ -26,8 +34,8 @@ export class AmcrestClient {
     return `http://${host}${pathAndQuery}`;
   }
 
-  private fetch(pathAndQuery: string, init?: { method?: string; headers?: Record<string, string>; body?: BodyInit; signal?: AbortSignal }): Promise<Response> {
-    return digestFetch({
+  private async fetch(pathAndQuery: string, init?: { method?: string; headers?: Record<string, string>; body?: BodyInit; signal?: AbortSignal }): Promise<Response> {
+    const res = await digestFetch({
       url: this.urlFor(pathAndQuery),
       username: this.opts.username,
       password: this.opts.password,
@@ -36,6 +44,14 @@ export class AmcrestClient {
       body: init?.body,
       signal: init?.signal,
     });
+    // A final 401 (after the digest handshake) means the credentials are wrong.
+    // Surface it clearly instead of letting callers misread the 401 body (e.g.
+    // getSystemInfo would otherwise throw the misleading 'not amcrest').
+    if (res.status === 401) {
+      await res.arrayBuffer().catch(() => undefined);
+      throw new AmcrestAuthError();
+    }
+    return res;
   }
 
   rtspUrl(channel: number, subtype: number): string {
