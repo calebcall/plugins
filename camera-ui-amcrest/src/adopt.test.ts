@@ -30,8 +30,15 @@ test('builds a config with main+sub sources and snapshot on main', () => {
 
 test('falls back to a single main source when only one stream is present', () => {
   const config = buildCameraConfig({
-    name: 'Cam', nativeId: 'x', ip: '10.0.0.1', username: 'a', password: 'b', port: 554, channel: 1,
-    info: {}, streams: [{ role: 'main', subtype: 0, codec: 'h264', width: 1920, height: 1080 }],
+    name: 'Cam',
+    nativeId: 'x',
+    ip: '10.0.0.1',
+    username: 'a',
+    password: 'b',
+    port: 554,
+    channel: 1,
+    info: {},
+    streams: [{ role: 'main', subtype: 0, codec: 'h264', width: 1920, height: 1080 }],
   });
   assert.equal(config.sources.length, 1);
   assert.equal(config.sources[0].useForSnapshot, true);

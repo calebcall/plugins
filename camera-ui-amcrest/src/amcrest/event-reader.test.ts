@@ -38,15 +38,7 @@ test('extractCompleteEvents: no boundary marker yields no blobs and an unchanged
 });
 
 test('extractCompleteEvents: strips a stray HTTP/1.1 200 OK status line from the emitted blob', () => {
-  const buffer = [
-    '--myboundary',
-    'Content-Type: text/plain',
-    '',
-    'HTTP/1.1 200 OK',
-    'Code=VideoMotion;action=Start;index=0',
-    '--myboundary',
-    '',
-  ].join('\r\n');
+  const buffer = ['--myboundary', 'Content-Type: text/plain', '', 'HTTP/1.1 200 OK', 'Code=VideoMotion;action=Start;index=0', '--myboundary', ''].join('\r\n');
 
   const { blobs } = extractCompleteEvents(buffer, 'myboundary');
   assert.equal(blobs.length, 1);

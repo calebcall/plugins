@@ -43,17 +43,9 @@ export function buildDigestAuthHeader(p: DigestParams): string {
   const cnonce = p.cnonce ?? randomBytes(8).toString('hex');
   const ha1 = md5(`${p.username}:${p.realm}:${p.password}`);
   const ha2 = md5(`${p.method}:${p.uri}`);
-  const response = qop
-    ? md5(`${ha1}:${p.nonce}:${nc}:${cnonce}:${qop}:${ha2}`)
-    : md5(`${ha1}:${p.nonce}:${ha2}`);
+  const response = qop ? md5(`${ha1}:${p.nonce}:${nc}:${cnonce}:${qop}:${ha2}`) : md5(`${ha1}:${p.nonce}:${ha2}`);
 
-  const parts = [
-    `username="${p.username}"`,
-    `realm="${p.realm}"`,
-    `nonce="${p.nonce}"`,
-    `uri="${p.uri}"`,
-    `response="${response}"`,
-  ];
+  const parts = [`username="${p.username}"`, `realm="${p.realm}"`, `nonce="${p.nonce}"`, `uri="${p.uri}"`, `response="${response}"`];
   if (p.algorithm) parts.push(`algorithm=${p.algorithm}`);
   if (qop) {
     parts.push(`qop=${qop}`, `nc=${nc}`, `cnonce="${cnonce}"`);

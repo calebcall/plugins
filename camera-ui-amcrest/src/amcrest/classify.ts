@@ -1,10 +1,7 @@
 import type { AmcrestEvent } from './events.js';
 
 export type AmcrestClassification =
-  | { kind: 'motion'; active: boolean }
-  | { kind: 'audio'; active: boolean }
-  | { kind: 'object'; category: 'person' | 'vehicle'; active: boolean }
-  | { kind: 'doorbell' };
+  { kind: 'motion'; active: boolean } | { kind: 'audio'; active: boolean } | { kind: 'object'; category: 'person' | 'vehicle'; active: boolean } | { kind: 'doorbell' };
 
 function objectTypeToCategory(objectType?: string): 'person' | 'vehicle' | undefined {
   if (objectType === 'Human') return 'person';
