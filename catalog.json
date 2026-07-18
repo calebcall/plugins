@@ -1,4 +1,12 @@
 {
+  "@camera.ui/camera-ui-amcrest": {
+    "displayName": "Amcrest",
+    "category": "camera-source",
+    "featured": false,
+    "tagline": "Integrates Amcrest and Dahua-compatible cameras, doorbells and PTZ into camera.ui with discovery, live streaming, two-way audio, PTZ, and motion, object, audio and doorbell events.",
+    "logo": "https://raw.githubusercontent.com/cameraui/plugins/main/camera-ui-amcrest/logo.png",
+    "screenshots": []
+  },
   "@camera.ui/camera-ui-audio-yamnet": {
     "displayName": "YAMNet Audio Detection",
     "category": "detection",
