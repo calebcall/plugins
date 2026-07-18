@@ -61,6 +61,11 @@ test('parseDiscoveryResponse: undefined when the datagram has no JSON body', () 
   assert.equal(parseDiscoveryResponse(datagram), undefined);
 });
 
+test('parseDiscoveryResponse: undefined when the content between braces is invalid JSON', () => {
+  const datagram = Buffer.from('garbage{not: valid json,,,}trailing', 'utf8');
+  assert.equal(parseDiscoveryResponse(datagram), undefined);
+});
+
 test('parseDiscoveryResponse: undefined when the JSON body is missing an IP', () => {
   const datagram = syntheticDatagram({
     params: {

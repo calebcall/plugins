@@ -51,15 +51,23 @@ export async function discover(timeoutMs: number, logger: { debug: (...a: unknow
   return new Promise((resolvePromise) => {
     const found = new Map<string, DiscoveredAmcrest>();
     const socket = createSocket({ type: 'udp4', reuseAddr: true });
+    let finished = false;
 
-    const finish = () => {
+    // Scheduled up front (not inside socket.bind's callback) so discover()
+    // always resolves even if bind() never calls back and never errors.
+    const timer = setTimeout(finish, timeoutMs);
+
+    function finish() {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
       try {
         socket.close();
       } catch {
         // ignore
       }
       resolvePromise(Array.from(found.values()));
-    };
+    }
 
     socket.on('error', (err) => {
       logger.debug('Amcrest discovery socket error:', err);
@@ -80,7 +88,6 @@ export async function discover(timeoutMs: number, logger: { debug: (...a: unknow
       } catch (err) {
         logger.debug('Amcrest discovery send failed:', err);
       }
-      setTimeout(finish, timeoutMs);
     });
   });
 }
