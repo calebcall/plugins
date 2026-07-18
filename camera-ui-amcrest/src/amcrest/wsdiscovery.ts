@@ -97,16 +97,44 @@ export interface WsDiscoveryLogger {
 }
 
 const PROBE_RESEND_MS = 1200;
+// Only sweep reasonably small subnets (>= /22 => <= 1022 hosts) to avoid a huge
+// packet fan-out on large/misconfigured networks.
+const MIN_SWEEP_PREFIX = 22;
 
-function localIPv4Addresses(): string[] {
+interface LocalIface {
+  address: string;
+  cidr: string | null;
+}
+
+function localIPv4Interfaces(): LocalIface[] {
   const nifs = networkInterfaces();
-  const addrs: string[] = [];
+  const out: LocalIface[] = [];
   for (const list of Object.values(nifs)) {
     for (const ni of list ?? []) {
-      if (ni.family === 'IPv4' && !ni.internal) addrs.push(ni.address);
+      if (ni.family === 'IPv4' && !ni.internal) out.push({ address: ni.address, cidr: ni.cidr });
     }
   }
-  return addrs;
+  return out;
+}
+
+// Enumerate host addresses of a subnet given as "10.1.126.179/24".
+// Excludes the network and broadcast addresses. Returns [] for subnets larger
+// than MIN_SWEEP_PREFIX or unparseable input.
+export function subnetHosts(cidr: string | null): string[] {
+  if (!cidr) return [];
+  const [addr, prefixStr] = cidr.split('/');
+  const prefix = Number(prefixStr);
+  if (!addr || !Number.isInteger(prefix) || prefix < MIN_SWEEP_PREFIX || prefix > 32) return [];
+
+  const ipToInt = (ip: string): number => ip.split('.').reduce((acc, o) => ((acc << 8) | (Number(o) & 255)) >>> 0, 0);
+  const intToIp = (n: number): string => [24, 16, 8, 0].map((s) => (n >>> s) & 255).join('.');
+
+  const mask = prefix === 0 ? 0 : (~0 << (32 - prefix)) >>> 0;
+  const base = ipToInt(addr) & mask;
+  const total = 2 ** (32 - prefix);
+  const hosts: string[] = [];
+  for (let i = 1; i < total - 1; i++) hosts.push(intToIp((base + i) >>> 0));
+  return hosts;
 }
 
 export async function discoverWs(timeoutMs: number, logger: WsDiscoveryLogger): Promise<WsDiscovered[]> {
@@ -120,9 +148,11 @@ export async function discoverWs(timeoutMs: number, logger: WsDiscoveryLogger): 
 
     // Probe from every non-internal IPv4 interface; a single default-interface
     // probe misses cameras reachable only via another NIC/VLAN/bridge.
-    const addrs = localIPv4Addresses();
-    logger.log(`WS-Discovery: probing ${addrs.length} interface(s): ${addrs.length ? addrs.join(', ') : '(default only)'}`);
-    const bindTargets: (string | undefined)[] = addrs.length ? addrs : [undefined];
+    const ifaces = localIPv4Interfaces();
+    logger.log(
+      `WS-Discovery: probing ${ifaces.length} interface(s): ${ifaces.length ? ifaces.map((i) => i.cidr ?? i.address).join(', ') : '(default only)'}`,
+    );
+    const bindTargets: LocalIface[] = ifaces.length ? ifaces : [{ address: '', cidr: null }];
 
     const timer = setTimeout(finish, timeoutMs);
     cleanups.push(() => clearTimeout(timer));
@@ -165,7 +195,8 @@ export async function discoverWs(timeoutMs: number, logger: WsDiscoveryLogger): 
       }
     }
 
-    for (const addr of bindTargets) {
+    for (const iface of bindTargets) {
+      const addr = iface.address || undefined;
       const socket = createSocket({ type: 'udp4', reuseAddr: true });
       sockets.push(socket);
       // One socket failing (e.g. bind conflict) must not abort the whole scan.
@@ -178,38 +209,31 @@ export async function discoverWs(timeoutMs: number, logger: WsDiscoveryLogger): 
         } catch (err) {
           logger.debug(`WS-Discovery setup failed (${addr ?? '*'}):`, err);
         }
-        senders.push(() => {
+
+        const send = (target: string) => {
           try {
-            socket.send(Buffer.from(buildWsDiscoveryProbe(randomUUID()), 'utf8'), WSD_PORT, WSD_ADDR);
+            socket.send(Buffer.from(buildWsDiscoveryProbe(randomUUID()), 'utf8'), WSD_PORT, target);
           } catch (err) {
-            logger.debug(`WS-Discovery send failed (${addr ?? '*'}):`, err);
+            logger.debug(`WS-Discovery send failed (${addr ?? '*'} -> ${target}):`, err);
           }
-        });
+        };
+
+        // Unicast sweep of this interface's subnet: every ONVIF device replies
+        // unicast to our ephemeral port, so we never depend on multicast-group
+        // replies or share port 3702 with the ONVIF plugin. Sent once.
+        const hosts = subnetHosts(iface.cidr).filter((h) => h !== iface.address);
+        if (hosts.length) {
+          logger.log(`WS-Discovery: unicast sweep of ${iface.cidr} (${hosts.length} hosts)`);
+          for (const h of hosts) send(h);
+        }
+
+        // Also multicast (repeated) for anything the sweep can't reach.
+        senders.push(() => send(WSD_ADDR));
       });
     }
 
-    // Some Amcrest units reply to the multicast GROUP (239.255.255.250:3702)
-    // instead of unicast to our source port. Listen on 3702 + join the group on
-    // each interface to catch them. Delivered to all joined members, so this
-    // does not interfere with the ONVIF plugin; degrades gracefully if the bind
-    // or membership fails.
-    const mcastSocket = createSocket({ type: 'udp4', reuseAddr: true });
-    sockets.push(mcastSocket);
-    mcastSocket.on('error', (err) => logger.debug('WS-Discovery multicast socket error:', err));
-    mcastSocket.on('message', handleMessage);
-    mcastSocket.bind(WSD_PORT, () => {
-      const targets = addrs.length ? addrs : [undefined];
-      for (const addr of targets) {
-        try {
-          mcastSocket.addMembership(WSD_ADDR, addr);
-        } catch (err) {
-          logger.debug(`WS-Discovery addMembership failed (${addr ?? '*'}):`, err);
-        }
-      }
-    });
-
-    // Resend across the window (dedup handles repeats); the first tick gives the
-    // per-interface binds time to register their senders.
+    // Resend the multicast probe across the window (dedup handles repeats); the
+    // first tick gives the per-interface binds time to register their senders.
     const sendAll = () => senders.forEach((s) => s());
     const firstSend = setTimeout(sendAll, 100);
     const resend = setInterval(sendAll, PROBE_RESEND_MS);

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { buildWsDiscoveryProbe, isAmcrestDevice, parseWsProbeMatch, scopeValue } from './wsdiscovery.js';
+import { buildWsDiscoveryProbe, isAmcrestDevice, parseWsProbeMatch, scopeValue, subnetHosts } from './wsdiscovery.js';
 
 const AMCREST_MATCH = `<?xml version="1.0" encoding="UTF-8"?>
 <SOAP-ENV:Envelope xmlns:SOAP-ENV="http://www.w3.org/2003/05/soap-envelope" xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery">
@@ -53,4 +53,23 @@ test('isAmcrestDevice matches by hardware prefix when manufacturer scope is abse
 
 test('parseWsProbeMatch returns undefined without an address', () => {
   assert.equal(parseWsProbeMatch('<d:ProbeMatch><d:Scopes>onvif://x/name/y</d:Scopes></d:ProbeMatch>'), undefined);
+});
+
+test('subnetHosts enumerates a /24 excluding network and broadcast', () => {
+  const hosts = subnetHosts('10.1.126.179/24');
+  assert.equal(hosts.length, 254);
+  assert.equal(hosts[0], '10.1.126.1');
+  assert.equal(hosts[hosts.length - 1], '10.1.126.254');
+  assert.ok(!hosts.includes('10.1.126.0'));
+  assert.ok(!hosts.includes('10.1.126.255'));
+});
+
+test('subnetHosts handles a /30', () => {
+  assert.deepEqual(subnetHosts('192.168.1.5/30'), ['192.168.1.5', '192.168.1.6']);
+});
+
+test('subnetHosts refuses large subnets and bad input', () => {
+  assert.deepEqual(subnetHosts('10.0.0.5/16'), []);
+  assert.deepEqual(subnetHosts(null), []);
+  assert.deepEqual(subnetHosts('not-a-cidr'), []);
 });
