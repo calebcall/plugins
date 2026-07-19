@@ -126,7 +126,7 @@ func TestFinalizeSegment_IndexesRealFMP4File(t *testing.T) {
 	segStore := newTestSegmentStore(t)
 	ff := ResolveFFmpeg()
 
-	seg, err := finalizeSegment(ff, segStore, "cam1", "high", path)
+	seg, err := finalizeSegment(ff, segStore, "cam1", "high", path, true)
 	if err != nil {
 		t.Fatalf("finalizeSegment: %v", err)
 	}

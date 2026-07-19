@@ -16,23 +16,50 @@ type eventUpserter interface {
 	Upsert(events []store.DetectionEvent) error
 }
 
+// eventRecorder is the minimal interface detectionEventIngester needs to
+// trigger Task 8's event-mode retention: *recorder.Recorder.MarkEvent
+// satisfies it directly (see recorder/event_mode.go — it is itself a no-op
+// outside RecordingModeEvents, so the ingester never needs to know a
+// camera's mode to decide whether calling it is safe). Tests substitute a
+// spy to assert MarkEvent is invoked with the right window.
+type eventRecorder interface {
+	MarkEvent(startMs, endMs int64)
+}
+
+// eventRecorderLookup resolves a camera ID to the eventRecorder responsible
+// for it, if this plugin instance currently has one registered. A camera
+// this instance isn't recording at all (recordingMode "off", or simply not
+// assigned here) has none, and RecorderFor's ok=false return tells handle to
+// skip MarkEvent for it entirely rather than trying to construct a
+// zero-value recorder.
+type eventRecorderLookup interface {
+	RecorderFor(cameraID string) (eventRecorder, bool)
+}
+
 // detectionEventIngester adapts sdk.CameraDevice.OnDetectionEvent's callback
-// shape into an EventStore.Upsert call. One instance is shared across every
-// camera this plugin attaches to (see NVRPlugin.attachDetectionIngestion in
-// plugin.go); it carries no per-camera state of its own — the event already
-// identifies its camera via DetectionEvent.CameraID.
+// shape into an EventStore.Upsert call, plus (Task 8) a MarkEvent call on
+// the event's camera's recorder, if one is registered. One instance is
+// shared across every camera this plugin attaches to (see
+// NVRPlugin.attachDetectionIngestion in plugin.go); it carries no per-camera
+// state of its own — the event already identifies its camera via
+// DetectionEvent.CameraID.
 type detectionEventIngester struct {
-	store  eventUpserter
-	logger *sdk.Logger
+	store     eventUpserter
+	recorders eventRecorderLookup
+	logger    *sdk.Logger
 }
 
 // newDetectionEventIngester returns a detectionEventIngester that upserts
-// into store. logger may be nil (as in unit tests); errors are only logged,
-// never surfaced, because OnDetectionEvent's callback signature (see
-// camera_device.go) has no error return for a failed handler to report
-// through.
-func newDetectionEventIngester(store eventUpserter, logger *sdk.Logger) *detectionEventIngester {
-	return &detectionEventIngester{store: store, logger: logger}
+// into store and, for a camera with a registered recorder, calls MarkEvent
+// via recorders. logger may be nil (as in unit tests); recorders may also be
+// nil — handle treats that identically to RecorderFor returning ok=false,
+// i.e. it just skips the MarkEvent step — so existing callers/tests that
+// don't care about event-mode wiring at all don't need to supply a lookup.
+// Errors are only logged, never surfaced, because OnDetectionEvent's
+// callback signature (see camera_device.go) has no error return for a
+// failed handler to report through.
+func newDetectionEventIngester(store eventUpserter, recorders eventRecorderLookup, logger *sdk.Logger) *detectionEventIngester {
+	return &detectionEventIngester{store: store, recorders: recorders, logger: logger}
 }
 
 // handle is the exact callback shape sdk.CameraDevice.OnDetectionEvent
@@ -47,10 +74,35 @@ func newDetectionEventIngester(store eventUpserter, logger *sdk.Logger) *detecti
 // row via EventStore.Upsert's ON CONFLICT(id) DO UPDATE rather than adding a
 // duplicate. eventType itself isn't needed here — event.ID and event.State
 // already carry everything Upsert needs to decide insert vs. replace.
+//
+// After upserting, handle also calls markEvent for the same event: every
+// lifecycle message carries the event's current StartTime/EndTime, so
+// MarkEvent is called repeatedly (once per message) with a window that only
+// grows as EndTime advances from 0 (event still active) to its final value
+// — each call promotes whatever segments are coverable so far, which is
+// simpler and safer than trying to call it only once on some particular
+// eventType, and is idempotent because MarkReferenced (store/segments.go) is
+// itself idempotent.
 func (i *detectionEventIngester) handle(eventType sdk.DetectionEventType, event sdk.DetectionEvent) {
 	if err := i.store.Upsert([]store.DetectionEvent{event}); err != nil && i.logger != nil {
 		i.logger.Error("nvr-local: upsert detection event failed:", err)
 	}
+	i.markEvent(event)
+}
+
+// markEvent calls MarkEvent(event.StartTime, event.EndTime) on the
+// eventRecorder registered for event.CameraID, if any. A no-op when
+// i.recorders is nil or has no recorder registered for this camera — see
+// newDetectionEventIngester's doc comment for why that's not an error.
+func (i *detectionEventIngester) markEvent(event sdk.DetectionEvent) {
+	if i.recorders == nil {
+		return
+	}
+	rec, ok := i.recorders.RecorderFor(event.CameraID)
+	if !ok {
+		return
+	}
+	rec.MarkEvent(event.StartTime, event.EndTime)
 }
 
 // detectionSubscriptions tracks the per-camera sdk.Disposable returned by

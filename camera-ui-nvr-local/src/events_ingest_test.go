@@ -32,7 +32,7 @@ func (f *fakeEventStore) Upsert(events []store.DetectionEvent) error {
 // a synthetic detection event into the store unchanged.
 func TestDetectionEventIngester_Handle_UpsertsTheEvent(t *testing.T) {
 	fake := &fakeEventStore{}
-	ingester := newDetectionEventIngester(fake, nil)
+	ingester := newDetectionEventIngester(fake, nil, nil)
 
 	event := sdk.DetectionEvent{
 		ID:        "evt-1",
@@ -59,7 +59,7 @@ func TestDetectionEventIngester_Handle_UpsertsTheEvent(t *testing.T) {
 // handler must not skip or coalesce them itself.
 func TestDetectionEventIngester_Handle_ReplacesOnUpdate(t *testing.T) {
 	fake := &fakeEventStore{}
-	ingester := newDetectionEventIngester(fake, nil)
+	ingester := newDetectionEventIngester(fake, nil, nil)
 
 	ingester.handle(sdk.DetectionEventStart, sdk.DetectionEvent{
 		ID: "evt-1", CameraID: "cam1", State: sdk.DetectionEventStateActive, StartTime: 1000,
@@ -84,9 +84,81 @@ func TestDetectionEventIngester_Handle_ReplacesOnUpdate(t *testing.T) {
 // there's nowhere to log to either).
 func TestDetectionEventIngester_Handle_LogsAndSwallowsStoreErrors(t *testing.T) {
 	fake := &fakeEventStore{err: errors.New("boom")}
-	ingester := newDetectionEventIngester(fake, nil)
+	ingester := newDetectionEventIngester(fake, nil, nil)
 
 	ingester.handle(sdk.DetectionEventStart, sdk.DetectionEvent{ID: "evt-1", CameraID: "cam1"})
+}
+
+// ---------------------------------------------------------------------------
+// Task 8 wiring: handle -> eventRecorder.MarkEvent
+// ---------------------------------------------------------------------------
+
+// spyRecorder is an eventRecorder test double recording every MarkEvent call
+// it receives, so a test can assert both that it was called and with which
+// window.
+type spyRecorder struct {
+	calls []struct{ startMs, endMs int64 }
+}
+
+func (s *spyRecorder) MarkEvent(startMs, endMs int64) {
+	s.calls = append(s.calls, struct{ startMs, endMs int64 }{startMs, endMs})
+}
+
+// fakeRecorderLookup is an eventRecorderLookup test double: recorders holds
+// the (possibly empty) set of camera IDs with a registered eventRecorder.
+type fakeRecorderLookup struct {
+	recorders map[string]eventRecorder
+}
+
+func (f *fakeRecorderLookup) RecorderFor(cameraID string) (eventRecorder, bool) {
+	rec, ok := f.recorders[cameraID]
+	return rec, ok
+}
+
+// TestDetectionEventIngester_Handle_CallsMarkEventOnRegisteredRecorder proves
+// handle looks up the event's camera in the recorder lookup and, when found,
+// calls MarkEvent with exactly the event's StartTime/EndTime — the window
+// recorder.Recorder.MarkEvent (event_mode.go) then expands by the camera's
+// pre/post roll itself.
+func TestDetectionEventIngester_Handle_CallsMarkEventOnRegisteredRecorder(t *testing.T) {
+	spy := &spyRecorder{}
+	lookup := &fakeRecorderLookup{recorders: map[string]eventRecorder{"cam1": spy}}
+	ingester := newDetectionEventIngester(&fakeEventStore{}, lookup, nil)
+
+	ingester.handle(sdk.DetectionEventEnd, sdk.DetectionEvent{
+		ID: "evt-1", CameraID: "cam1", StartTime: 1000, EndTime: 6000,
+	})
+
+	if len(spy.calls) != 1 {
+		t.Fatalf("expected exactly 1 MarkEvent call, got %d", len(spy.calls))
+	}
+	if spy.calls[0].startMs != 1000 || spy.calls[0].endMs != 6000 {
+		t.Fatalf("expected MarkEvent(1000, 6000), got MarkEvent(%d, %d)", spy.calls[0].startMs, spy.calls[0].endMs)
+	}
+}
+
+// TestDetectionEventIngester_Handle_SkipsMarkEventWhenNoRecorderRegistered
+// proves handle does not call MarkEvent (and does not panic) for a camera
+// with no registered recorder — e.g. one this instance isn't recording, or
+// isn't in events mode — even though a lookup is configured.
+func TestDetectionEventIngester_Handle_SkipsMarkEventWhenNoRecorderRegistered(t *testing.T) {
+	lookup := &fakeRecorderLookup{recorders: map[string]eventRecorder{}}
+	ingester := newDetectionEventIngester(&fakeEventStore{}, lookup, nil)
+
+	ingester.handle(sdk.DetectionEventStart, sdk.DetectionEvent{
+		ID: "evt-1", CameraID: "cam-unregistered", StartTime: 1000,
+	})
+	// No assertion beyond "did not panic": there is no spy to have been
+	// called, by construction of this test's empty lookup.
+}
+
+// TestDetectionEventIngester_Handle_SkipsMarkEventWhenLookupNil proves handle
+// tolerates a nil eventRecorderLookup (the default for any caller that
+// doesn't care about event-mode wiring, matching newDetectionEventIngester's
+// doc comment) without panicking.
+func TestDetectionEventIngester_Handle_SkipsMarkEventWhenLookupNil(t *testing.T) {
+	ingester := newDetectionEventIngester(&fakeEventStore{}, nil, nil)
+	ingester.handle(sdk.DetectionEventStart, sdk.DetectionEvent{ID: "evt-1", CameraID: "cam1", StartTime: 1000})
 }
 
 // TestDetectionSubscriptions_AddThenRemove proves the add/remove bookkeeping

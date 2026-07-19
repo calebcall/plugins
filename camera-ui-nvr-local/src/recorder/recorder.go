@@ -80,6 +80,21 @@ type RecorderConfig struct {
 	Roles          []string
 	SegmentSeconds int
 	DataDir        string
+
+	// Mode, PreRollS, and PostRollS drive event-mode recording (Task 8, see
+	// event_mode.go): everything below is a no-op when Mode is anything
+	// other than RecordingModeEvents (its zero value included), which is
+	// also why every pre-Task-8 caller of RecorderConfig (this field's zero
+	// value) keeps behaving exactly like continuous mode.
+	//
+	// Mode selects, at the moment each segment is finalized, whether it
+	// starts out permanently retained (continuous, indexed
+	// Referenced=true) or as an events-mode "spool" segment (indexed
+	// Referenced=false, only promoted by MarkEvent, otherwise swept once
+	// older than PreRollS).
+	Mode      RecordingMode
+	PreRollS  int
+	PostRollS int
 }
 
 // commandRunner abstracts "run this ffmpeg invocation until it exits or ctx
@@ -412,6 +427,12 @@ func (r *Recorder) watchSegments(ctx context.Context, outDir, role string) {
 			return
 		case <-ticker.C:
 			r.sweepSegments(outDir, role, &processedUpTo, false)
+			// The events-mode janitor rides the same tick: see
+			// sweepEventSpool's doc comment (event_mode.go) for why it
+			// only ever does anything in RecordingModeEvents, and only to
+			// spool segments already older than the camera's configured
+			// pre-roll.
+			r.sweepEventSpool(time.Now())
 		}
 	}
 }
@@ -448,12 +469,22 @@ func (r *Recorder) sweepSegments(outDir, role string, processedUpTo *string, fin
 
 	for i := start; i < limit; i++ {
 		path := files[i]
-		if _, err := finalizeSegment(r.ff, r.segStore, r.cfg.CameraID, role, path); err != nil {
+		if _, err := finalizeSegment(r.ff, r.segStore, r.cfg.CameraID, role, path, r.initiallyReferenced()); err != nil {
 			r.logf("recorder: %s/%s: index segment %s: %v", r.cfg.CameraID, role, path, err)
 			return
 		}
 		*processedUpTo = path
 	}
+}
+
+// initiallyReferenced reports the Referenced value a newly finalized segment
+// should be indexed with: false (an events-mode "spool" segment, subject to
+// sweepEventSpool until/unless MarkEvent promotes it) only when this
+// recorder is in RecordingModeEvents; true — permanently retained from the
+// moment it's indexed — for every other mode (continuous, and the zero
+// value, so existing callers that never set Mode are unaffected).
+func (r *Recorder) initiallyReferenced() bool {
+	return r.cfg.Mode != RecordingModeEvents
 }
 
 // logf logs through r.log if one was provided (see NewRecorder's doc
@@ -467,9 +498,10 @@ func (r *Recorder) logf(format string, args ...any) {
 
 // finalizeSegment probes path (a segment file ffmpeg has finished writing)
 // via ff, derives its start/end/codec info, and indexes it into segStore as
-// a store.Segment for cameraID/role. Returns the indexed segment (with its
-// assigned ID) on success.
-func finalizeSegment(ff *FFmpeg, segStore *store.SegmentStore, cameraID, role, path string) (store.Segment, error) {
+// a store.Segment for cameraID/role, with Referenced set to referenced (see
+// initiallyReferenced: false for an events-mode spool segment, true
+// otherwise). Returns the indexed segment (with its assigned ID) on success.
+func finalizeSegment(ff *FFmpeg, segStore *store.SegmentStore, cameraID, role, path string, referenced bool) (store.Segment, error) {
 	res, err := ff.probe(path)
 	if err != nil {
 		return store.Segment{}, err
@@ -488,14 +520,15 @@ func finalizeSegment(ff *FFmpeg, segStore *store.SegmentStore, cameraID, role, p
 	hasVideo, hasAudio, codec := res.videoAudio()
 
 	seg := store.Segment{
-		CameraID: cameraID,
-		Role:     role,
-		Path:     path,
-		StartMs:  startMs,
-		EndMs:    endMs,
-		HasVideo: hasVideo,
-		HasAudio: hasAudio,
-		Codec:    codec,
+		CameraID:   cameraID,
+		Role:       role,
+		Path:       path,
+		StartMs:    startMs,
+		EndMs:      endMs,
+		HasVideo:   hasVideo,
+		HasAudio:   hasAudio,
+		Codec:      codec,
+		Referenced: referenced,
 	}
 
 	id, err := segStore.Add(seg)

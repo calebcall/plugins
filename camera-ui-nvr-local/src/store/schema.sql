@@ -27,7 +27,17 @@ CREATE TABLE IF NOT EXISTS segments (
   end_ms INTEGER,
   has_video INTEGER,
   has_audio INTEGER,
-  codec TEXT
+  codec TEXT,
+  -- referenced (Task 8): whether this segment is permanently retained.
+  -- Continuous-mode segments are always inserted referenced=1. Events-mode
+  -- segments are inserted referenced=0 ("spool") and only flipped to 1 by
+  -- Recorder.MarkEvent when a detection event's [start-preRoll,
+  -- end+postRoll] window covers them; unreferenced spool segments older
+  -- than the camera's preRoll are removed by the events-mode janitor (see
+  -- recorder/event_mode.go). Added retroactively via an ALTER TABLE
+  -- migration for pre-existing v1 databases (see db.go's migrateToV2) —
+  -- DEFAULT 1 there so already-recorded footage is never swept.
+  referenced INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE INDEX IF NOT EXISTS idx_segments_camera_role_start

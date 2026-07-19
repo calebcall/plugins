@@ -28,7 +28,12 @@ var schemaSQL string
 // schemaVersion is the target PRAGMA user_version. Bump it and extend
 // migrate (or add a new embedded file switched on the current version) when
 // schema.sql changes in a later task.
-const schemaVersion = 1
+//
+// Version history:
+//   - 1: initial schema (Task 3).
+//   - 2: segments.referenced column (Task 8) — see migrateToV2 and
+//     schema.sql's segments table doc comment.
+const schemaVersion = 2
 
 // dbFileName is the SQLite database file created inside the directory
 // passed to Open.
@@ -88,9 +93,29 @@ func (db *DB) Conn() *sqlite3.Conn { return db.conn }
 // Close releases the underlying SQLite connection.
 func (db *DB) Close() error { return db.conn.Close() }
 
-// migrate applies schemaSQL exactly once per database file, tracked via
-// PRAGMA user_version, so repeated calls to Open against the same file are
-// idempotent and cheap (a single PRAGMA read) once migrated.
+// migrate brings the database from whatever PRAGMA user_version it's
+// currently at up to schemaVersion, applying each step in order inside a
+// single transaction, so repeated calls to Open against the same file are
+// idempotent and cheap (a single PRAGMA read) once fully migrated.
+//
+// Step 0->1 (current < 1) runs the full embedded schemaSQL: every statement
+// in it is CREATE TABLE/INDEX IF NOT EXISTS, and schemaSQL as embedded today
+// already includes everything through the latest version (e.g. the
+// segments.referenced column added for version 2) — so a genuinely fresh
+// database goes straight from 0 to schemaVersion in this one step, and
+// migrateToV2 below (current < 2) then finds the column already present via
+// hasColumn and no-ops.
+//
+// Step 1->2 (current < 2, migrateToV2) exists specifically for databases
+// that were already migrated to version 1 by an earlier build, before
+// schema.sql grew the segments.referenced column: re-running schemaSQL's
+// `CREATE TABLE IF NOT EXISTS segments (...)` against such a database is a
+// no-op (the table already exists) and would silently leave the column
+// missing, so that step uses an explicit ALTER TABLE instead. This is the
+// first version bump since schemaVersion was introduced (Task 3), so this
+// is also the first incremental (non-schemaSQL) migration step in this
+// function — later version bumps should follow the same "current < N" step
+// pattern rather than assuming a fresh install.
 func migrate(conn *sqlite3.Conn) error {
 	current, err := userVersion(conn)
 	if err != nil {
@@ -103,10 +128,20 @@ func migrate(conn *sqlite3.Conn) error {
 	if err := conn.Exec("BEGIN IMMEDIATE"); err != nil {
 		return fmt.Errorf("store: begin migration: %w", err)
 	}
-	if err := conn.Exec(schemaSQL); err != nil {
-		_ = conn.Exec("ROLLBACK")
-		return fmt.Errorf("store: apply schema: %w", err)
+
+	if current < 1 {
+		if err := conn.Exec(schemaSQL); err != nil {
+			_ = conn.Exec("ROLLBACK")
+			return fmt.Errorf("store: apply schema: %w", err)
+		}
 	}
+	if current < 2 {
+		if err := migrateToV2(conn); err != nil {
+			_ = conn.Exec("ROLLBACK")
+			return fmt.Errorf("store: migrate to v2: %w", err)
+		}
+	}
+
 	if err := conn.Exec(fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
 		_ = conn.Exec("ROLLBACK")
 		return fmt.Errorf("store: set user_version: %w", err)
@@ -115,6 +150,49 @@ func migrate(conn *sqlite3.Conn) error {
 		return fmt.Errorf("store: commit migration: %w", err)
 	}
 	return nil
+}
+
+// migrateToV2 adds the segments.referenced column (Task 8: event-mode
+// recording's retain/discard mechanism — see schema.sql's doc comment on the
+// column) to a database that doesn't have it yet. DEFAULT 1 means every
+// pre-existing row (recorded before this column existed, i.e. under
+// continuous-mode recording only, since events mode didn't exist either) is
+// retroactively treated as referenced/retained — none of it is newly
+// eligible for the events-mode janitor's deletion just because this column
+// was added. Guarded by hasColumn so it's a no-op when schemaSQL (a fresh
+// install going straight from version 0) already created the column
+// directly.
+func migrateToV2(conn *sqlite3.Conn) error {
+	has, err := hasColumn(conn, "segments", "referenced")
+	if err != nil {
+		return err
+	}
+	if has {
+		return nil
+	}
+	return conn.Exec("ALTER TABLE segments ADD COLUMN referenced INTEGER NOT NULL DEFAULT 1")
+}
+
+// hasColumn reports whether table has a column named column, via PRAGMA
+// table_info (the standard SQLite way to introspect a table's columns
+// without depending on sqlite_master's raw CREATE TABLE SQL text).
+func hasColumn(conn *sqlite3.Conn, table, column string) (bool, error) {
+	stmt, _, err := conn.Prepare(fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return false, fmt.Errorf("store: prepare table_info(%s): %w", table, err)
+	}
+	defer stmt.Close()
+
+	for stmt.Step() {
+		// PRAGMA table_info columns: cid, name, type, notnull, dflt_value, pk.
+		if stmt.ColumnText(1) == column {
+			return true, nil
+		}
+	}
+	if err := stmt.Err(); err != nil {
+		return false, fmt.Errorf("store: scan table_info(%s): %w", table, err)
+	}
+	return false, nil
 }
 
 // userVersion reads the database's current PRAGMA user_version.

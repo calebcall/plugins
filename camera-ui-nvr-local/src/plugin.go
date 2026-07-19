@@ -107,6 +107,8 @@
 package main
 
 import (
+	"sync"
+
 	sdk "github.com/cameraui/sdk/go"
 
 	"github.com/calebcall/plugins/camera-ui-nvr-local/src/recorder"
@@ -151,6 +153,13 @@ type NVRPlugin struct {
 	// CameraDevice.OnDetectionEvent so OnCameraReleased can unsubscribe
 	// exactly the released camera (see events_ingest.go).
 	detectionSubs detectionSubscriptions
+
+	// recorders backs detectionEventIngester's eventRecorderLookup
+	// (events_ingest.go), letting DetectionEvent ingestion call MarkEvent on
+	// the camera's live recorder when one is registered. Zero value is
+	// ready to use (an always-empty registry) — see recorderRegistry's doc
+	// comment for why nothing populates it yet.
+	recorders recorderRegistry
 }
 
 // Compile-time assertions that NVRPlugin implements the optional SDK
@@ -245,7 +254,58 @@ func (p *NVRPlugin) OnCameraAdded(camera *sdk.CameraDevice) error {
 
 func (p *NVRPlugin) OnCameraReleased(cameraID string) error {
 	p.detectionSubs.remove(cameraID)
+	p.recorders.Remove(cameraID)
 	return p.recorder.Remove(cameraID)
+}
+
+// recorderRegistry maps camera IDs to the *recorder.Recorder instance
+// currently recording them, backing detectionEventIngester's
+// eventRecorderLookup (events_ingest.go: RecorderFor). Nothing populates it
+// yet in this build: constructing and Start()ing one *recorder.Recorder per
+// managed camera — tying RecorderManager's RecorderEntry/RecordingConfig
+// (manager.go) to a live ffmpeg process — is explicitly deferred to a later
+// task per Task 7's own report ("Wiring one *Recorder per
+// continuously-recorded RecorderEntry is left to whichever later task
+// orchestrates RecorderManager against real cameras"). This type is that
+// later task's extension point: Set/Remove for it to call as recorders
+// start/stop, RecorderFor for detectionEventIngester to query on every
+// DetectionEvent. OnCameraReleased above already calls Remove so a stale
+// entry doesn't outlive its camera once something starts adding them.
+//
+// *recorder.Recorder satisfies eventRecorder (MarkEvent(startMs, endMs
+// int64)) directly — no adapter needed, unlike sdkManagedCamera above.
+type recorderRegistry struct {
+	mu   sync.Mutex
+	recs map[string]*recorder.Recorder
+}
+
+// Set registers rec as cameraID's live recorder, replacing any previous
+// entry for the same id.
+func (r *recorderRegistry) Set(cameraID string, rec *recorder.Recorder) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.recs == nil {
+		r.recs = make(map[string]*recorder.Recorder)
+	}
+	r.recs[cameraID] = rec
+}
+
+// Remove unregisters cameraID's recorder, if any. A no-op for an unknown id.
+func (r *recorderRegistry) Remove(cameraID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.recs, cameraID)
+}
+
+// RecorderFor implements eventRecorderLookup.
+func (r *recorderRegistry) RecorderFor(cameraID string) (eventRecorder, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rec, ok := r.recs[cameraID]
+	if !ok {
+		return nil, false
+	}
+	return rec, true
 }
 
 // sdkManagedCamera adapts a real *sdk.CameraDevice to recorder.ManagedCamera.
@@ -286,6 +346,6 @@ func (p *NVRPlugin) attachDetectionIngestion(cam *sdk.CameraDevice) {
 	if p.events == nil {
 		return
 	}
-	ingester := newDetectionEventIngester(p.events, p.Logger)
+	ingester := newDetectionEventIngester(p.events, &p.recorders, p.Logger)
 	p.detectionSubs.add(cam.ID(), cam.OnDetectionEvent(ingester.handle))
 }

@@ -1,6 +1,11 @@
 package store
 
-import "testing"
+import (
+	"path/filepath"
+	"testing"
+
+	"github.com/ncruces/go-sqlite3"
+)
 
 // TestOpen_CreatesSchema verifies that Open bootstraps a fresh database
 // with every table the later store layers (segments, events, faces,
@@ -74,6 +79,73 @@ func TestOpen_IsIdempotent(t *testing.T) {
 	}
 	if v2 != schemaVersion {
 		t.Errorf("user_version after second Open = %d, want %d (unchanged)", v2, schemaVersion)
+	}
+}
+
+// TestMigrateToV2_AddsColumnToExistingV1Database proves the Task 8
+// incremental migration path (migrate's `current < 2` step, migrateToV2):
+// given a database file left at PRAGMA user_version 1 by an earlier build
+// (its segments table created without the referenced column, exactly as
+// schema.sql looked before this task), re-opening it via Open brings it to
+// schemaVersion, adds the column via ALTER TABLE, and — critically —
+// defaults every pre-existing row to referenced=true so footage recorded
+// before this feature existed is never swept by the new events-mode
+// janitor. This directly exercises the incremental-migration code path that
+// TestOpen_CreatesSchema/TestOpen_IsIdempotent (a fresh database going
+// straight to schemaVersion via schemaSQL) cannot: those never take the
+// `current < 2` / migrateToV2 branch at all.
+func TestMigrateToV2_AddsColumnToExistingV1Database(t *testing.T) {
+	dir := t.TempDir()
+
+	// Hand-build a v1 database: schemaSQL as it existed before this task
+	// (segments table with no referenced column), user_version pinned to 1,
+	// and one pre-existing segment row — standing in for footage a real
+	// install already recorded under continuous mode before upgrading.
+	conn, err := sqlite3.Open(filepath.Join(dir, dbFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Exec(`CREATE TABLE segments (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		camera_id TEXT, role TEXT, path TEXT,
+		start_ms INTEGER, end_ms INTEGER,
+		has_video INTEGER, has_audio INTEGER, codec TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Exec("PRAGMA user_version = 1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Exec(`INSERT INTO segments (camera_id, role, path, start_ms, end_ms)
+		VALUES ('cam1', 'high', '/rec/pre-existing.mp4', 0, 1000)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open (migrate v1 -> v2): %v", err)
+	}
+	defer db.Close()
+
+	v, err := userVersion(db.Conn())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v != schemaVersion {
+		t.Errorf("user_version after migration = %d, want %d", v, schemaVersion)
+	}
+
+	got, err := NewSegmentStore(db).InRange("cam1", "high", 0, 2000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected the pre-existing segment to survive migration, got %d rows", len(got))
+	}
+	if !got[0].Referenced {
+		t.Errorf("expected the pre-existing row to default to referenced=true after migration, got %+v", got[0])
 	}
 }
 
