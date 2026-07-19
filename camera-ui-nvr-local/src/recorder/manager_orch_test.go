@@ -49,11 +49,14 @@ func (h *fakeRecorderHandle) snapshot() (started, stopped int) {
 // RecorderConfig it was called with and keeps the most recently created
 // fakeRecorderHandle per camera ID, so a test can find "the handle currently
 // backing this camera" without RecorderManager exposing its internal active
-// map.
+// map. all additionally keeps EVERY handle ever created (not just the most
+// recent per camera), for the concurrency/leak tests below, which need to
+// inspect every handle a camera ID ever had, not just the latest.
 type fakeRecorderFactory struct {
 	mu      sync.Mutex
 	calls   []RecorderConfig
 	handles map[string]*fakeRecorderHandle
+	all     []*fakeRecorderHandle
 }
 
 func newFakeRecorderFactory() *fakeRecorderFactory {
@@ -67,8 +70,26 @@ func (f *fakeRecorderFactory) factory() RecorderFactory {
 		f.calls = append(f.calls, cfg)
 		h := &fakeRecorderHandle{cfg: cfg}
 		f.handles[cfg.CameraID] = h
+		f.all = append(f.all, h)
 		return h
 	}
+}
+
+// allHandlesFor returns every handle ever created for cameraID, in creation
+// order.
+func (f *fakeRecorderFactory) allHandlesFor(cameraID string) []*fakeRecorderHandle {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []*fakeRecorderHandle
+	for _, h := range f.all {
+		h.mu.Lock()
+		id := h.cfg.CameraID
+		h.mu.Unlock()
+		if id == cameraID {
+			out = append(out, h)
+		}
+	}
+	return out
 }
 
 func (f *fakeRecorderFactory) callCount() int {
@@ -405,6 +426,74 @@ func TestRemove_UnknownOrInactiveCameraIsNoop(t *testing.T) {
 
 	if err := m.Remove("does-not-exist"); err != nil {
 		t.Fatalf("expected Remove of an unmanaged camera to be a no-op, got %v", err)
+	}
+}
+
+// TestAdd_ConcurrentSameCameraID_NoHandleLeak is the review-fix regression
+// test for the concurrent-restart handle leak: syncRecording's stop-old/
+// start-new sequence used to run as two independently-locked map operations
+// with no exclusion between them for a given camera ID, so two overlapping
+// Add calls for the SAME id could each successfully Start a handle, with
+// the loser's handle silently overwritten (and never Stopped) in m.active
+// once the winner's write ran after it — a goroutine/ffmpeg leak invisible
+// to StopAll/Shutdown, since the leaked handle is no longer reachable from
+// m.active at all.
+//
+// Fires a burst of concurrent Add calls (occasionally interleaved with a
+// Remove) for one camera ID from multiple goroutines, then asserts the
+// invariant that must hold regardless of interleaving: for every handle
+// fakeRecorderFactory ever built for that camera, started == stopped + (1
+// if it's still the one currently tracked in m.active, else 0) — i.e.
+// nothing was ever started without eventually being stopped (or still
+// legitimately running as the sole survivor).
+func TestAdd_ConcurrentSameCameraID_NoHandleLeak(t *testing.T) {
+	m := NewRecorderManager()
+	factory := newFakeRecorderFactory()
+	m.ConfigureRecording("/data", 0, factory.factory())
+	if err := m.StartAll(); err != nil {
+		t.Fatalf("StartAll: %v", err)
+	}
+
+	const cameraID = "cam-1"
+	const n = 40
+
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			defer wg.Done()
+			if i%7 == 0 {
+				_ = m.Remove(cameraID)
+				return
+			}
+			_ = m.Add(newFakeCamera(cameraID, "A", RecordingModeContinuous))
+		}(i)
+	}
+	wg.Wait()
+
+	m.mu.Lock()
+	activeHandle, stillActive := m.active[cameraID]
+	activeCount := len(m.active)
+	m.mu.Unlock()
+
+	if activeCount > 1 {
+		t.Fatalf("expected at most 1 active handle tracked across all cameras, got %d", activeCount)
+	}
+
+	handles := factory.allHandlesFor(cameraID)
+	if len(handles) == 0 {
+		t.Fatalf("expected at least one handle to have been created for %s", cameraID)
+	}
+
+	for i, h := range handles {
+		started, stopped := h.snapshot()
+		wantActive := 0
+		if stillActive && h == activeHandle {
+			wantActive = 1
+		}
+		if started != stopped+wantActive {
+			t.Errorf("handle %d leaked: started=%d stopped=%d stillActive=%v (want started == stopped + %d)", i, started, stopped, h == activeHandle, wantActive)
+		}
 	}
 }
 

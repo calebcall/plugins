@@ -297,6 +297,13 @@ func NewPlugin(logger *sdk.Logger, api *sdk.PluginAPI, storage *sdk.DeviceStorag
 		// p.segments.
 		ff := recorder.ResolveFFmpeg()
 		p.recorder.ConfigureRecording(api.StoragePath, 0, p.newRecorderFactory(ff))
+		// Wires RecorderManager's own lifecycle logging (recorder
+		// started/stopped/restarted, StartAll summaries, start failures —
+		// see RecorderManager.SetLogger's doc comment) through this
+		// plugin's logger, so operators can actually see recording
+		// lifecycle events rather than recording running with no
+		// visibility at all.
+		p.recorder.SetLogger(p.Logger)
 	}
 
 	api.On(string(sdk.APIEventFinishLaunching), func(...any) {

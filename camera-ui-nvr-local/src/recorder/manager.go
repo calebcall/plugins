@@ -212,6 +212,35 @@ type RecorderManager struct {
 	rootCtx    context.Context
 	rootCancel context.CancelFunc
 	active     map[string]RecorderHandle
+
+	// camLocksMu/camLocks serialize, per camera ID, the "stop the currently
+	// active handle, then (unless mode is off) start a fresh one" sequence
+	// (see startOrRestartRecorder) — the review fix for a concurrent-Add
+	// leak: without a per-ID lock, two overlapping calls for the SAME
+	// camera ID could each successfully Start a handle, with the loser's
+	// handle silently overwritten (and never Stopped) in m.active once the
+	// winner's write ran after it — a goroutine/ffmpeg leak invisible to
+	// StopAll/Shutdown, since the leaked handle is no longer reachable from
+	// m.active at all.
+	//
+	// Deliberately a SEPARATE lock from m.mu, keyed per camera ID: the
+	// whole point is to hold exclusivity across the blocking
+	// handle.Start/Stop calls (which may wait out real ffmpeg/supervision
+	// goroutines) without ever holding m.mu itself across that wait — m.mu
+	// is still only ever held for short, independent map reads/writes
+	// inside startRecorder/stopRecorder. camLocks entries are created
+	// lazily and never removed (bounded by the number of distinct camera
+	// IDs ever seen across this manager's lifetime, which for a single NVR
+	// instance is small).
+	camLocksMu sync.Mutex
+	camLocks   map[string]*sync.Mutex
+
+	// log reports recorder lifecycle events (started/stopped/restarted,
+	// StartAll summaries, start failures) — see logf/warnf. nil (the zero
+	// value, matching every test that doesn't call SetLogger) silently
+	// skips every log call rather than panicking, the same nil-logger
+	// tolerance recorder.go's Recorder.logf already established.
+	log *sdk.Logger
 }
 
 // NewRecorderManager returns an empty manager. Recording config lives on
@@ -237,18 +266,30 @@ func (m *RecorderManager) Configure(cameras []ManagedCamera) error {
 }
 
 // Add registers (or re-registers, re-reading its config) a single camera.
-// Intended for the Hub OnCameraAdded callback — and, since re-adding an
-// already-known camera ID re-reads its config from scratch, also the
-// mechanism a live per-camera settings edit (recordingMode/roles/pre-post
-// roll) flows through: there is no separate SDK "config changed" hook (see
-// sdk.Plugin), so whatever notices a stored value changed is expected to
-// call Add again for that camera.
+// Intended for the Hub OnCameraAdded callback.
 //
 // Once recording has been launched (StartAll has run), this also
 // starts/restarts/stops that camera's live Recorder to match its
 // (re-)resolved config — see syncRecording. Before StartAll, this only
 // updates the registry; StartAll picks up whatever's registered when it
 // eventually runs.
+//
+// KNOWN LIMITATION (documented, not fixed, per review): re-adding an
+// already-known camera ID DOES re-read its config from scratch and restart
+// its Recorder to match — so Add is technically capable of being the
+// mechanism a live per-camera settings edit (recordingMode/roles/pre-post
+// roll) flows through. But nothing in this plugin actually calls Add for
+// that reason today: the SDK's sdk.Plugin interface has no "camera config
+// changed" hook at all (only ConfigureCameras once at startup, and
+// OnCameraAdded/OnCameraReleased for assignment changes — see sdk.Plugin's
+// own doc comment, "the host calls these methods... as the user adds or
+// removes cameras", nothing about editing an already-assigned one). So in
+// production, editing an already-adopted camera's recording settings has NO
+// effect on its already-running Recorder until the plugin (or camera.ui
+// itself) restarts and ConfigureCameras runs again with the new values. A
+// later task could close this gap with a periodic reconcile pass (re-read
+// every managed camera's stored config on a timer and call Add for any that
+// changed) — out of scope here.
 func (m *RecorderManager) Add(cam ManagedCamera) error {
 	r := newRecorder(cam)
 
@@ -266,12 +307,18 @@ func (m *RecorderManager) Add(cam ManagedCamera) error {
 // callback. Removing an unknown ID is a no-op, not an error. Also stops and
 // deregisters that camera's live Recorder, if one is currently active —
 // a no-op if recording was never launched or the camera had none (e.g. it
-// was already mode "off").
+// was already mode "off"). Takes the same per-camera-ID lock
+// startOrRestartRecorder does, so a Remove can never race a concurrent
+// Add/restart for the same camera into the handle-leak this file's review
+// fix closed (see camLocks's doc comment).
 func (m *RecorderManager) Remove(cameraID string) error {
 	m.mu.Lock()
 	delete(m.recorders, cameraID)
 	m.mu.Unlock()
 
+	lock := m.camLock(cameraID)
+	lock.Lock()
+	defer lock.Unlock()
 	m.stopRecorder(cameraID)
 	return nil
 }
@@ -289,6 +336,12 @@ func (m *RecorderManager) Remove(cameraID string) error {
 // Safe to call once, before StartAll is ever invoked; calling it again
 // replaces the previous configuration (production wiring only ever calls
 // this once, at startup, mirroring ConfigureRetention's own contract).
+//
+// See SetLogger for wiring this manager's lifecycle logging, and Add's own
+// doc comment for the known limitation that a config change to an
+// already-adopted camera has no live effect (no SDK hook fires for it) —
+// neither of those is a ConfigureRecording concern, called out here only so
+// a reader wiring this up (plugin.go) sees both nearby.
 func (m *RecorderManager) ConfigureRecording(dataDir string, segmentSeconds int, factory RecorderFactory) {
 	if segmentSeconds <= 0 {
 		segmentSeconds = defaultSegmentSeconds
@@ -298,6 +351,57 @@ func (m *RecorderManager) ConfigureRecording(dataDir string, segmentSeconds int,
 	m.segmentSeconds = segmentSeconds
 	m.recorderFactory = factory
 	m.mu.Unlock()
+}
+
+// SetLogger wires the *sdk.Logger RecorderManager uses to report recorder
+// lifecycle events: started/stopped/restarted, a StartAll summary, and a
+// warning when a camera's Recorder fails to start. Optional — a manager
+// with no logger set (the zero value, matching every test that predates
+// this) silently skips every log call via logf/warnf instead of panicking,
+// mirroring Recorder's own nil-logger tolerance (recorder.go). Safe to call
+// at any time; production wiring (plugin.go) calls it once, alongside
+// ConfigureRecording.
+func (m *RecorderManager) SetLogger(log *sdk.Logger) {
+	m.mu.Lock()
+	m.log = log
+	m.mu.Unlock()
+}
+
+func (m *RecorderManager) logf(format string, args ...any) {
+	m.mu.RLock()
+	log := m.log
+	m.mu.RUnlock()
+	if log == nil {
+		return
+	}
+	log.Log(fmt.Sprintf(format, args...))
+}
+
+func (m *RecorderManager) warnf(format string, args ...any) {
+	m.mu.RLock()
+	log := m.log
+	m.mu.RUnlock()
+	if log == nil {
+		return
+	}
+	log.Warn(fmt.Sprintf(format, args...))
+}
+
+// camLock returns the per-camera-ID mutex startOrRestartRecorder/Remove hold
+// across their stop/start sequence for cameraID, creating it on first use.
+// See camLocks's doc comment for why this is a separate lock from m.mu.
+func (m *RecorderManager) camLock(cameraID string) *sync.Mutex {
+	m.camLocksMu.Lock()
+	defer m.camLocksMu.Unlock()
+	if m.camLocks == nil {
+		m.camLocks = make(map[string]*sync.Mutex)
+	}
+	l, ok := m.camLocks[cameraID]
+	if !ok {
+		l = &sync.Mutex{}
+		m.camLocks[cameraID] = l
+	}
+	return l
 }
 
 // StartAll starts a Recorder for every currently registered camera whose
@@ -327,15 +431,27 @@ func (m *RecorderManager) StartAll() error {
 	m.launched = true
 	m.mu.Unlock()
 
+	started := 0
+	attempted := 0
 	var errs []error
 	for _, entry := range m.entriesSnapshot() {
 		if entry.Config.Mode == RecordingModeOff {
 			continue
 		}
-		if err := m.startRecorder(entry); err != nil {
+		attempted++
+		// Takes the per-camera-ID lock (via startOrRestartRecorder, which
+		// no-ops the "stop" half since nothing is active for a camera yet
+		// at initial launch) rather than calling startRecorder directly, so
+		// a concurrent Add for the same camera ID racing this very first
+		// pass can't double-start it either — the same exclusion Add/Remove
+		// rely on for a config-change restart.
+		if err := m.startOrRestartRecorder(entry); err != nil {
 			errs = append(errs, fmt.Errorf("camera %s: %w", entry.CameraID, err))
+			continue
 		}
+		started++
 	}
+	m.logf("recorder: StartAll: started %d of %d managed camera(s)", started, attempted)
 	return errors.Join(errs...)
 }
 
@@ -367,7 +483,9 @@ func (m *RecorderManager) StopAll() {
 // CameraID, then — unless the resolved mode is "off" — starts a fresh one
 // from entry's (possibly just-changed) config. Called from Add for every
 // registration, so both a genuinely new camera and a config change to an
-// already-managed one (Add's own doc comment) take effect immediately.
+// already-managed one (Add's own doc comment, including its documented
+// limitation that nothing currently triggers this for a live settings edit)
+// take effect immediately once something does call Add.
 //
 // A no-op before StartAll has ever run (m.launched false): there is nothing
 // to stop yet, and starting anything before ConfigureRecording's
@@ -382,9 +500,41 @@ func (m *RecorderManager) syncRecording(entry RecorderEntry) error {
 		return nil
 	}
 
-	m.stopRecorder(entry.CameraID)
+	return m.startOrRestartRecorder(entry)
+}
+
+// startOrRestartRecorder serializes, per camera ID (via camLock), the
+// sequence "stop any currently active handle for this camera, then (unless
+// mode is off) build and start a fresh one from entry's current config".
+//
+// This per-ID lock is the review fix for a handle leak: without it, two
+// concurrent callers for the SAME camera ID (e.g. two overlapping Add
+// calls, or Add racing StartAll's own initial pass for a camera Add already
+// registered before StartAll ran) could each independently read "nothing
+// active yet"/"stop then start", and each successfully Start a handle —
+// with the loser's handle silently overwritten (and never Stopped) in
+// m.active once the winner's write ran after it. Holding camLock(cameraID)
+// for the whole stop→start→record sequence means only one such sequence can
+// ever be in flight for a given camera ID at a time, so m.active always
+// ends up holding exactly the most recently started handle, and every
+// handle that was ever started is either that one or was Stopped by the
+// next sequence that replaced it.
+//
+// Deliberately does NOT hold m.mu itself across this — see camLocks's doc
+// comment — so a concurrent call for a DIFFERENT camera ID, or an unrelated
+// read (ManagedCameraIDs, Camera, entriesSnapshot), is never blocked
+// waiting on this one's potentially-slow handle.Start/Stop.
+func (m *RecorderManager) startOrRestartRecorder(entry RecorderEntry) error {
+	lock := m.camLock(entry.CameraID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	restarting := m.stopRecorder(entry.CameraID)
 	if entry.Config.Mode == RecordingModeOff {
 		return nil
+	}
+	if restarting {
+		m.logf("recorder: restarting camera %s (config changed)", entry.CameraID)
 	}
 	return m.startRecorder(entry)
 }
@@ -395,9 +545,11 @@ func (m *RecorderManager) syncRecording(entry RecorderEntry) error {
 // once Start has actually succeeded — records it in m.active so a later
 // stopRecorder/StopAll can find and stop it. A no-op, returning nil, if
 // recording hasn't been configured or the manager's root context doesn't
-// exist yet (StartAll hasn't run) — callers (StartAll, syncRecording) only
-// reach this once both are true, but this guard keeps startRecorder safe to
-// call on its own too.
+// exist yet (StartAll hasn't run) — callers (StartAll, syncRecording, both
+// via startOrRestartRecorder) only reach this once both are true, but this
+// guard keeps startRecorder safe to call on its own too.
+//
+// Callers must hold camLock(entry.CameraID) — see startOrRestartRecorder.
 func (m *RecorderManager) startRecorder(entry RecorderEntry) error {
 	m.mu.RLock()
 	factory := m.recorderFactory
@@ -422,6 +574,7 @@ func (m *RecorderManager) startRecorder(entry RecorderEntry) error {
 
 	handle := factory(cfg)
 	if err := handle.Start(ctx); err != nil {
+		m.warnf("recorder: camera %s: start failed: %v", entry.CameraID, err)
 		return fmt.Errorf("start recorder: %w", err)
 	}
 
@@ -431,13 +584,20 @@ func (m *RecorderManager) startRecorder(entry RecorderEntry) error {
 	}
 	m.active[entry.CameraID] = handle
 	m.mu.Unlock()
+
+	m.logf("recorder: started camera %s (mode=%s roles=%v)", entry.CameraID, entry.Config.Mode, entry.Config.Roles)
 	return nil
 }
 
 // stopRecorder stops and deregisters cameraID's currently active Recorder,
-// if any. A no-op for a camera with none (never started, already stopped,
-// or mode "off").
-func (m *RecorderManager) stopRecorder(cameraID string) {
+// if any, and reports whether there was one to stop (so
+// startOrRestartRecorder can tell a genuine restart from a first start for
+// its log line). A no-op — returning false — for a camera with none (never
+// started, already stopped, or mode "off").
+//
+// Callers must hold camLock(cameraID) — see startOrRestartRecorder; Remove
+// (the other caller) takes it directly itself.
+func (m *RecorderManager) stopRecorder(cameraID string) bool {
 	m.mu.Lock()
 	handle, ok := m.active[cameraID]
 	if ok {
@@ -445,9 +605,12 @@ func (m *RecorderManager) stopRecorder(cameraID string) {
 	}
 	m.mu.Unlock()
 
-	if ok {
-		_ = handle.Stop()
+	if !ok {
+		return false
 	}
+	_ = handle.Stop()
+	m.logf("recorder: stopped camera %s", cameraID)
+	return true
 }
 
 // Camera returns the registered Recorder for id, if any.
