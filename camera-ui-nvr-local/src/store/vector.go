@@ -130,11 +130,21 @@ func (b *bruteForceVectorBackend) Query(embedding []float32, k int) ([]VectorMat
 		return nil, nil
 	}
 
-	stmt, _, err := b.conn.Prepare(fmt.Sprintf("SELECT id, embedding FROM %s", b.table))
+	// Only compare rows whose stored dimension matches the query vector.
+	// Without this filter, a single row left over from a different
+	// embedding model (a different dim) would make cosineDistance error
+	// out and abort the whole query, discarding every valid same-dimension
+	// match — exactly the case the dim column exists to guard against
+	// (e.g. migrating to a new embedding model without a data migration).
+	stmt, _, err := b.conn.Prepare(fmt.Sprintf("SELECT id, embedding FROM %s WHERE dim = ?", b.table))
 	if err != nil {
 		return nil, fmt.Errorf("store: prepare scan of %s: %w", b.table, err)
 	}
 	defer stmt.Close()
+
+	if err := stmt.BindInt(1, len(embedding)); err != nil {
+		return nil, err
+	}
 
 	var matches []VectorMatch
 	for stmt.Step() {

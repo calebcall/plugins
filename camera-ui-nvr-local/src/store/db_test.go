@@ -34,14 +34,25 @@ func TestOpen_CreatesSchema(t *testing.T) {
 }
 
 // TestOpen_IsIdempotent verifies that re-opening an already-migrated
-// database file does not error and does not attempt to re-run the schema
-// (which would fail on CREATE TABLE without IF NOT EXISTS/guards).
+// database file does not error, does not attempt to re-run the schema
+// (which would fail on CREATE TABLE without IF NOT EXISTS/guards), and
+// leaves PRAGMA user_version at schemaVersion both times — i.e. it actually
+// exercises the `current >= schemaVersion` gate in migrate, not just the
+// IF NOT EXISTS DDL guards (which alone would make this test pass even if
+// that gate were deleted).
 func TestOpen_IsIdempotent(t *testing.T) {
 	dir := t.TempDir()
 
 	db1, err := Open(dir)
 	if err != nil {
 		t.Fatal(err)
+	}
+	v1, err := userVersion(db1.Conn())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v1 != schemaVersion {
+		t.Errorf("user_version after first Open = %d, want %d", v1, schemaVersion)
 	}
 	if err := db1.Close(); err != nil {
 		t.Fatal(err)
@@ -55,6 +66,14 @@ func TestOpen_IsIdempotent(t *testing.T) {
 
 	if !db2.hasTable("cameras") {
 		t.Errorf("missing table cameras after re-open")
+	}
+
+	v2, err := userVersion(db2.Conn())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v2 != schemaVersion {
+		t.Errorf("user_version after second Open = %d, want %d (unchanged)", v2, schemaVersion)
 	}
 }
 
