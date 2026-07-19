@@ -1,5 +1,8 @@
 # Changelog
 
+## 1.0.2
+- Update logo to be Amcrest colors
+
 ## 1.0.1
 
 - Discovery: use dependency-free ONVIF WS-Discovery (unicast subnet sweep) instead of the Dahua DHIP probe, which many Amcrest units don't answer; label discovered/manual cameras as "Amcrest".
