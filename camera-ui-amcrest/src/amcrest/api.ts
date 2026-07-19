@@ -85,7 +85,10 @@ export class AmcrestClient {
   }
 
   async attachEvents(signal: AbortSignal): Promise<ReadableStream<Uint8Array>> {
-    const res = await this.fetch('/cgi-bin/eventManager.cgi?action=attach&codes=[All]', { signal });
+    // heartbeat=N makes the camera emit periodic keep-alives, so the long-lived
+    // stream keeps receiving data and undici's ~5min body timeout
+    // (UND_ERR_BODY_TIMEOUT) never fires on cameras that are idle between events.
+    const res = await this.fetch('/cgi-bin/eventManager.cgi?action=attach&codes=[All]&heartbeat=30', { signal });
     if (!res.body) {
       throw new Error('event stream has no body');
     }

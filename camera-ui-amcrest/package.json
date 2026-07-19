@@ -1,7 +1,7 @@
 {
   "displayName": "Amcrest",
-  "name": "@camera.ui/camera-ui-amcrest",
-  "version": "1.0.0",
+  "name": "@calebcall/camera-ui-amcrest",
+  "version": "1.0.2",
   "description": "Integrates Amcrest and Dahua-compatible IP cameras, doorbells and PTZ cameras into camera.ui via their native CGI API, with discovery, live streaming, two-way audio, PTZ, and motion, object, audio and doorbell events.",
   "author": "calebcall (https://github.com/calebcall/plugins)",
   "type": "module",
@@ -40,7 +40,7 @@
     "updates": "^17.19.1"
   },
   "engines": {
-    "camera.ui": ">=2.0.12",
+    "camera.ui": ">=2.0.15",
     "node": ">=22.0.0"
   },
   "os": [],
