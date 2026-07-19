@@ -107,6 +107,8 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"sync"
 
 	sdk "github.com/cameraui/sdk/go"
@@ -279,6 +281,22 @@ func NewPlugin(logger *sdk.Logger, api *sdk.PluginAPI, storage *sdk.DeviceStorag
 		// simply never reached, so StartRetention below stays a no-op too
 		// (see its own doc comment).
 		p.recorder.ConfigureRetention(p.segments, p.events, p.nvrQuotaGB, db.ClipVectors, db.FaceVectors)
+
+		// Wires StartAll/Add/Remove (Task ORCH, recorder/manager.go) with
+		// what they need to actually build and start a live *recorder.
+		// Recorder per managed camera: api.StoragePath (the same directory
+		// store.Open just opened the SQLite database against — see
+		// recorder.go's outDir, "<DataDir>/recordings/..."), 0 (meaning "use
+		// RecorderManager's own default", currently 60s — see
+		// defaultSegmentSeconds), and newRecorderFactory's closure, which
+		// builds a real *recorder.Recorder against p.segments/ff/p.Logger
+		// and wraps it so Start/Stop also keep p.recorders (this plugin's
+		// event-mode recorder registry) in sync. Guarded the same way
+		// ConfigureRetention is: only reached when db opened successfully,
+		// since a real Recorder would otherwise index segments into a nil
+		// p.segments.
+		ff := recorder.ResolveFFmpeg()
+		p.recorder.ConfigureRecording(api.StoragePath, 0, p.newRecorderFactory(ff))
 	}
 
 	api.On(string(sdk.APIEventFinishLaunching), func(...any) {
@@ -286,9 +304,25 @@ func NewPlugin(logger *sdk.Logger, api *sdk.PluginAPI, storage *sdk.DeviceStorag
 		if err := p.recorder.StartRetention(0, nil); err != nil {
 			p.Logger.Error("nvr-local: start retention gc failed:", err)
 		}
+		// StartAll (recorder/manager.go) starts one *recorder.Recorder per
+		// camera ConfigureCameras already registered above (mode != off) —
+		// safe to call here specifically because the SDK guarantees
+		// ConfigureCameras has already returned by the time
+		// APIEventFinishLaunching fires (see sdk.APIEventFinishLaunching's
+		// own doc comment), so the managed-camera registry is stable before
+		// any Recorder is built from it.
+		if err := p.recorder.StartAll(); err != nil {
+			p.Logger.Error("nvr-local: start recorders failed:", err)
+		}
 	})
 	api.On(string(sdk.APIEventShutdown), func(...any) {
 		p.Logger.Log("nvr-local: shutdown")
+		// StopAll blocks until every active Recorder's own Stop has
+		// returned (each one waits out its supervised ffmpeg
+		// goroutines) — deliberately before StopRetention/db.Close, so
+		// nothing is still indexing segments into p.segments/p.db by the
+		// time the database is closed.
+		p.recorder.StopAll()
 		p.recorder.StopRetention()
 		if p.db != nil {
 			if err := p.db.Close(); err != nil {
@@ -298,6 +332,49 @@ func NewPlugin(logger *sdk.Logger, api *sdk.PluginAPI, storage *sdk.DeviceStorag
 	})
 
 	return p
+}
+
+// newRecorderFactory returns a recorder.RecorderFactory that builds a real
+// *recorder.Recorder (backed by p.segments/ff/p.Logger) for every
+// RecorderConfig RecorderManager asks for, and wraps it in
+// recorderHandleWithRegistry so that Recorder's Start/Stop lifecycle also
+// keeps p.recorders (the recorderRegistry backing detectionEventIngester's
+// MarkEvent lookup, above) in sync — registered while running, deregistered
+// once stopped. This is the only place a real *recorder.Recorder is ever
+// constructed in this plugin.
+func (p *NVRPlugin) newRecorderFactory(ff *recorder.FFmpeg) recorder.RecorderFactory {
+	return func(cfg recorder.RecorderConfig) recorder.RecorderHandle {
+		rec := recorder.NewRecorder(cfg, p.segments, ff, p.Logger)
+		return recorderHandleWithRegistry{rec: rec, cameraID: cfg.CameraID, registry: &p.recorders}
+	}
+}
+
+// recorderHandleWithRegistry adapts a real *recorder.Recorder to
+// recorder.RecorderHandle while also keeping the parent plugin's
+// recorderRegistry (p.recorders) in sync with RecorderManager's own
+// start/stop lifecycle: Set on a successful Start (so a start failure never
+// registers a recorder that isn't actually running), Remove on Stop. Without
+// this wrapper, *recorder.Recorder already satisfies RecorderHandle directly
+// (Start/Stop match exactly) — this type exists purely for the registry side
+// effect, the same reason sdkManagedCamera below exists to bridge a
+// return-type mismatch rather than behavior RecorderManager itself needs.
+type recorderHandleWithRegistry struct {
+	rec      *recorder.Recorder
+	cameraID string
+	registry *recorderRegistry
+}
+
+func (h recorderHandleWithRegistry) Start(ctx context.Context) error {
+	if err := h.rec.Start(ctx); err != nil {
+		return err
+	}
+	h.registry.Set(h.cameraID, h.rec)
+	return nil
+}
+
+func (h recorderHandleWithRegistry) Stop() error {
+	h.registry.Remove(h.cameraID)
+	return h.rec.Stop()
 }
 
 // ConfigureCameras, OnCameraAdded and OnCameraReleased satisfy sdk.Plugin.
@@ -398,6 +475,27 @@ func (c sdkManagedCamera) ID() string   { return c.dev.ID() }
 func (c sdkManagedCamera) Name() string { return c.dev.Name() }
 func (c sdkManagedCamera) Storage() recorder.CameraStorage {
 	return c.dev.Storage()
+}
+
+// StreamURL resolves the RTSP/go2rtc URL for one of this camera's configured
+// stream sources by role (e.g. sdk.CameraRoleHighRes, "high-resolution" —
+// see recorder/manager.go's defaultRoles). *sdk.CameraDevice has no public
+// StreamUrl(role) method of its own — only per-role source getters
+// (HighResolutionSource, MidResolutionSource, ...) and the generic Sources/
+// GetSourceByID, each returning a *CameraDeviceSource whose SourceURL()
+// method is the public equivalent of the device's own unexported
+// getStreamURL default path (camera_device.go: "Default: return the
+// source's default RTSP URL"). Iterating Sources() by Role() rather than
+// switching on the known role constants keeps this forward-compatible with
+// any role string a camera's config happens to store, without this adapter
+// needing to enumerate sdk.CameraRole's cases itself.
+func (c sdkManagedCamera) StreamURL(role string) (string, error) {
+	for _, src := range c.dev.Sources() {
+		if string(src.Role()) == role {
+			return src.SourceURL(), nil
+		}
+	}
+	return "", fmt.Errorf("nvr-local: camera %s: no stream source for role %q", c.dev.ID(), role)
 }
 
 // attachDetectionIngestion subscribes to cam's detection-event stream via

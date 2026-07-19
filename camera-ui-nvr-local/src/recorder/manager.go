@@ -15,6 +15,9 @@
 package recorder
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"sort"
 	"sync"
 
@@ -67,13 +70,25 @@ type CameraStorage interface {
 }
 
 // ManagedCamera is the minimal camera shape RecorderManager needs: enough to
-// identify a camera and read its recording config. Kept intentionally
-// narrow (YAGNI) — add methods here only when a concrete need shows up in a
-// later task.
+// identify a camera, read its recording config, and (Task ORCH) resolve the
+// RTSP/go2rtc URL for one of its stream roles so a live Recorder can be
+// started against it. Kept intentionally narrow (YAGNI) — add methods here
+// only when a concrete need shows up in a later task.
+//
+// StreamURL is the one addition this task makes: it is deliberately a
+// method on ManagedCamera rather than a bare string, mirroring
+// RecorderConfig.StreamURL's own doc comment (recorder.go) — the URL may
+// need re-resolving on every (re)connect attempt, not just once. A real
+// *sdk.CameraDevice cannot be constructed in tests (newCameraDeviceProxy is
+// unexported), which is exactly why this stays on the interface instead of
+// RecorderManager reaching for *sdk.CameraDevice directly: the parent
+// package's sdkManagedCamera adapter (plugin.go) is the only place a real
+// device is bridged to it; tests use fakeCamera.
 type ManagedCamera interface {
 	ID() string
 	Name() string
 	Storage() CameraStorage
+	StreamURL(role string) (string, error)
 }
 
 // RecordingConfig is one camera's resolved recording settings.
@@ -108,7 +123,50 @@ type RecorderEntry struct {
 	CameraID string
 	Name     string
 	Config   RecordingConfig
+
+	// StreamURL resolves cam.StreamURL for the camera this entry was built
+	// from (see newRecorder) — carried on the entry itself, rather than
+	// requiring callers to keep the original ManagedCamera around, so
+	// StartAll/syncRecording (below) can build a RecorderConfig purely from
+	// the registry, well after ConfigureCameras/Add's ManagedCamera
+	// argument has gone out of scope.
+	StreamURL func(role string) (string, error)
 }
+
+// RecorderHandle is the lifecycle surface RecorderManager needs from a live
+// per-camera recording process: Start begins recording (idempotent, like
+// *recorder.Recorder.Start), Stop cancels it and blocks until it has fully
+// stopped. *Recorder satisfies this directly (its Start/Stop signatures
+// already match) — no adapter needed for tests that exercise a real
+// Recorder, and production wiring (plugin.go) wraps one only to also keep
+// its own event-mode recorder registry in sync.
+//
+// RecorderManager depends on this interface — never *Recorder directly —
+// specifically so orchestration (StartAll/StopAll/syncRecording, below) can
+// be unit-tested with an injected fake RecorderFactory instead of spawning
+// real ffmpeg processes.
+type RecorderHandle interface {
+	Start(ctx context.Context) error
+	Stop() error
+}
+
+// RecorderFactory constructs a RecorderHandle for cfg. Production wiring
+// (plugin.go's NewPlugin, via ConfigureRecording) supplies one that builds a
+// real *Recorder (backed by the plugin's SegmentStore/FFmpeg) and registers
+// it in the plugin's own recorderRegistry so detection-event ingestion's
+// MarkEvent reaches it; tests inject a fake that records the RecorderConfig
+// it was called with and a fake handle whose Start/Stop calls can be
+// asserted on directly.
+type RecorderFactory func(RecorderConfig) RecorderHandle
+
+// defaultSegmentSeconds is the ffmpeg segment duration (RecorderConfig.
+// SegmentSeconds) ConfigureRecording applies when its caller doesn't specify
+// one (segmentSeconds <= 0). A minute is short enough that a given segment's
+// worst-case finalization lag (see recorder.go's postRollWindowMs, the Task
+// 8 events-mode edge this task also fixes) stays small relative to typical
+// pre/post-roll settings, while still being long enough that continuous
+// recording doesn't churn through an excessive number of small files.
+const defaultSegmentSeconds = 60
 
 // RecorderManager tracks which cameras this NVR instance is assigned to
 // (via the Hub camera lifecycle: ConfigureCameras/OnCameraAdded/
@@ -126,6 +184,34 @@ type RecorderManager struct {
 	// as "not configured, nothing to do" rather than panicking. Set once via
 	// ConfigureRetention (production wiring lives in plugin.go).
 	gc *retentionGC
+
+	// recorderFactory, dataDir, and segmentSeconds are the dependencies
+	// StartAll/syncRecording (Task ORCH, below) need to actually build and
+	// start a live Recorder for a managed camera. Set once via
+	// ConfigureRecording; a nil recorderFactory means "recording not
+	// configured", the same "not configured, nothing to do" convention gc
+	// above already established for retention.
+	recorderFactory RecorderFactory
+	dataDir         string
+	segmentSeconds  int
+
+	// launched, rootCtx/rootCancel, and active track this manager's live
+	// orchestration state: launched flips true exactly once, on the first
+	// StartAll call, and back to false on StopAll (so a later StartAll —
+	// not expected in production, where Shutdown ends the process — starts
+	// fresh rather than silently no-op'ing forever). rootCtx is the parent
+	// context every started RecorderHandle.Start is given; rootCancel is
+	// released by StopAll after every active handle has already been
+	// stopped individually (a backstop, not the primary shutdown path —
+	// each handle's own Stop() is what actually blocks until its recording
+	// goroutines exit). active maps a managed camera's ID to its currently
+	// running RecorderHandle, if any; a camera can be registered
+	// (m.recorders) without being active (mode "off", or recording not yet
+	// launched).
+	launched   bool
+	rootCtx    context.Context
+	rootCancel context.CancelFunc
+	active     map[string]RecorderHandle
 }
 
 // NewRecorderManager returns an empty manager. Recording config lives on
@@ -151,7 +237,18 @@ func (m *RecorderManager) Configure(cameras []ManagedCamera) error {
 }
 
 // Add registers (or re-registers, re-reading its config) a single camera.
-// Intended for the Hub OnCameraAdded callback.
+// Intended for the Hub OnCameraAdded callback — and, since re-adding an
+// already-known camera ID re-reads its config from scratch, also the
+// mechanism a live per-camera settings edit (recordingMode/roles/pre-post
+// roll) flows through: there is no separate SDK "config changed" hook (see
+// sdk.Plugin), so whatever notices a stored value changed is expected to
+// call Add again for that camera.
+//
+// Once recording has been launched (StartAll has run), this also
+// starts/restarts/stops that camera's live Recorder to match its
+// (re-)resolved config — see syncRecording. Before StartAll, this only
+// updates the registry; StartAll picks up whatever's registered when it
+// eventually runs.
 func (m *RecorderManager) Add(cam ManagedCamera) error {
 	r := newRecorder(cam)
 
@@ -161,16 +258,196 @@ func (m *RecorderManager) Add(cam ManagedCamera) error {
 	}
 	m.recorders[cam.ID()] = r
 	m.mu.Unlock()
-	return nil
+
+	return m.syncRecording(*r)
 }
 
 // Remove unregisters a camera. Intended for the Hub OnCameraReleased
-// callback. Removing an unknown ID is a no-op, not an error.
+// callback. Removing an unknown ID is a no-op, not an error. Also stops and
+// deregisters that camera's live Recorder, if one is currently active —
+// a no-op if recording was never launched or the camera had none (e.g. it
+// was already mode "off").
 func (m *RecorderManager) Remove(cameraID string) error {
 	m.mu.Lock()
 	delete(m.recorders, cameraID)
 	m.mu.Unlock()
+
+	m.stopRecorder(cameraID)
 	return nil
+}
+
+// ConfigureRecording wires the dependencies StartAll/syncRecording need to
+// actually build and start a live Recorder for a managed camera: dataDir is
+// the RecorderConfig.DataDir every built config uses (the plugin's own
+// storage directory — recordings/ lives under it, see recorder.go's outDir),
+// segmentSeconds is the RecorderConfig.SegmentSeconds every built config
+// uses (defaultSegmentSeconds when <= 0), and factory builds the actual
+// RecorderHandle for a given RecorderConfig (production: a real *Recorder,
+// wrapped to also register into the plugin's recorderRegistry — see
+// plugin.go; tests: a fake).
+//
+// Safe to call once, before StartAll is ever invoked; calling it again
+// replaces the previous configuration (production wiring only ever calls
+// this once, at startup, mirroring ConfigureRetention's own contract).
+func (m *RecorderManager) ConfigureRecording(dataDir string, segmentSeconds int, factory RecorderFactory) {
+	if segmentSeconds <= 0 {
+		segmentSeconds = defaultSegmentSeconds
+	}
+	m.mu.Lock()
+	m.dataDir = dataDir
+	m.segmentSeconds = segmentSeconds
+	m.recorderFactory = factory
+	m.mu.Unlock()
+}
+
+// StartAll starts a Recorder for every currently registered camera whose
+// recording mode is not "off" (see ManagedCameraIDs — off-mode cameras get
+// no Recorder). Intended for the APIEventFinishLaunching handler, called
+// once ConfigureCameras/Configure has populated the registry and
+// ConfigureRecording has wired the factory/dataDir/segmentSeconds this needs
+// to build one.
+//
+// A no-op, returning nil, when recording hasn't been configured
+// (ConfigureRecording never called — mirrors StartRetention's own
+// "not configured" no-op) or StartAll has already been called once
+// (launched — calling it again doesn't start a second set of Recorders for
+// every camera; new cameras still start normally via Add/syncRecording).
+// Every per-camera start error is collected (errors.Join) rather than
+// aborting the whole pass, so one camera's failure to start doesn't prevent
+// every other managed camera from recording.
+func (m *RecorderManager) StartAll() error {
+	m.mu.Lock()
+	if m.launched || m.recorderFactory == nil {
+		m.mu.Unlock()
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	m.rootCtx = ctx
+	m.rootCancel = cancel
+	m.launched = true
+	m.mu.Unlock()
+
+	var errs []error
+	for _, entry := range m.entriesSnapshot() {
+		if entry.Config.Mode == RecordingModeOff {
+			continue
+		}
+		if err := m.startRecorder(entry); err != nil {
+			errs = append(errs, fmt.Errorf("camera %s: %w", entry.CameraID, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// StopAll stops every currently active Recorder — blocking until each one's
+// Stop has returned, so a caller (APIEventShutdown) never leaves a recording
+// goroutine running past this call — and marks the manager as no longer
+// launched. Safe to call when nothing was ever started (StartAll never
+// called, or every managed camera is mode "off"); idempotent.
+func (m *RecorderManager) StopAll() {
+	m.mu.Lock()
+	active := m.active
+	m.active = nil
+	cancel := m.rootCancel
+	m.launched = false
+	m.rootCtx = nil
+	m.rootCancel = nil
+	m.mu.Unlock()
+
+	for _, handle := range active {
+		_ = handle.Stop()
+	}
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// syncRecording brings entry's live Recorder in line with its current
+// Config.Mode: stops and deregisters any existing Recorder for entry.
+// CameraID, then — unless the resolved mode is "off" — starts a fresh one
+// from entry's (possibly just-changed) config. Called from Add for every
+// registration, so both a genuinely new camera and a config change to an
+// already-managed one (Add's own doc comment) take effect immediately.
+//
+// A no-op before StartAll has ever run (m.launched false): there is nothing
+// to stop yet, and starting anything before ConfigureRecording's
+// dataDir/segmentSeconds and StartAll's root context exist would be
+// premature — StartAll's own pass over the registry picks up whatever was
+// registered by the time it runs.
+func (m *RecorderManager) syncRecording(entry RecorderEntry) error {
+	m.mu.RLock()
+	launched := m.launched
+	m.mu.RUnlock()
+	if !launched {
+		return nil
+	}
+
+	m.stopRecorder(entry.CameraID)
+	if entry.Config.Mode == RecordingModeOff {
+		return nil
+	}
+	return m.startRecorder(entry)
+}
+
+// startRecorder builds a RecorderConfig from entry (plus this manager's
+// configured dataDir/segmentSeconds), constructs a RecorderHandle via the
+// configured factory, starts it under the manager's root context, and — only
+// once Start has actually succeeded — records it in m.active so a later
+// stopRecorder/StopAll can find and stop it. A no-op, returning nil, if
+// recording hasn't been configured or the manager's root context doesn't
+// exist yet (StartAll hasn't run) — callers (StartAll, syncRecording) only
+// reach this once both are true, but this guard keeps startRecorder safe to
+// call on its own too.
+func (m *RecorderManager) startRecorder(entry RecorderEntry) error {
+	m.mu.RLock()
+	factory := m.recorderFactory
+	dataDir := m.dataDir
+	segmentSeconds := m.segmentSeconds
+	ctx := m.rootCtx
+	m.mu.RUnlock()
+	if factory == nil || ctx == nil {
+		return nil
+	}
+
+	cfg := RecorderConfig{
+		CameraID:       entry.CameraID,
+		StreamURL:      entry.StreamURL,
+		Roles:          entry.Config.Roles,
+		SegmentSeconds: segmentSeconds,
+		DataDir:        dataDir,
+		Mode:           entry.Config.Mode,
+		PreRollS:       entry.Config.PreRollS,
+		PostRollS:      entry.Config.PostRollS,
+	}
+
+	handle := factory(cfg)
+	if err := handle.Start(ctx); err != nil {
+		return fmt.Errorf("start recorder: %w", err)
+	}
+
+	m.mu.Lock()
+	if m.active == nil {
+		m.active = make(map[string]RecorderHandle)
+	}
+	m.active[entry.CameraID] = handle
+	m.mu.Unlock()
+	return nil
+}
+
+// stopRecorder stops and deregisters cameraID's currently active Recorder,
+// if any. A no-op for a camera with none (never started, already stopped,
+// or mode "off").
+func (m *RecorderManager) stopRecorder(cameraID string) {
+	m.mu.Lock()
+	handle, ok := m.active[cameraID]
+	if ok {
+		delete(m.active, cameraID)
+	}
+	m.mu.Unlock()
+
+	if ok {
+		_ = handle.Stop()
+	}
 }
 
 // Camera returns the registered Recorder for id, if any.
@@ -222,9 +499,10 @@ func (m *RecorderManager) entriesSnapshot() []RecorderEntry {
 
 func newRecorder(cam ManagedCamera) *RecorderEntry {
 	return &RecorderEntry{
-		CameraID: cam.ID(),
-		Name:     cam.Name(),
-		Config:   readRecordingConfig(cam.Storage()),
+		CameraID:  cam.ID(),
+		Name:      cam.Name(),
+		Config:    readRecordingConfig(cam.Storage()),
+		StreamURL: cam.StreamURL,
 	}
 }
 

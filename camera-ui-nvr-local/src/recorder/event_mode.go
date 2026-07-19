@@ -247,7 +247,7 @@ func (r *Recorder) promoteIfCovered(seg store.Segment) {
 
 	now := r.nowFn()
 	preRollMs := int64(r.cfg.PreRollS) * 1000
-	postRollMs := int64(r.cfg.PostRollS) * 1000
+	postRollMs := r.postRollWindowMs()
 
 	for _, w := range r.events.snapshot(now, preRollMs, postRollMs) {
 		if !w.open {
@@ -273,7 +273,7 @@ func (r *Recorder) promoteIfCovered(seg store.Segment) {
 func (r *Recorder) promoteOpenWindowsLocked() []windowRange {
 	now := r.nowFn()
 	preRollMs := int64(r.cfg.PreRollS) * 1000
-	postRollMs := int64(r.cfg.PostRollS) * 1000
+	postRollMs := r.postRollWindowMs()
 
 	ranges := r.events.snapshot(now, preRollMs, postRollMs)
 

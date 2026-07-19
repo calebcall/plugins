@@ -233,6 +233,104 @@ func TestRecorder_MarkEvent_NoOpOutsideEventsMode(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// postRollWindowMs grace (Task ORCH's fix for the Task-8-deferred edge): when
+// SegmentSeconds >= PostRollS, a tail post-roll segment might not finalize
+// until after the un-padded window would already have closed. These tests
+// drive promoteIfCovered directly (the call site that would otherwise skip
+// such a segment via its "!w.open" guard) to prove the padded window keeps
+// it eligible, and that no such padding is applied (or needed) when segments
+// are short relative to the configured post-roll.
+// ---------------------------------------------------------------------------
+
+// TestRecorder_PostRollGrace_KeepsLateFinalizedSegmentEligible covers the
+// case the brief calls out: SegmentSeconds (60s) at least as large as
+// PostRollS (5s) means a segment finalized well after eventEnd+PostRollS
+// (but still within eventEnd+PostRollS+SegmentSeconds) must still be
+// promoted — the tail segment isn't orphaned just because ffmpeg hadn't
+// rotated to a new file yet when the un-padded window would have closed.
+func TestRecorder_PostRollGrace_KeepsLateFinalizedSegmentEligible(t *testing.T) {
+	segStore := newTestSegmentStore(t)
+	dir := t.TempDir()
+
+	const preRollS = 0
+	const postRollS = 5
+	const segmentSeconds = 60
+	cfg := RecorderConfig{
+		CameraID:       "cam1",
+		Roles:          []string{"high"},
+		DataDir:        t.TempDir(),
+		Mode:           RecordingModeEvents,
+		PreRollS:       preRollS,
+		PostRollS:      postRollS,
+		SegmentSeconds: segmentSeconds,
+	}
+	r := NewRecorder(cfg, segStore, &FFmpeg{}, nil)
+
+	const eventStart = int64(100_000)
+	const eventEnd = int64(105_000) // eventStart + 5s
+
+	clockMs := eventEnd
+	r.nowFn = func() int64 { return clockMs }
+	r.MarkEvent("evt-1", eventStart, eventEnd)
+
+	// Un-padded, the window would close at eventEnd+postRollS = 110000.
+	// Advance well past that (150000) but still within the padded window
+	// (eventEnd + postRollS*1000 + segmentSeconds*1000 = 165000) before the
+	// tail segment is finalized — simulating ffmpeg only rotating to a new
+	// segment file 45s after the event ended, well within its 60s segment
+	// length.
+	clockMs = 150_000
+	tailSeg := seedSegment(t, dir, segStore, eventEnd+1_000, eventEnd+2_000, false)
+	r.promoteIfCovered(tailSeg)
+
+	if !segmentReferenced(t, segStore, tailSeg) {
+		t.Fatalf("tail post-roll segment finalized after the un-padded window would have closed (but within the SegmentSeconds grace) must still be promoted")
+	}
+}
+
+// TestRecorder_PostRollGrace_NotAppliedWhenSegmentsAreShort proves the grace
+// is conditional: when SegmentSeconds (2s) is comfortably smaller than
+// PostRollS (5s), a segment finalized well after the window's un-padded
+// close time must NOT be promoted — there is no finalization-lag problem to
+// compensate for, so promoteIfCovered's ordinary "window closed" behavior
+// applies unchanged.
+func TestRecorder_PostRollGrace_NotAppliedWhenSegmentsAreShort(t *testing.T) {
+	segStore := newTestSegmentStore(t)
+	dir := t.TempDir()
+
+	const postRollS = 5
+	const segmentSeconds = 2
+	cfg := RecorderConfig{
+		CameraID:       "cam1",
+		Roles:          []string{"high"},
+		DataDir:        t.TempDir(),
+		Mode:           RecordingModeEvents,
+		PreRollS:       0,
+		PostRollS:      postRollS,
+		SegmentSeconds: segmentSeconds,
+	}
+	r := NewRecorder(cfg, segStore, &FFmpeg{}, nil)
+
+	const eventStart = int64(100_000)
+	const eventEnd = int64(105_000)
+
+	clockMs := eventEnd
+	r.nowFn = func() int64 { return clockMs }
+	r.MarkEvent("evt-1", eventStart, eventEnd)
+
+	// Well past eventEnd+postRollS (110000), and also well past any
+	// plausible SegmentSeconds-based grace (which shouldn't apply at all
+	// here since segmentSeconds < postRollS).
+	clockMs = 130_000
+	lateSeg := seedSegment(t, dir, segStore, eventEnd+20_000, eventEnd+21_000, false)
+	r.promoteIfCovered(lateSeg)
+
+	if segmentReferenced(t, segStore, lateSeg) {
+		t.Fatalf("segment finalized long after the (un-padded) post-roll window closed must not be promoted when SegmentSeconds < PostRollS")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // sweepEventSpool: discard (no protected windows in play)
 // ---------------------------------------------------------------------------
 

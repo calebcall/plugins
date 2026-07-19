@@ -509,6 +509,36 @@ func (r *Recorder) sweepSegments(outDir, role string, processedUpTo *string, fin
 	}
 }
 
+// postRollWindowMs returns the millisecond post-roll figure event_mode.go's
+// eventWindow.window/isOpen should use when deciding how long a window
+// stays protected — r.cfg.PostRollS's own value, padded with one extra
+// SegmentSeconds when SegmentSeconds >= PostRollS (both converted to ms
+// first).
+//
+// Why the padding: a segment isn't finalized (indexed into segStore, and
+// therefore visible to promoteIfCovered) until ffmpeg rotates to the next
+// one — which can be up to SegmentSeconds after the last moment it covers.
+// When the configured segment length is at or beyond the post-roll window
+// itself, the segment carrying the event's actual post-roll footage can
+// still be mid-write at the instant isOpen would otherwise report the
+// window closed, so promoteIfCovered's "skip if !w.open" guard permanently
+// orphans it (it never gets another look once the window is gone). Padding
+// the effective post-roll by one more SegmentSeconds keeps the window open
+// long enough for that final segment to finish and be checked. Left
+// unpadded (this method returns exactly r.cfg.PostRollS in ms) when
+// SegmentSeconds is comfortably smaller than PostRollS, since in that case
+// the segment finalizes well within the post-roll window already and
+// widening it further would just over-retain unrelated footage for no
+// reason.
+func (r *Recorder) postRollWindowMs() int64 {
+	postRollMs := int64(r.cfg.PostRollS) * 1000
+	segMs := int64(r.cfg.SegmentSeconds) * 1000
+	if segMs >= postRollMs {
+		postRollMs += segMs
+	}
+	return postRollMs
+}
+
 // initiallyReferenced reports the Referenced value a newly finalized segment
 // should be indexed with: false (an events-mode "spool" segment, subject to
 // sweepEventSpool until/unless MarkEvent promotes it) only when this

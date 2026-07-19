@@ -49,18 +49,33 @@ type fakeCamera struct {
 	id      string
 	name    string
 	storage *fakeCameraStorage
+
+	// streamURL backs StreamURL below; defaults (in newFakeCamera) to a
+	// fixed, deterministic URL per role so tests that don't care about the
+	// actual value (most of them) don't need to set it themselves.
+	streamURL func(role string) (string, error)
 }
 
 func (f *fakeCamera) ID() string             { return f.id }
 func (f *fakeCamera) Name() string           { return f.name }
 func (f *fakeCamera) Storage() CameraStorage { return f.storage }
+func (f *fakeCamera) StreamURL(role string) (string, error) {
+	return f.streamURL(role)
+}
 
 func newFakeCamera(id, name string, mode RecordingMode) *fakeCamera {
 	storage := newFakeCameraStorage()
 	if mode != "" {
 		storage.set(keyRecordingMode, string(mode))
 	}
-	return &fakeCamera{id: id, name: name, storage: storage}
+	return &fakeCamera{
+		id:      id,
+		name:    name,
+		storage: storage,
+		streamURL: func(role string) (string, error) {
+			return "rtsp://" + id + "/" + role, nil
+		},
+	}
 }
 
 func TestConfigure_OnlyNonOffCamerasAreManaged(t *testing.T) {

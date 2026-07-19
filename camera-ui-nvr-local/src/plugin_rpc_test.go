@@ -144,6 +144,9 @@ func newFakeManagedCamera(id, name, recordingMode string) *fakeManagedCamera {
 func (f *fakeManagedCamera) ID() string                      { return f.id }
 func (f *fakeManagedCamera) Name() string                    { return f.name }
 func (f *fakeManagedCamera) Storage() recorder.CameraStorage { return f.storage }
+func (f *fakeManagedCamera) StreamURL(role string) (string, error) {
+	return "rtsp://" + f.id + "/" + role, nil
+}
 
 func TestGetManagedCameraIds_DelegatesToRecorderManager(t *testing.T) {
 	p := newTestPlugin(t)
