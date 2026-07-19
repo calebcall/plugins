@@ -3,9 +3,11 @@ package recorder
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -166,19 +168,20 @@ func TestFinalizeSegment_IndexesRealFMP4File(t *testing.T) {
 
 // fakeRunner is a commandRunner test double: behavior decides what the Nth
 // call does, letting tests simulate a crash-looping or long-running ffmpeg
-// without spawning one.
+// without spawning one. It receives the stderr io.Writer runOnce passes
+// through, so a test can write to it to prove stderr capture works.
 type fakeRunner struct {
 	mu       sync.Mutex
 	calls    int
-	behavior func(callN int, ctx context.Context, name string, args []string) error
+	behavior func(callN int, ctx context.Context, name string, args []string, stderr io.Writer) error
 }
 
-func (f *fakeRunner) Run(ctx context.Context, name string, args []string) error {
+func (f *fakeRunner) Run(ctx context.Context, name string, args []string, stderr io.Writer) error {
 	f.mu.Lock()
 	f.calls++
 	n := f.calls
 	f.mu.Unlock()
-	return f.behavior(n, ctx, name, args)
+	return f.behavior(n, ctx, name, args, stderr)
 }
 
 func (f *fakeRunner) callCount() int {
@@ -220,7 +223,7 @@ func TestRecorder_SupervisionRestartsWithBackoffAndStopsCleanly(t *testing.T) {
 	// Calls 1 and 2 simulate ffmpeg crashing immediately; call 3 simulates a
 	// healthy, long-running process that only exits when ctx is canceled
 	// (i.e. Stop()).
-	fake.behavior = func(n int, ctx context.Context, name string, args []string) error {
+	fake.behavior = func(n int, ctx context.Context, name string, args []string, stderr io.Writer) error {
 		if n < 3 {
 			return errors.New("boom")
 		}
@@ -320,7 +323,7 @@ func TestRecorder_StartIndexesRealSegments_SyntheticSource(t *testing.T) {
 	r.pollInterval = 200 * time.Millisecond
 
 	fake := &fakeRunner{}
-	fake.behavior = func(n int, ctx context.Context, name string, args []string) error {
+	fake.behavior = func(n int, ctx context.Context, name string, args []string, stderr io.Writer) error {
 		// args' last element is the segmentArgs output pattern
 		// (<outDir>/%s.mp4); reuse that directory so the recorder's own
 		// watcher (pointed at the same outDir) discovers these files.
@@ -363,5 +366,216 @@ func TestRecorder_StartIndexesRealSegments_SyntheticSource(t *testing.T) {
 	}
 	if state := r.State(); state.State != StateStopped {
 		t.Fatalf("expected stopped state after Stop, got %+v", state)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ffmpeg stderr capture on failure.
+// ---------------------------------------------------------------------------
+
+// TestTailBuffer_BoundedToMaxSize proves tailBuffer keeps only the most
+// recent maxSize bytes rather than accumulating everything ever written to
+// it — the property that keeps a long-running ffmpeg process's stderr
+// capture from growing without bound.
+func TestTailBuffer_BoundedToMaxSize(t *testing.T) {
+	tb := newTailBuffer(10)
+
+	if _, err := tb.Write([]byte("0123456789ABCDEFGHIJ")); err != nil { // 20 bytes
+		t.Fatalf("Write: %v", err)
+	}
+
+	if got := tb.String(); got != "ABCDEFGHIJ" {
+		t.Fatalf("String() = %q, want %q (only the last 10 bytes)", got, "ABCDEFGHIJ")
+	}
+}
+
+// TestRunOnce_CapturesFfmpegStderrTailOnFailure proves runOnce wires the
+// runner's stderr into the returned error: a crash-looping camera's actual
+// failure reason (auth failure, connection refused, RTSP negotiation error,
+// ...) must be visible in the logged error, not just a bare exit status.
+func TestRunOnce_CapturesFfmpegStderrTailOnFailure(t *testing.T) {
+	segStore := newTestSegmentStore(t)
+	ff := &FFmpeg{ffmpegPath: "ffmpeg", ffprobePath: "ffprobe"}
+
+	cfg := RecorderConfig{
+		CameraID:       "cam1",
+		StreamURL:      func(role string) (string, error) { return "rtsp://cam1/" + role, nil },
+		Roles:          []string{"high"},
+		SegmentSeconds: 60,
+		DataDir:        t.TempDir(),
+	}
+
+	r := NewRecorder(cfg, segStore, ff, nil)
+
+	fake := &fakeRunner{}
+	const wantStderr = "Connection to rtsp://cam1/high failed: 401 Unauthorized"
+	fake.behavior = func(n int, ctx context.Context, name string, args []string, stderr io.Writer) error {
+		if _, err := io.WriteString(stderr, wantStderr+"\n"); err != nil {
+			t.Fatalf("write to stderr: %v", err)
+		}
+		return errors.New("exit status 1")
+	}
+	r.runner = fake
+
+	err := r.runOnce(context.Background(), "high")
+	if err == nil {
+		t.Fatalf("expected an error from runOnce")
+	}
+	if !strings.Contains(err.Error(), wantStderr) {
+		t.Fatalf("expected the ffmpeg stderr tail in the returned error, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "exit status 1") {
+		t.Fatalf("expected the original exit error to still be present, got: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Start/Stop WaitGroup race regression test.
+// ---------------------------------------------------------------------------
+
+// TestRecorder_ConcurrentStartStop_NoRaceAndCleanStop calls Start and Stop
+// from separate goroutines concurrently, many times, and asserts no
+// panic/data race and that the recorder always converges to a clean stopped
+// state. This regression-tests a fixed bug where Start set running = true
+// and released r.mu *before* calling wg.Add for its supervisor goroutines:
+// a concurrent Stop() could observe running == true and call wg.Wait()
+// before any Add() had run, violating sync.WaitGroup's documented
+// Add-before-Wait contract — which either lets Stop() return while a
+// just-launched supervisor goroutine is still unaccounted for, or trips
+// WaitGroup's own "Add called concurrently with Wait" misuse panic. The fix
+// (recorder.go, Start) moves every wg.Add call inside the same r.mu
+// critical section that sets running = true, so Stop() cannot reach the
+// point of calling Wait() until every Add() for that Start() has already
+// happened — a structural guarantee, not a timing one, so this test should
+// pass reliably (not just probabilistically) against the fixed code.
+//
+// Confirmed this fails against the pre-fix code: reverting the Start fix
+// (moving wg.Add back into the per-role loop, after r.mu.Unlock()) and
+// running this test under `go test -race -run ConcurrentStartStop -count=20`
+// reproduces both a `-race` data race and, on some runs, a runtime
+// "sync: WaitGroup misuse" panic.
+func TestRecorder_ConcurrentStartStop_NoRaceAndCleanStop(t *testing.T) {
+	segStore := newTestSegmentStore(t)
+	ff := &FFmpeg{ffmpegPath: "ffmpeg", ffprobePath: "ffprobe"}
+
+	cfg := RecorderConfig{
+		CameraID:       "cam1",
+		StreamURL:      func(role string) (string, error) { return "rtsp://cam1/" + role, nil },
+		Roles:          []string{"high"},
+		SegmentSeconds: 60,
+		DataDir:        t.TempDir(),
+	}
+
+	r := NewRecorder(cfg, segStore, ff, nil)
+	r.pollInterval = time.Minute // avoid the watcher's ticker firing during this test
+
+	fake := &fakeRunner{}
+	// Blocks until ctx is canceled, like a healthy real ffmpeg process would
+	// — this avoids the supervisor busy-looping between iterations (it would
+	// otherwise restart immediately every time the fake returns) and keeps
+	// this test's total work bounded regardless of how the Start/Stop race
+	// resolves on any given iteration.
+	fake.behavior = func(n int, ctx context.Context, name string, args []string, stderr io.Writer) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	r.runner = fake
+
+	const iterations = 300
+	for i := 0; i < iterations; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_ = r.Start(ctx)
+		}()
+		go func() {
+			defer wg.Done()
+			_ = r.Stop()
+		}()
+		wg.Wait()
+
+		// Whichever way the race above resolved, force this iteration's
+		// recorder back to a clean stopped state before the next iteration
+		// reuses the same instance (a no-op if the racing Stop() already won).
+		_ = r.Stop()
+		cancel()
+	}
+
+	if state := r.State(); state.State != StateStopped {
+		t.Fatalf("expected a clean stopped state after %d concurrent Start/Stop iterations, got %+v", iterations, state)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Incremental segment watcher: bounded per-tick work.
+// ---------------------------------------------------------------------------
+
+// TestSweepSegments_SkipsAlreadyProcessedFilesOnSubsequentTicks proves
+// sweepSegments' per-tick work is bounded by how many *new* files appeared
+// since the last tick, not by the total number of files ever seen in
+// outDir: files already indexed on an earlier call are never re-examined or
+// re-finalized on a later one (previously, sweepSegments re-globbed and
+// re-sorted every file in the directory on every tick, forever, for as long
+// as a single ffmpeg run kept accumulating segments in one outDir).
+func TestSweepSegments_SkipsAlreadyProcessedFilesOnSubsequentTicks(t *testing.T) {
+	requireFFmpeg(t)
+
+	dir := t.TempDir()
+	genSegment := func(name string) {
+		path := filepath.Join(dir, name)
+		cmd := exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+			"-f", "lavfi", "-i", "testsrc=duration=1:size=320x240:rate=5",
+			"-c:v", "libx264", "-movflags", "+frag_keyframe+empty_moov", path)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("generate %s: %v\n%s", name, err, out)
+		}
+	}
+
+	genSegment("1000.mp4")
+	genSegment("1001.mp4")
+	genSegment("1002.mp4")
+
+	segStore := newTestSegmentStore(t)
+	ff := ResolveFFmpeg()
+	r := NewRecorder(RecorderConfig{CameraID: "cam1", DataDir: t.TempDir()}, segStore, ff, nil)
+
+	countRows := func() int {
+		segs, err := segStore.InRange("cam1", "high", 0, time.Now().UnixMilli()+int64(time.Hour/time.Millisecond))
+		if err != nil {
+			t.Fatalf("InRange: %v", err)
+		}
+		return len(segs)
+	}
+
+	var processedUpTo string
+
+	// First tick: 3 files present, newest ("1002.mp4") is skipped as
+	// presumably still being written.
+	r.sweepSegments(dir, "high", &processedUpTo, false)
+	if got := countRows(); got != 2 {
+		t.Fatalf("expected the first 2 files indexed (newest skipped), got %d rows", got)
+	}
+	if want := filepath.Join(dir, "1001.mp4"); processedUpTo != want {
+		t.Fatalf("processedUpTo = %q, want %q", processedUpTo, want)
+	}
+
+	// A new file appears; a second tick must index exactly the one file
+	// that became "not-newest" (1002.mp4) and must NOT re-touch 1000/1001.
+	genSegment("1003.mp4")
+	r.sweepSegments(dir, "high", &processedUpTo, false)
+	if got := countRows(); got != 3 {
+		t.Fatalf("expected exactly 1 newly-indexed file, not a re-index of earlier ones; got %d rows total", got)
+	}
+	if want := filepath.Join(dir, "1002.mp4"); processedUpTo != want {
+		t.Fatalf("processedUpTo = %q, want %q", processedUpTo, want)
+	}
+
+	// Final sweep indexes the last remaining file too.
+	r.sweepSegments(dir, "high", &processedUpTo, true)
+	if got := countRows(); got != 4 {
+		t.Fatalf("expected the final sweep to also index the last remaining file, got %d rows", got)
 	}
 }

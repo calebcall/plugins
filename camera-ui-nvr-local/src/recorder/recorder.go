@@ -16,6 +16,7 @@ package recorder
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -44,6 +45,11 @@ const (
 	// fine for hours doesn't creep toward defaultBackoffMax on one transient
 	// disconnect.
 	stableRunResetThreshold = 10 * time.Second
+	// stderrTailSize bounds how much of a failed ffmpeg process's stderr is
+	// kept and surfaced in logs — enough to carry a meaningful failure
+	// reason (auth failure, connection refused, codec/RTSP negotiation
+	// errors) without accumulating without bound across a long healthy run.
+	stderrTailSize = 8 * 1024
 )
 
 // RecordingState is the wire shape polled by the frontend's
@@ -79,17 +85,55 @@ type RecorderConfig struct {
 // commandRunner abstracts "run this ffmpeg invocation until it exits or ctx
 // is canceled" so Recorder's supervision/backoff logic can be unit-tested
 // with an injected fake instead of spawning real ffmpeg processes and
-// depending on real process timing. execCommandRunner (the default,
-// production implementation) shells out for real.
+// depending on real process timing. stderr receives everything the process
+// writes to its standard error stream (ffmpeg logs its own diagnostics
+// there) so a failing run's actual error can be surfaced, not just its exit
+// status. execCommandRunner (the default, production implementation) shells
+// out for real.
 type commandRunner interface {
-	Run(ctx context.Context, name string, args []string) error
+	Run(ctx context.Context, name string, args []string, stderr io.Writer) error
 }
 
 type execCommandRunner struct{}
 
-func (execCommandRunner) Run(ctx context.Context, name string, args []string) error {
+func (execCommandRunner) Run(ctx context.Context, name string, args []string, stderr io.Writer) error {
 	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Stderr = stderr
 	return cmd.Run()
+}
+
+// tailBuffer is an io.Writer that keeps only the most recent maxSize bytes
+// written to it, discarding everything older — used to capture a bounded
+// tail of a supervised ffmpeg process's stderr (see stderrTailSize) without
+// letting a long-running process accumulate unbounded memory. Safe for
+// concurrent use: written to from the OS-pipe-reading goroutine os/exec runs
+// internally while cmd.Run() is in flight, and read from (String) by the
+// caller after the process exits.
+type tailBuffer struct {
+	mu      sync.Mutex
+	buf     []byte
+	maxSize int
+}
+
+func newTailBuffer(maxSize int) *tailBuffer {
+	return &tailBuffer{maxSize: maxSize}
+}
+
+func (t *tailBuffer) Write(p []byte) (int, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.buf = append(t.buf, p...)
+	if len(t.buf) > t.maxSize {
+		t.buf = t.buf[len(t.buf)-t.maxSize:]
+	}
+	return len(p), nil
+}
+
+func (t *tailBuffer) String() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return string(t.buf)
 }
 
 // Recorder continuously records one camera's configured roles: one
@@ -157,6 +201,20 @@ func ctxSleep(ctx context.Context, d time.Duration) bool {
 // until ctx is canceled or Stop is called; on an unexpected ffmpeg exit
 // while ctx is still alive, the process is restarted with backoff (see
 // superviseRole).
+//
+// Every wg.Add call for this Start happens inside the same r.mu critical
+// section that sets running = true, and before r.mu is unlocked. This
+// matters: a concurrent Stop() can only observe running == true after
+// acquiring r.mu, which (by mutex ordering) can only happen after this
+// critical section — and therefore every Add — has already completed. That
+// ordering is what makes r.wg.Add always happen-before any r.wg.Wait() Stop
+// might go on to call, satisfying sync.WaitGroup's documented contract
+// ("calls with a positive delta... must happen before a Wait"). Doing the
+// Adds after unlocking (e.g. one per loop iteration, as an earlier version
+// of this method did) leaves a window where a concurrent Stop() can call
+// Wait() before any Add() has run, which either lets Stop() return before
+// the goroutine it should have waited for even starts, or trips
+// sync.WaitGroup's own "Add called concurrently with Wait" misuse panic.
 func (r *Recorder) Start(ctx context.Context) error {
 	r.mu.Lock()
 	if r.running {
@@ -169,6 +227,7 @@ func (r *Recorder) Start(ctx context.Context) error {
 	r.running = true
 	r.setStateLocked(StateRecording)
 	roles := r.cfg.Roles
+	r.wg.Add(len(roles))
 	r.mu.Unlock()
 
 	if len(roles) == 0 {
@@ -176,7 +235,6 @@ func (r *Recorder) Start(ctx context.Context) error {
 	}
 
 	for _, role := range roles {
-		r.wg.Add(1)
 		go func(role string) {
 			defer r.wg.Done()
 			r.superviseRole(runCtx, role)
@@ -299,10 +357,17 @@ func (r *Recorder) runOnce(ctx context.Context, role string) error {
 		r.watchSegments(watchCtx, outDir, role)
 	}()
 
-	runErr := r.runner.Run(ctx, r.ff.Path(), args)
+	stderrTail := newTailBuffer(stderrTailSize)
+	runErr := r.runner.Run(ctx, r.ff.Path(), args, stderrTail)
 
 	stopWatch()
 	<-watchDone
+
+	if runErr != nil {
+		if tail := strings.TrimSpace(stderrTail.String()); tail != "" {
+			runErr = fmt.Errorf("%w\nffmpeg stderr (tail):\n%s", runErr, tail)
+		}
+	}
 
 	return runErr
 }
@@ -323,23 +388,30 @@ func (r *Recorder) outDir(role string, at time.Time) string {
 
 // watchSegments polls outDir every r.pollInterval, indexing every *.mp4 file
 // except the most recently created one (which ffmpeg is presumably still
-// writing to) into r.segStore as soon as it's noticed. When ctx is done (the
-// ffmpeg process this watcher was paired with has exited — see runOnce), it
-// performs one last sweep that indexes every remaining file, including the
-// one that was previously being skipped, since ffmpeg is no longer writing
-// to anything in this directory.
+// writing to) into r.segStore as soon as it's noticed. processedUpTo tracks
+// only the single lexically-highest filename already fully indexed (rather
+// than an ever-growing set of every path ever seen), so both memory and the
+// per-tick work in sweepSegments stay bounded by how many *new* segments
+// appeared since the last tick — not by how long this run has accumulated
+// segments in outDir (a long healthy recording keeps writing into the same
+// directory; see outDir's doc comment on why directory rollover only
+// happens when ffmpeg restarts). When ctx is done (the ffmpeg process this
+// watcher was paired with has exited — see runOnce), it performs one last
+// sweep that indexes every remaining file, including the one that was
+// previously being skipped, since ffmpeg is no longer writing to anything
+// in this directory.
 func (r *Recorder) watchSegments(ctx context.Context, outDir, role string) {
-	indexed := make(map[string]bool)
+	var processedUpTo string
 	ticker := time.NewTicker(r.pollInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			r.sweepSegments(outDir, role, indexed, true)
+			r.sweepSegments(outDir, role, &processedUpTo, true)
 			return
 		case <-ticker.C:
-			r.sweepSegments(outDir, role, indexed, false)
+			r.sweepSegments(outDir, role, &processedUpTo, false)
 		}
 	}
 }
@@ -347,33 +419,40 @@ func (r *Recorder) watchSegments(ctx context.Context, outDir, role string) {
 // sweepSegments lists outDir's *.mp4 files (oldest first — files are named
 // by creation-epoch-second and ffmpeg creates them strictly in order, so a
 // lexical sort matches creation order for as long as every name has the same
-// digit count, i.e. until the year 2286) and indexes every one not already
-// in indexed, skipping the newest file unless final is true (see
-// watchSegments). Indexing failures (e.g. ffprobe transiently unable to read
-// a file mid-write) are logged and left un-indexed so the next sweep retries
-// them, rather than being marked indexed and silently dropped.
-func (r *Recorder) sweepSegments(outDir, role string, indexed map[string]bool, final bool) {
+// digit count, i.e. until the year 2286), skips every file at or before
+// *processedUpTo (already indexed by an earlier tick — sort.SearchStrings
+// finds that boundary in the already-sorted list without rescanning it), and
+// indexes the rest, skipping the newest file unless final is true (see
+// watchSegments). *processedUpTo only advances past a file once it has been
+// successfully indexed; on the first failure in a tick (e.g. ffprobe
+// transiently unable to read a file mid-write) the sweep stops rather than
+// skipping ahead, so a failed file and everything after it are retried
+// together, in order, on the next tick instead of ever being silently
+// dropped.
+func (r *Recorder) sweepSegments(outDir, role string, processedUpTo *string, final bool) {
 	files, err := filepath.Glob(filepath.Join(outDir, "*.mp4"))
 	if err != nil || len(files) == 0 {
 		return
 	}
 	sort.Strings(files)
 
+	start := 0
+	if *processedUpTo != "" {
+		start = sort.SearchStrings(files, *processedUpTo) + 1
+	}
+
 	limit := len(files)
 	if !final {
 		limit-- // leave the newest file alone; ffmpeg is still writing it
 	}
 
-	for i := 0; i < limit; i++ {
+	for i := start; i < limit; i++ {
 		path := files[i]
-		if indexed[path] {
-			continue
-		}
 		if _, err := finalizeSegment(r.ff, r.segStore, r.cfg.CameraID, role, path); err != nil {
 			r.logf("recorder: %s/%s: index segment %s: %v", r.cfg.CameraID, role, path, err)
-			continue
+			return
 		}
-		indexed[path] = true
+		*processedUpTo = path
 	}
 }
 
