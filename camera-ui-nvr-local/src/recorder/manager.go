@@ -85,10 +85,20 @@ type RecordingConfig struct {
 	Roles         []string
 }
 
-// Recorder is a managed camera's identity plus its resolved recording
-// config. Later tasks (ffmpeg segment writing) hang per-camera runtime
-// state off this struct; Task 6 only populates the fields below.
-type Recorder struct {
+// RecorderEntry is a managed camera's identity plus its resolved recording
+// config — RecorderManager's registry entry. It carries no ffmpeg/recording
+// process state of its own; that runtime (see recorder.go's Recorder type,
+// Task 7) is a separate, independently-constructed object driven by whatever
+// orchestrates RecorderManager (a later task), not hung off this struct.
+//
+// Named "RecorderEntry" rather than "Recorder" specifically to avoid
+// colliding with that Task 7 runtime type in this same package — Task 6
+// originally named this struct "Recorder" and said later tasks would "hang
+// per-camera runtime state off this struct"; Task 7 instead needed the bare
+// name "Recorder" for its own exported constructor/Start/Stop/State API
+// (kept exact because Tasks 8-10 depend on it), so this registry entry was
+// renamed instead of the other way around.
+type RecorderEntry struct {
 	CameraID string
 	Name     string
 	Config   RecordingConfig
@@ -100,21 +110,21 @@ type Recorder struct {
 // ffmpeg/recording process state yet — that's Task 7.
 type RecorderManager struct {
 	mu        sync.RWMutex
-	recorders map[string]*Recorder
+	recorders map[string]*RecorderEntry
 }
 
 // NewRecorderManager returns an empty manager. Recording config lives on
 // each camera's own DeviceStorage (via ManagedCamera.Storage()), not in this
 // plugin's SQLite database, so there is no store dependency to inject here.
 func NewRecorderManager() *RecorderManager {
-	return &RecorderManager{recorders: make(map[string]*Recorder)}
+	return &RecorderManager{recorders: make(map[string]*RecorderEntry)}
 }
 
 // Configure replaces the full set of managed cameras. Intended for the Hub
 // ConfigureCameras callback, which the SDK calls once at startup with every
 // camera currently assigned to this plugin.
 func (m *RecorderManager) Configure(cameras []ManagedCamera) error {
-	next := make(map[string]*Recorder, len(cameras))
+	next := make(map[string]*RecorderEntry, len(cameras))
 	for _, cam := range cameras {
 		next[cam.ID()] = newRecorder(cam)
 	}
@@ -132,7 +142,7 @@ func (m *RecorderManager) Add(cam ManagedCamera) error {
 
 	m.mu.Lock()
 	if m.recorders == nil {
-		m.recorders = make(map[string]*Recorder)
+		m.recorders = make(map[string]*RecorderEntry)
 	}
 	m.recorders[cam.ID()] = r
 	m.mu.Unlock()
@@ -149,7 +159,7 @@ func (m *RecorderManager) Remove(cameraID string) error {
 }
 
 // Camera returns the registered Recorder for id, if any.
-func (m *RecorderManager) Camera(id string) (*Recorder, bool) {
+func (m *RecorderManager) Camera(id string) (*RecorderEntry, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	r, ok := m.recorders[id]
@@ -174,8 +184,8 @@ func (m *RecorderManager) ManagedCameraIDs() []string {
 	return ids
 }
 
-func newRecorder(cam ManagedCamera) *Recorder {
-	return &Recorder{
+func newRecorder(cam ManagedCamera) *RecorderEntry {
+	return &RecorderEntry{
 		CameraID: cam.ID(),
 		Name:     cam.Name(),
 		Config:   readRecordingConfig(cam.Storage()),

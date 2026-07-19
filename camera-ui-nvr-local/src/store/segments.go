@@ -1,6 +1,9 @@
 package store
 
-import "fmt"
+import (
+	"fmt"
+	"sync"
+)
 
 // Segment is one indexed recorded video segment: a single file on disk
 // covering [StartMs, EndMs) for one camera/role (e.g. "main"/"sub"),
@@ -20,7 +23,17 @@ type Segment struct {
 // SegmentStore is the typed API over the segments table (see schema.sql):
 // indexing recorded segments and querying them by time range or by day, and
 // pruning rows past a retention cutoff.
+//
+// mu serializes every method against the shared *DB.Conn(): go-sqlite3's
+// *sqlite3.Conn is documented as "not safe for concurrent use by multiple
+// goroutines" (conn.go), but SegmentStore itself is: the recorder (Task 7)
+// runs one goroutine per recorded role, each indexing finished segments into
+// the same SegmentStore concurrently, and RPC read handlers (later tasks)
+// query it from yet another goroutine while recording is ongoing. Without
+// this lock those goroutines would race directly on the underlying
+// connection's internal state, not just risk an app-level SQLITE_BUSY.
 type SegmentStore struct {
+	mu sync.Mutex
 	db *DB
 }
 
@@ -31,6 +44,9 @@ func NewSegmentStore(db *DB) *SegmentStore {
 
 // Add inserts seg as a new row and returns its assigned id.
 func (s *SegmentStore) Add(seg Segment) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	stmt, _, err := s.db.Conn().Prepare(`
 		INSERT INTO segments (camera_id, role, path, start_ms, end_ms, has_video, has_audio, codec)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
@@ -76,6 +92,9 @@ func (s *SegmentStore) Add(seg Segment) (int64, error) {
 // inclusive on both ends (end_ms >= startMs AND start_ms <= endMs) so a
 // segment merely touching a window boundary is still included.
 func (s *SegmentStore) InRange(cameraID, role string, startMs, endMs int64) ([]Segment, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	stmt, _, err := s.db.Conn().Prepare(`
 		SELECT id, camera_id, role, path, start_ms, end_ms, has_video, has_audio, codec
 		FROM segments
@@ -126,6 +145,9 @@ func (s *SegmentStore) InRange(cameraID, role string, startMs, endMs int64) ([]S
 // functions operate in UTC by default; no other convention is established
 // elsewhere in this package, so UTC is used here).
 func (s *SegmentStore) Days(cameraID string, year, month int) ([]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	stmt, _, err := s.db.Conn().Prepare(`
 		SELECT DISTINCT date(start_ms / 1000, 'unixepoch') AS day
 		FROM segments
@@ -163,6 +185,9 @@ func (s *SegmentStore) Days(cameraID string, year, month int) ([]string, error) 
 // This only deletes the SQLite index rows; deleting the underlying files at
 // those paths is the caller's (retention task's) responsibility.
 func (s *SegmentStore) DeleteOlderThan(cameraID string, cutoffMs int64) ([]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	conn := s.db.Conn()
 
 	if err := conn.Exec("BEGIN IMMEDIATE"); err != nil {
@@ -203,6 +228,8 @@ func (s *SegmentStore) DeleteOlderThan(cameraID string, cutoffMs int64) ([]strin
 
 // pathsOlderThan returns the paths of the segments matching the same
 // predicate used by DeleteOlderThan's DELETE, so the two stay in sync.
+// Internal helper only called from DeleteOlderThan, which already holds
+// s.mu — it must not lock again itself (sync.Mutex isn't reentrant).
 func (s *SegmentStore) pathsOlderThan(cameraID string, cutoffMs int64) ([]string, error) {
 	stmt, _, err := s.db.Conn().Prepare(`
 		SELECT path FROM segments WHERE camera_id = ? AND end_ms < ?`)

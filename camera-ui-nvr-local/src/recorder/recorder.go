@@ -1,0 +1,453 @@
+// recorder.go implements the actual single-camera continuous ffmpeg
+// recorder (Task 7): pulling one RTSP role, writing segmented fMP4 files to
+// disk via ffmpeg, supervising that process (restart-with-backoff on exit
+// while the caller's context is still alive), and indexing each finished
+// segment into a *store.SegmentStore. This is the runtime engine; the
+// registry/config bookkeeping (which cameras are recorded, at what
+// mode/retention) is RecorderEntry/RecorderManager in manager.go — a later
+// task wires the two together (one *Recorder per continuously-recorded
+// camera, constructed from its RecorderEntry.Config).
+//
+// Event-triggered recording and retention garbage collection are explicitly
+// out of scope here (the next two tasks) — this file only ever runs ffmpeg
+// continuously for as long as Start's context is alive.
+package recorder
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	sdk "github.com/cameraui/sdk/go"
+
+	"github.com/calebcall/plugins/camera-ui-nvr-local/src/store"
+)
+
+// Backoff/poll tuning. Exposed as package-level defaults (not exported
+// constants) so tests can override the Recorder-instance fields
+// (pollInterval, sleep) without touching global state.
+const (
+	defaultSegmentPollInterval = 1 * time.Second
+	defaultBackoffInitial      = 1 * time.Second
+	defaultBackoffMax          = 30 * time.Second
+	// stableRunResetThreshold: an ffmpeg run that lasted at least this long
+	// before exiting is treated as "was healthy, then had a one-off hiccup"
+	// rather than "crash-looping" — the backoff resets to its initial value
+	// instead of continuing to grow, so a recorder that's been recording
+	// fine for hours doesn't creep toward defaultBackoffMax on one transient
+	// disconnect.
+	stableRunResetThreshold = 10 * time.Second
+)
+
+// RecordingState is the wire shape polled by the frontend's
+// onRecordingState (docs/superpowers/specs/2026-07-19-nvr-frontend-contract.d.ts:
+// RecordingState { cameraId, state: 'recording'|'stopped', timestamp }).
+type RecordingState struct {
+	CameraID    string `msgpack:"cameraId" json:"cameraId"`
+	State       string `msgpack:"state" json:"state"`
+	TimestampMs int64  `msgpack:"timestamp" json:"timestamp"`
+}
+
+// Recording state values, matching the frontend contract's string union
+// exactly.
+const (
+	StateRecording = "recording"
+	StateStopped   = "stopped"
+)
+
+// RecorderConfig is everything one Recorder instance needs to continuously
+// record a single camera. StreamURL is a function rather than a plain
+// string because the actual RTSP URL for a role (credentials embedded, etc.)
+// may need to be resolved fresh on every (re)connect attempt — e.g. a token
+// that expires, or a URL the caller looks up from the live *sdk.CameraDevice
+// rather than caching once at construction time.
+type RecorderConfig struct {
+	CameraID       string
+	StreamURL      func(role string) (string, error)
+	Roles          []string
+	SegmentSeconds int
+	DataDir        string
+}
+
+// commandRunner abstracts "run this ffmpeg invocation until it exits or ctx
+// is canceled" so Recorder's supervision/backoff logic can be unit-tested
+// with an injected fake instead of spawning real ffmpeg processes and
+// depending on real process timing. execCommandRunner (the default,
+// production implementation) shells out for real.
+type commandRunner interface {
+	Run(ctx context.Context, name string, args []string) error
+}
+
+type execCommandRunner struct{}
+
+func (execCommandRunner) Run(ctx context.Context, name string, args []string) error {
+	cmd := exec.CommandContext(ctx, name, args...)
+	return cmd.Run()
+}
+
+// Recorder continuously records one camera's configured roles: one
+// supervised ffmpeg process per role, each writing segmented fMP4 files that
+// get indexed into SegmentStore as they're finished. Safe for concurrent use
+// of Start/Stop/State from multiple goroutines.
+type Recorder struct {
+	cfg      RecorderConfig
+	segStore *store.SegmentStore
+	ff       *FFmpeg
+	log      *sdk.Logger
+
+	// runner, pollInterval, and sleep are overridden by tests to avoid
+	// spawning real processes / real wall-clock delays; production code
+	// never touches them after construction.
+	runner       commandRunner
+	pollInterval time.Duration
+	sleep        func(ctx context.Context, d time.Duration) bool
+
+	mu      sync.Mutex
+	cancel  context.CancelFunc
+	running bool
+	state   RecordingState
+	wg      sync.WaitGroup
+}
+
+// NewRecorder returns a Recorder for cfg, ready to Start. segStore is where
+// finished segments are indexed; ff resolves the ffmpeg/ffprobe binaries;
+// log may be nil (as in unit tests) — every log call below guards for that,
+// matching the pattern established by detectionEventIngester
+// (events_ingest.go) since neither has anywhere else to report an error
+// (ffmpeg supervision runs entirely in background goroutines with no caller
+// to return an error to).
+func NewRecorder(cfg RecorderConfig, segStore *store.SegmentStore, ff *FFmpeg, log *sdk.Logger) *Recorder {
+	return &Recorder{
+		cfg:          cfg,
+		segStore:     segStore,
+		ff:           ff,
+		log:          log,
+		runner:       execCommandRunner{},
+		pollInterval: defaultSegmentPollInterval,
+		sleep:        ctxSleep,
+		state:        RecordingState{CameraID: cfg.CameraID, State: StateStopped},
+	}
+}
+
+// ctxSleep blocks for d, or until ctx is canceled, whichever comes first. It
+// reports whether the sleep completed normally (true) or was cut short by
+// ctx (false) — a false return means the caller's supervision loop should
+// stop rather than proceeding to another restart attempt.
+func ctxSleep(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// Start begins supervising one ffmpeg process per configured role. It is
+// idempotent: calling Start again while already running is a no-op (returns
+// nil without spawning a second set of supervisors). Recording continues
+// until ctx is canceled or Stop is called; on an unexpected ffmpeg exit
+// while ctx is still alive, the process is restarted with backoff (see
+// superviseRole).
+func (r *Recorder) Start(ctx context.Context) error {
+	r.mu.Lock()
+	if r.running {
+		r.mu.Unlock()
+		return nil
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	r.cancel = cancel
+	r.running = true
+	r.setStateLocked(StateRecording)
+	roles := r.cfg.Roles
+	r.mu.Unlock()
+
+	if len(roles) == 0 {
+		r.logf("recorder: %s: Start called with no configured roles; nothing to record", r.cfg.CameraID)
+	}
+
+	for _, role := range roles {
+		r.wg.Add(1)
+		go func(role string) {
+			defer r.wg.Done()
+			r.superviseRole(runCtx, role)
+		}(role)
+	}
+	return nil
+}
+
+// Stop cancels every role's supervised ffmpeg process and waits for their
+// goroutines to finish (each one performs a final segment-index sweep before
+// returning — see runOnce). Idempotent: calling Stop when not running is a
+// no-op.
+func (r *Recorder) Stop() error {
+	r.mu.Lock()
+	if !r.running {
+		r.mu.Unlock()
+		return nil
+	}
+	cancel := r.cancel
+	r.mu.Unlock()
+
+	cancel()
+	r.wg.Wait()
+
+	r.mu.Lock()
+	r.running = false
+	r.cancel = nil
+	r.setStateLocked(StateStopped)
+	r.mu.Unlock()
+	return nil
+}
+
+// State returns the recorder's current wire-shape recording state.
+func (r *Recorder) State() RecordingState {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.state
+}
+
+// setStateLocked updates r.state to the given state value, stamped with the
+// current time. Callers must hold r.mu.
+func (r *Recorder) setStateLocked(state string) {
+	r.state = RecordingState{
+		CameraID:    r.cfg.CameraID,
+		State:       state,
+		TimestampMs: time.Now().UnixMilli(),
+	}
+}
+
+// superviseRole runs one role's ffmpeg process for as long as ctx is alive,
+// restarting it with exponential backoff (capped at defaultBackoffMax) on
+// every exit that isn't caused by ctx itself being canceled. A run that
+// lasted at least stableRunResetThreshold resets the backoff back to
+// defaultBackoffInitial, so an intermittent disconnect after hours of good
+// recording doesn't inherit a large backoff from an earlier, unrelated
+// crash loop.
+func (r *Recorder) superviseRole(ctx context.Context, role string) {
+	backoff := defaultBackoffInitial
+
+	for ctx.Err() == nil {
+		started := time.Now()
+
+		if err := r.runOnce(ctx, role); err != nil {
+			r.logf("recorder: %s/%s: ffmpeg exited: %v", r.cfg.CameraID, role, err)
+		}
+
+		if ctx.Err() != nil {
+			return
+		}
+
+		if time.Since(started) >= stableRunResetThreshold {
+			backoff = defaultBackoffInitial
+		}
+
+		r.logf("recorder: %s/%s: restarting in %s", r.cfg.CameraID, role, backoff)
+		if !r.sleep(ctx, backoff) {
+			return
+		}
+		backoff = nextBackoff(backoff)
+	}
+}
+
+// nextBackoff doubles cur, capped at defaultBackoffMax.
+func nextBackoff(cur time.Duration) time.Duration {
+	next := cur * 2
+	if next > defaultBackoffMax {
+		return defaultBackoffMax
+	}
+	return next
+}
+
+// runOnce resolves role's stream URL, ensures this run's output directory
+// exists, runs ffmpeg (via r.runner, blocking until it exits or ctx is
+// canceled) while a concurrent watcher indexes finished segments as they
+// appear, and performs one final indexing sweep once ffmpeg has exited
+// (whether that's because ctx was canceled or the process died on its own)
+// so no completed segment is left un-indexed just because this particular
+// attempt ended.
+func (r *Recorder) runOnce(ctx context.Context, role string) error {
+	url, err := r.cfg.StreamURL(role)
+	if err != nil {
+		return fmt.Errorf("resolve stream url: %w", err)
+	}
+
+	outDir := r.outDir(role, time.Now())
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return fmt.Errorf("create output dir %s: %w", outDir, err)
+	}
+
+	args := r.ff.segmentArgs(url, outDir, r.cfg.SegmentSeconds, role)
+
+	// The watcher gets its own context, independent of ctx: it must still
+	// run its final sweep (indexing whatever ffmpeg finished writing) even
+	// when ctx is the one that ended the run, so a Stop()/cancellation never
+	// drops the last, already-finalized segment.
+	watchCtx, stopWatch := context.WithCancel(context.Background())
+	watchDone := make(chan struct{})
+	go func() {
+		defer close(watchDone)
+		r.watchSegments(watchCtx, outDir, role)
+	}()
+
+	runErr := r.runner.Run(ctx, r.ff.Path(), args)
+
+	stopWatch()
+	<-watchDone
+
+	return runErr
+}
+
+// outDir returns the on-disk directory one role's segments for the given
+// moment are written to:
+// <DataDir>/recordings/<cameraId>/<YYYY-MM-DD>/<HH>/<role>/ (UTC, so the
+// boundary a long-running recording rolls over at is unambiguous
+// regardless of host timezone). Segments only roll into a new directory
+// when ffmpeg is (re)started — a single ffmpeg process that runs across an
+// hour/day boundary keeps writing into the directory chosen when it started;
+// see the Concerns section of the task report for why that's an accepted
+// limitation of this task's scope rather than something worked around here.
+func (r *Recorder) outDir(role string, at time.Time) string {
+	at = at.UTC()
+	return filepath.Join(r.cfg.DataDir, "recordings", r.cfg.CameraID, at.Format("2006-01-02"), at.Format("15"), role)
+}
+
+// watchSegments polls outDir every r.pollInterval, indexing every *.mp4 file
+// except the most recently created one (which ffmpeg is presumably still
+// writing to) into r.segStore as soon as it's noticed. When ctx is done (the
+// ffmpeg process this watcher was paired with has exited — see runOnce), it
+// performs one last sweep that indexes every remaining file, including the
+// one that was previously being skipped, since ffmpeg is no longer writing
+// to anything in this directory.
+func (r *Recorder) watchSegments(ctx context.Context, outDir, role string) {
+	indexed := make(map[string]bool)
+	ticker := time.NewTicker(r.pollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			r.sweepSegments(outDir, role, indexed, true)
+			return
+		case <-ticker.C:
+			r.sweepSegments(outDir, role, indexed, false)
+		}
+	}
+}
+
+// sweepSegments lists outDir's *.mp4 files (oldest first — files are named
+// by creation-epoch-second and ffmpeg creates them strictly in order, so a
+// lexical sort matches creation order for as long as every name has the same
+// digit count, i.e. until the year 2286) and indexes every one not already
+// in indexed, skipping the newest file unless final is true (see
+// watchSegments). Indexing failures (e.g. ffprobe transiently unable to read
+// a file mid-write) are logged and left un-indexed so the next sweep retries
+// them, rather than being marked indexed and silently dropped.
+func (r *Recorder) sweepSegments(outDir, role string, indexed map[string]bool, final bool) {
+	files, err := filepath.Glob(filepath.Join(outDir, "*.mp4"))
+	if err != nil || len(files) == 0 {
+		return
+	}
+	sort.Strings(files)
+
+	limit := len(files)
+	if !final {
+		limit-- // leave the newest file alone; ffmpeg is still writing it
+	}
+
+	for i := 0; i < limit; i++ {
+		path := files[i]
+		if indexed[path] {
+			continue
+		}
+		if _, err := finalizeSegment(r.ff, r.segStore, r.cfg.CameraID, role, path); err != nil {
+			r.logf("recorder: %s/%s: index segment %s: %v", r.cfg.CameraID, role, path, err)
+			continue
+		}
+		indexed[path] = true
+	}
+}
+
+// logf logs through r.log if one was provided (see NewRecorder's doc
+// comment on why log may be nil).
+func (r *Recorder) logf(format string, args ...any) {
+	if r.log == nil {
+		return
+	}
+	r.log.Log(fmt.Sprintf(format, args...))
+}
+
+// finalizeSegment probes path (a segment file ffmpeg has finished writing)
+// via ff, derives its start/end/codec info, and indexes it into segStore as
+// a store.Segment for cameraID/role. Returns the indexed segment (with its
+// assigned ID) on success.
+func finalizeSegment(ff *FFmpeg, segStore *store.SegmentStore, cameraID, role, path string) (store.Segment, error) {
+	res, err := ff.probe(path)
+	if err != nil {
+		return store.Segment{}, err
+	}
+
+	durationMs, ok := res.durationMs()
+	if !ok {
+		return store.Segment{}, fmt.Errorf("recorder: finalize %s: no parseable duration in ffprobe output", path)
+	}
+
+	startMs, endMs, err := segmentTimeRange(path, durationMs)
+	if err != nil {
+		return store.Segment{}, err
+	}
+
+	hasVideo, hasAudio, codec := res.videoAudio()
+
+	seg := store.Segment{
+		CameraID: cameraID,
+		Role:     role,
+		Path:     path,
+		StartMs:  startMs,
+		EndMs:    endMs,
+		HasVideo: hasVideo,
+		HasAudio: hasAudio,
+		Codec:    codec,
+	}
+
+	id, err := segStore.Add(seg)
+	if err != nil {
+		return store.Segment{}, fmt.Errorf("recorder: index segment %s: %w", path, err)
+	}
+	seg.ID = id
+	return seg, nil
+}
+
+// segmentTimeRange derives a segment file's [startMs, endMs) window given
+// its known duration. ffmpeg's segment muxer (see FFmpeg.segmentArgs's
+// -strftime 1 pattern) names each file after the Unix epoch second it was
+// opened at, so the primary path parses path's basename as that integer and
+// uses it directly as the (exact) start time. Any file whose basename isn't
+// a plain integer (e.g. a hand-picked fixture file in a test, or a segment
+// produced by some other naming scheme) falls back to the file's mtime as
+// an estimate of when it finished writing, and derives the start time by
+// subtracting the known duration from that.
+func segmentTimeRange(path string, durationMs int64) (startMs, endMs int64, err error) {
+	base := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	if epochSeconds, convErr := strconv.ParseInt(base, 10, 64); convErr == nil && epochSeconds > 0 {
+		startMs = epochSeconds * 1000
+		return startMs, startMs + durationMs, nil
+	}
+
+	info, statErr := os.Stat(path)
+	if statErr != nil {
+		return 0, 0, fmt.Errorf("recorder: stat %s: %w", path, statErr)
+	}
+	endMs = info.ModTime().UnixMilli()
+	startMs = endMs - durationMs
+	return startMs, endMs, nil
+}
