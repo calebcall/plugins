@@ -109,6 +109,7 @@ package main
 import (
 	sdk "github.com/cameraui/sdk/go"
 
+	"github.com/calebcall/plugins/camera-ui-nvr-local/src/recorder"
 	"github.com/calebcall/plugins/camera-ui-nvr-local/src/store"
 )
 
@@ -117,10 +118,15 @@ import (
 type NVRPlugin struct {
 	sdk.BasePlugin
 
-	// recorders supplies the set of camera IDs this instance is actively
-	// recording. Stubbed with noRecorders until Task 6 introduces the real
-	// recorder registry.
-	recorders managedCameraSource
+	// recorder tracks which cameras assigned to this Hub-role plugin are
+	// actually being recorded, and each one's per-camera recording config.
+	// Replaces the Task-2 noRecorders/managedCameraSource stub —
+	// GetManagedCameraIds (rpc_recording.go) now delegates to
+	// recorder.ManagedCameraIDs(). Populated from the Hub camera lifecycle
+	// (ConfigureCameras/OnCameraAdded/OnCameraReleased, below) via the
+	// sdkManagedCamera adapter. No ffmpeg/recording process state lives here
+	// yet — that's Task 7.
+	recorder *recorder.RecorderManager
 
 	// store backs GetInstanceId's persistent UUID. Set to the plugin's real
 	// sdk.DeviceStorage (the same value as BasePlugin.Storage) in NewPlugin;
@@ -182,7 +188,7 @@ func (p *NVRPlugin) StorageSchema() []sdk.JsonSchema {
 }
 
 func NewPlugin(logger *sdk.Logger, api *sdk.PluginAPI, storage *sdk.DeviceStorage) sdk.Plugin {
-	p := &NVRPlugin{BasePlugin: sdk.NewBasePlugin(logger, api, storage), recorders: noRecorders{}, store: storage}
+	p := &NVRPlugin{BasePlugin: sdk.NewBasePlugin(logger, api, storage), recorder: recorder.NewRecorderManager(), store: storage}
 
 	// Open the embedded SQLite database against the host-provided storage
 	// directory (api.StoragePath — see plugin_api.go: "absolute path to the
@@ -217,26 +223,48 @@ func NewPlugin(logger *sdk.Logger, api *sdk.PluginAPI, storage *sdk.DeviceStorag
 // This is a Hub-role plugin (PluginRoleHub, contract.ts) that "attaches to
 // cameras owned by other plugins" — cameras are handed to it here via the
 // host's hub assignment, not because it owns them. Recording (ffmpeg,
-// segment writing) is still a later task's no-op-for-now scope, but
-// DetectionEvent ingestion — the one piece of camera-aware wiring this task
-// owns — is real: every camera handed in gets subscribed via
-// attachDetectionIngestion, and released cameras are unsubscribed via
-// detectionSubs.remove (events_ingest.go).
+// segment writing) is still a later task's no-op-for-now scope, but two
+// pieces of camera-aware wiring are real as of this task: DetectionEvent
+// ingestion (attachDetectionIngestion, unchanged since Task 1) and the
+// recorder registry (p.recorder, Task 6) that backs GetManagedCameraIds.
+// Every camera handed in is adapted to recorder.ManagedCamera via
+// sdkManagedCamera below and registered/unregistered accordingly.
 func (p *NVRPlugin) ConfigureCameras(cameras []*sdk.CameraDevice) error {
+	managed := make([]recorder.ManagedCamera, 0, len(cameras))
 	for _, cam := range cameras {
 		p.attachDetectionIngestion(cam)
+		managed = append(managed, sdkManagedCamera{dev: cam})
 	}
-	return nil
+	return p.recorder.Configure(managed)
 }
 
 func (p *NVRPlugin) OnCameraAdded(camera *sdk.CameraDevice) error {
 	p.attachDetectionIngestion(camera)
-	return nil
+	return p.recorder.Add(sdkManagedCamera{dev: camera})
 }
 
 func (p *NVRPlugin) OnCameraReleased(cameraID string) error {
 	p.detectionSubs.remove(cameraID)
-	return nil
+	return p.recorder.Remove(cameraID)
+}
+
+// sdkManagedCamera adapts a real *sdk.CameraDevice to recorder.ManagedCamera.
+// This is the only place a *sdk.CameraDevice is bridged into the recorder
+// package — package recorder has no dependency on *sdk.CameraDevice itself
+// (see manager.go: sdk.CameraDevice's only constructor, newCameraDeviceProxy,
+// is unexported, so recorder's own tests use fakes instead). *sdk.CameraDevice
+// doesn't satisfy recorder.ManagedCamera on its own because its Storage()
+// method returns the concrete *sdk.DeviceStorage rather than the
+// recorder.CameraStorage interface; this adapter's Storage() method bridges
+// that return-type mismatch (*sdk.DeviceStorage does implement
+// recorder.CameraStorage's method set — GetValue/DefineSchemas — it's just
+// not the interface's declared return type until wrapped here).
+type sdkManagedCamera struct{ dev *sdk.CameraDevice }
+
+func (c sdkManagedCamera) ID() string   { return c.dev.ID() }
+func (c sdkManagedCamera) Name() string { return c.dev.Name() }
+func (c sdkManagedCamera) Storage() recorder.CameraStorage {
+	return c.dev.Storage()
 }
 
 // attachDetectionIngestion subscribes to cam's detection-event stream via

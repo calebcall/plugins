@@ -1,6 +1,12 @@
 package main
 
-import "testing"
+import (
+	"testing"
+
+	sdk "github.com/cameraui/sdk/go"
+
+	"github.com/calebcall/plugins/camera-ui-nvr-local/src/recorder"
+)
 
 // fakeInstanceStore is an in-memory stand-in for sdk.DeviceStorage. It
 // models the one behavior that matters for GetInstanceId's persistence
@@ -71,7 +77,7 @@ func declarePluginSchemas(p *NVRPlugin, store *fakeInstanceStore) {
 func newTestPlugin(t *testing.T) *NVRPlugin {
 	t.Helper()
 	store := newFakeInstanceStore()
-	p := &NVRPlugin{recorders: noRecorders{}, store: store}
+	p := &NVRPlugin{recorder: recorder.NewRecorderManager(), store: store}
 	declarePluginSchemas(p, store)
 	return p
 }
@@ -87,6 +93,75 @@ func TestGetManagedCameraIds_EmptyByDefault(t *testing.T) {
 	}
 	if len(ids) != 0 {
 		t.Fatalf("expected 0 managed cameras, got %d", len(ids))
+	}
+}
+
+// fakeManagedCameraStorage/fakeManagedCamera let this test delegate through
+// the real recorder.RecorderManager instead of a stub, proving
+// GetManagedCameraIds (rpc_recording.go) actually reflects p.recorder's
+// state rather than a hardcoded value. They implement
+// recorder.CameraStorage/recorder.ManagedCamera directly — see
+// src/recorder/manager_test.go for the equivalent fakes used inside package
+// recorder itself; these are duplicated here (rather than exported from
+// recorder) because plugin_rpc_test.go, in package main, cannot reach
+// recorder's unexported test-only types.
+type fakeManagedCameraStorage struct{ values map[string]any }
+
+func (f *fakeManagedCameraStorage) GetValue(key string, defaultValue ...any) any {
+	if v, ok := f.values[key]; ok {
+		return v
+	}
+	if len(defaultValue) > 0 {
+		return defaultValue[0]
+	}
+	return nil
+}
+
+func (f *fakeManagedCameraStorage) DefineSchemas(schemas []sdk.JsonSchema) {
+	for _, schema := range schemas {
+		if _, exists := f.values[schema.Key]; exists || schema.DefaultValue == nil {
+			continue
+		}
+		f.values[schema.Key] = schema.DefaultValue
+	}
+}
+
+type fakeManagedCamera struct {
+	id, name string
+	storage  *fakeManagedCameraStorage
+}
+
+func newFakeManagedCamera(id, name, recordingMode string) *fakeManagedCamera {
+	return &fakeManagedCamera{
+		id:   id,
+		name: name,
+		storage: &fakeManagedCameraStorage{
+			values: map[string]any{"recordingMode": recordingMode},
+		},
+	}
+}
+
+func (f *fakeManagedCamera) ID() string                      { return f.id }
+func (f *fakeManagedCamera) Name() string                    { return f.name }
+func (f *fakeManagedCamera) Storage() recorder.CameraStorage { return f.storage }
+
+func TestGetManagedCameraIds_DelegatesToRecorderManager(t *testing.T) {
+	p := newTestPlugin(t)
+	cam := newFakeManagedCamera("cam-1", "Front Door", "continuous")
+	if err := p.recorder.Add(cam); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	off := newFakeManagedCamera("cam-2", "Garage", "off")
+	if err := p.recorder.Add(off); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	ids, err := p.GetManagedCameraIds()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(ids) != 1 || ids[0] != "cam-1" {
+		t.Fatalf("expected GetManagedCameraIds to reflect p.recorder's state ([cam-1]), got %v", ids)
 	}
 }
 
@@ -120,7 +195,7 @@ func TestGetManagedCameraIds_RPCMethodsAllowsIt(t *testing.T) {
 // UUID is generated on every call instead of one being persisted).
 func TestGetInstanceId_GeneratesPersistsAndIsStable(t *testing.T) {
 	store := newFakeInstanceStore()
-	p := &NVRPlugin{recorders: noRecorders{}, store: store}
+	p := &NVRPlugin{recorder: recorder.NewRecorderManager(), store: store}
 	declarePluginSchemas(p, store)
 
 	first, err := p.GetInstanceId()
@@ -154,7 +229,7 @@ func TestGetInstanceId_GeneratesPersistsAndIsStable(t *testing.T) {
 // rather than on some other incidental code path.
 func TestGetInstanceId_WithoutSchemaRegistrationDoesNotPersist(t *testing.T) {
 	store := newFakeInstanceStore() // schema deliberately NOT declared
-	p := &NVRPlugin{recorders: noRecorders{}, store: store}
+	p := &NVRPlugin{recorder: recorder.NewRecorderManager(), store: store}
 
 	first, err := p.GetInstanceId()
 	if err != nil {
@@ -177,7 +252,7 @@ func TestGetInstanceId_WithoutSchemaRegistrationDoesNotPersist(t *testing.T) {
 func TestGetInstanceId_ReturnsExistingStoredValue(t *testing.T) {
 	store := newFakeInstanceStore()
 	store.values[instanceIDStorageKey] = "existing-uuid-value"
-	p := &NVRPlugin{recorders: noRecorders{}, store: store}
+	p := &NVRPlugin{recorder: recorder.NewRecorderManager(), store: store}
 
 	id, err := p.GetInstanceId()
 	if err != nil {

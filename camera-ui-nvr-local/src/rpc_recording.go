@@ -6,27 +6,19 @@ import (
 	"github.com/google/uuid"
 )
 
-// managedCameraSource is the minimal interface the RPC layer needs from the
-// recorder registry. Implemented for real by the recorder manager (Task 6);
-// stubbed by noRecorders until then.
-type managedCameraSource interface {
-	// ManagedCameraIDs returns the IDs of cameras this instance is actively
-	// recording. Must return a non-nil (possibly empty) slice.
-	ManagedCameraIDs() []string
-}
-
-// noRecorders is the zero-value stand-in for the recorder registry until
-// Task 6 lands. It manages no cameras.
-type noRecorders struct{}
-
-func (noRecorders) ManagedCameraIDs() []string { return []string{} }
-
 // GetManagedCameraIds returns the camera IDs this NVR instance is actively
-// recording. Registered as the RPC method "getManagedCameraIds" — see the
-// casing findings at the top of plugin.go for how the Go method name maps to
-// that wire name.
+// recording — i.e. p.recorder.ManagedCameraIDs(), the cameras assigned to
+// this Hub plugin whose recordingMode isn't "off" (see
+// recorder.RecorderManager, src/recorder/manager.go). Registered as the RPC
+// method "getManagedCameraIds" — see the casing findings at the top of
+// plugin.go for how the Go method name maps to that wire name.
+//
+// Before Task 6 this delegated to a permanently-empty stub
+// (managedCameraSource/noRecorders); it now reflects the real registry kept
+// current by the Hub camera lifecycle hooks in plugin.go
+// (ConfigureCameras/OnCameraAdded/OnCameraReleased).
 func (p *NVRPlugin) GetManagedCameraIds() ([]string, error) {
-	return p.recorders.ManagedCameraIDs(), nil
+	return p.recorder.ManagedCameraIDs(), nil
 }
 
 // instanceIDStore is the minimal storage interface GetInstanceId needs to
