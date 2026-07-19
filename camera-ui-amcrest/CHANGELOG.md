@@ -1,6 +1,7 @@
 # Changelog
 
 ## 1.0.2
+
 - Update logo to be Amcrest colors
 
 ## 1.0.1
