@@ -168,6 +168,27 @@ type Recorder struct {
 	pollInterval time.Duration
 	sleep        func(ctx context.Context, d time.Duration) bool
 
+	// nowFn is the injected clock (Task 8 fix) used by every event-mode
+	// retention decision (event_mode.go: MarkEvent, promoteIfCovered,
+	// sweepEventSpool) instead of calling time.Now() directly, so tests can
+	// drive "now" deterministically — essential for proving a protected
+	// window stays open across a long-active event, and that post-roll
+	// segments finalized after the terminal message get promoted, without
+	// actually sleeping. Defaults to the real wall clock in NewRecorder;
+	// production code never overrides it.
+	nowFn func() int64
+
+	// events tracks each currently-relevant detection event's protected
+	// retention window (event_mode.go), and retentionMu serializes every
+	// promotion pass (MarkEvent, promoteIfCovered) against sweepEventSpool's
+	// own read-decide-delete sequence, so the two can never interleave and
+	// delete a segment a concurrent promotion was in the middle of
+	// retaining (the TOCTOU a plain per-call SegmentStore lock alone
+	// couldn't prevent, since it only ever locked one round-trip at a
+	// time).
+	events      eventWindowSet
+	retentionMu sync.Mutex
+
 	mu      sync.Mutex
 	cancel  context.CancelFunc
 	running bool
@@ -191,6 +212,7 @@ func NewRecorder(cfg RecorderConfig, segStore *store.SegmentStore, ff *FFmpeg, l
 		runner:       execCommandRunner{},
 		pollInterval: defaultSegmentPollInterval,
 		sleep:        ctxSleep,
+		nowFn:        func() int64 { return time.Now().UnixMilli() },
 		state:        RecordingState{CameraID: cfg.CameraID, State: StateStopped},
 	}
 }
@@ -431,8 +453,9 @@ func (r *Recorder) watchSegments(ctx context.Context, outDir, role string) {
 			// sweepEventSpool's doc comment (event_mode.go) for why it
 			// only ever does anything in RecordingModeEvents, and only to
 			// spool segments already older than the camera's configured
-			// pre-roll.
-			r.sweepEventSpool(time.Now())
+			// pre-roll AND not covered by any still-open protected event
+			// window.
+			r.sweepEventSpool()
 		}
 	}
 }
@@ -469,11 +492,20 @@ func (r *Recorder) sweepSegments(outDir, role string, processedUpTo *string, fin
 
 	for i := start; i < limit; i++ {
 		path := files[i]
-		if _, err := finalizeSegment(r.ff, r.segStore, r.cfg.CameraID, role, path, r.initiallyReferenced()); err != nil {
+		seg, err := finalizeSegment(r.ff, r.segStore, r.cfg.CameraID, role, path, r.initiallyReferenced())
+		if err != nil {
 			r.logf("recorder: %s/%s: index segment %s: %v", r.cfg.CameraID, role, path, err)
 			return
 		}
 		*processedUpTo = path
+
+		// Critical 1 fix (Task 8 follow-up): a post-roll segment doesn't
+		// exist yet at the moment MarkEvent's own promotion pass runs for
+		// an event's terminal message — it's only finalized here, up to
+		// PostRollS seconds later. Checking every newly finalized
+		// events-mode segment against the currently open protected windows
+		// immediately is what actually retains it; see promoteIfCovered.
+		r.promoteIfCovered(seg)
 	}
 }
 

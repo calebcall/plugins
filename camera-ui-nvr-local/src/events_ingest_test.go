@@ -95,13 +95,21 @@ func TestDetectionEventIngester_Handle_LogsAndSwallowsStoreErrors(t *testing.T) 
 
 // spyRecorder is an eventRecorder test double recording every MarkEvent call
 // it receives, so a test can assert both that it was called and with which
-// window.
+// (eventID, startMs, endMs).
 type spyRecorder struct {
-	calls []struct{ startMs, endMs int64 }
+	calls []struct {
+		eventID string
+		startMs int64
+		endMs   int64
+	}
 }
 
-func (s *spyRecorder) MarkEvent(startMs, endMs int64) {
-	s.calls = append(s.calls, struct{ startMs, endMs int64 }{startMs, endMs})
+func (s *spyRecorder) MarkEvent(eventID string, startMs, endMs int64) {
+	s.calls = append(s.calls, struct {
+		eventID string
+		startMs int64
+		endMs   int64
+	}{eventID, startMs, endMs})
 }
 
 // fakeRecorderLookup is an eventRecorderLookup test double: recorders holds
@@ -117,7 +125,7 @@ func (f *fakeRecorderLookup) RecorderFor(cameraID string) (eventRecorder, bool) 
 
 // TestDetectionEventIngester_Handle_CallsMarkEventOnRegisteredRecorder proves
 // handle looks up the event's camera in the recorder lookup and, when found,
-// calls MarkEvent with exactly the event's StartTime/EndTime — the window
+// calls MarkEvent with exactly the event's ID/StartTime/EndTime — the window
 // recorder.Recorder.MarkEvent (event_mode.go) then expands by the camera's
 // pre/post roll itself.
 func TestDetectionEventIngester_Handle_CallsMarkEventOnRegisteredRecorder(t *testing.T) {
@@ -132,8 +140,40 @@ func TestDetectionEventIngester_Handle_CallsMarkEventOnRegisteredRecorder(t *tes
 	if len(spy.calls) != 1 {
 		t.Fatalf("expected exactly 1 MarkEvent call, got %d", len(spy.calls))
 	}
-	if spy.calls[0].startMs != 1000 || spy.calls[0].endMs != 6000 {
-		t.Fatalf("expected MarkEvent(1000, 6000), got MarkEvent(%d, %d)", spy.calls[0].startMs, spy.calls[0].endMs)
+	if spy.calls[0].eventID != "evt-1" || spy.calls[0].startMs != 1000 || spy.calls[0].endMs != 6000 {
+		t.Fatalf("expected MarkEvent(evt-1, 1000, 6000), got MarkEvent(%s, %d, %d)", spy.calls[0].eventID, spy.calls[0].startMs, spy.calls[0].endMs)
+	}
+}
+
+// TestDetectionEventIngester_Handle_StartThenEndLifecycle_CallsMarkEventForBoth
+// is the multi-message lifecycle case that hid the original design's bugs
+// (see event_mode.go's package doc): a "start" message reports EndTime==0
+// (sdk.DetectionEvent's omitempty zero value), and only a later "end"
+// message reports the real EndTime. This proves handle calls MarkEvent for
+// BOTH messages — not just the terminal one — with the same eventID both
+// times (so recorder.Recorder can tell they're updates to the same
+// protected window, not two different events) and the exact EndTime each
+// message carried (0, then 5000).
+func TestDetectionEventIngester_Handle_StartThenEndLifecycle_CallsMarkEventForBoth(t *testing.T) {
+	spy := &spyRecorder{}
+	lookup := &fakeRecorderLookup{recorders: map[string]eventRecorder{"cam1": spy}}
+	ingester := newDetectionEventIngester(&fakeEventStore{}, lookup, nil)
+
+	ingester.handle(sdk.DetectionEventStart, sdk.DetectionEvent{
+		ID: "evt-1", CameraID: "cam1", State: sdk.DetectionEventStateActive, StartTime: 1000,
+	})
+	ingester.handle(sdk.DetectionEventEnd, sdk.DetectionEvent{
+		ID: "evt-1", CameraID: "cam1", State: sdk.DetectionEventStateEnded, StartTime: 1000, EndTime: 5000,
+	})
+
+	if len(spy.calls) != 2 {
+		t.Fatalf("expected 2 MarkEvent calls (one per lifecycle message), got %d", len(spy.calls))
+	}
+	if spy.calls[0].eventID != "evt-1" || spy.calls[0].startMs != 1000 || spy.calls[0].endMs != 0 {
+		t.Fatalf("expected the start message's call to be MarkEvent(evt-1, 1000, 0), got MarkEvent(%s, %d, %d)", spy.calls[0].eventID, spy.calls[0].startMs, spy.calls[0].endMs)
+	}
+	if spy.calls[1].eventID != "evt-1" || spy.calls[1].startMs != 1000 || spy.calls[1].endMs != 5000 {
+		t.Fatalf("expected the end message's call to be MarkEvent(evt-1, 1000, 5000), got MarkEvent(%s, %d, %d)", spy.calls[1].eventID, spy.calls[1].startMs, spy.calls[1].endMs)
 	}
 }
 

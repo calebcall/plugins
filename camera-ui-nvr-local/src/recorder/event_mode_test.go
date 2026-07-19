@@ -3,6 +3,8 @@ package recorder
 import (
 	"fmt"
 	"os"
+	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -11,10 +13,11 @@ import (
 
 // newEventsModeRecorder returns a Recorder configured for RecordingModeEvents
 // against a fresh segStore, with the given pre/post roll (seconds). It never
-// runs ffmpeg — every test in this file drives MarkEvent/sweepEventSpool
-// directly against segments seeded straight into segStore, simulating "a
-// sequence of finalized segments" (the brief's rolling buffer) without any
-// real recording.
+// runs ffmpeg — every test in this file drives MarkEvent/promoteIfCovered/
+// sweepEventSpool directly against segments seeded straight into segStore,
+// simulating "a sequence of finalized segments" (the brief's rolling
+// buffer) without any real recording. Its clock (r.nowFn) defaults to the
+// real wall clock; tests that need deterministic time override it directly.
 func newEventsModeRecorder(t *testing.T, segStore *store.SegmentStore, preRollS, postRollS int) *Recorder {
 	t.Helper()
 	cfg := RecorderConfig{
@@ -26,6 +29,13 @@ func newEventsModeRecorder(t *testing.T, segStore *store.SegmentStore, preRollS,
 		PostRollS: postRollS,
 	}
 	return NewRecorder(cfg, segStore, &FFmpeg{}, nil)
+}
+
+// fixedClock returns a nowFn that always reports ms, for tests that need to
+// drive Recorder.nowFn deterministically rather than depending on real
+// elapsed wall-clock time.
+func fixedClock(ms int64) func() int64 {
+	return func() int64 { return ms }
 }
 
 // seedSegment inserts a segment row for cam1/high covering [startMs, endMs)
@@ -105,13 +115,15 @@ func segmentExists(t *testing.T, segStore *store.SegmentStore, seg store.Segment
 }
 
 // ---------------------------------------------------------------------------
-// MarkEvent: promotion
+// MarkEvent: promotion (single-message / already-final windows)
 // ---------------------------------------------------------------------------
 
 // TestRecorder_MarkEvent_PromotesOnlySegmentsCoveringWindow proves MarkEvent,
-// given a rolling buffer of finalized (but not yet referenced) segments,
-// promotes exactly the ones overlapping [start-preRoll, end+postRoll] and
-// leaves every other segment untouched (still unreferenced).
+// given a rolling buffer of finalized (but not yet referenced) segments and
+// a single already-terminal message (endMs > 0, as if it were the only
+// message received for this event), promotes exactly the segments
+// overlapping [start-preRoll, end+postRoll] and leaves every other segment
+// untouched (still unreferenced).
 func TestRecorder_MarkEvent_PromotesOnlySegmentsCoveringWindow(t *testing.T) {
 	segStore := newTestSegmentStore(t)
 	dir := t.TempDir()
@@ -128,7 +140,7 @@ func TestRecorder_MarkEvent_PromotesOnlySegmentsCoveringWindow(t *testing.T) {
 
 	// An event spanning exactly the seg1/seg2 boundary, with zero pre/post
 	// roll, overlaps only seg1 and seg2.
-	r.MarkEvent(19000, 21000)
+	r.MarkEvent("evt-1", 19000, 21000)
 
 	if segmentReferenced(t, segStore, seg0) {
 		t.Errorf("seg0 (ends before the event window) should not be promoted")
@@ -169,7 +181,7 @@ func TestRecorder_MarkEvent_RetainsSegmentStartingAtPreRollEdge(t *testing.T) {
 	current := seedSegment(t, dir, segStore, 30000, 39999, false)
 
 	const eventAtMs = 32000
-	r.MarkEvent(eventAtMs, eventAtMs)
+	r.MarkEvent("evt-1", eventAtMs, eventAtMs)
 
 	if segmentReferenced(t, segStore, justBefore) {
 		t.Errorf("segment ending at 19999 is entirely before T-preRoll (20000) and must not be retained")
@@ -207,7 +219,7 @@ func TestRecorder_MarkEvent_NoOpOutsideEventsMode(t *testing.T) {
 	// initiallyReferenced); seed it that way to prove MarkEvent leaves it be.
 	seg := seedSegment(t, dir, segStore, 0, 9999, true)
 
-	r.MarkEvent(0, 0)
+	r.MarkEvent("evt-1", 0, 0)
 
 	if !segmentReferenced(t, segStore, seg) {
 		t.Errorf("continuous-mode segment must remain referenced after MarkEvent")
@@ -217,18 +229,20 @@ func TestRecorder_MarkEvent_NoOpOutsideEventsMode(t *testing.T) {
 	// not panic either — this is the "no-op" half of MarkEvent's contract
 	// taken to its limit.
 	bare := NewRecorder(RecorderConfig{CameraID: "cam2"}, nil, &FFmpeg{}, nil)
-	bare.MarkEvent(1000, 2000)
+	bare.MarkEvent("evt-2", 1000, 2000)
 }
 
 // ---------------------------------------------------------------------------
-// sweepEventSpool: discard
+// sweepEventSpool: discard (no protected windows in play)
 // ---------------------------------------------------------------------------
 
 // TestRecorder_SweepEventSpool_DeletesOnlyStaleUnreferencedSegments proves
-// the janitor: an unreferenced segment older than PreRollS is deleted (row
-// and file); an unreferenced segment still within the PreRollS freshness
-// window is left alone (so a not-yet-arrived event can still claim it); and
-// a referenced segment is never deleted regardless of age.
+// the janitor's age/referenced predicate in isolation (no protected windows
+// exist in this test): an unreferenced segment older than PreRollS is
+// deleted (row and file); an unreferenced segment still within the
+// PreRollS freshness window is left alone (so a not-yet-arrived event can
+// still claim it); and a referenced segment is never deleted regardless of
+// age.
 func TestRecorder_SweepEventSpool_DeletesOnlyStaleUnreferencedSegments(t *testing.T) {
 	segStore := newTestSegmentStore(t)
 	dir := t.TempDir()
@@ -236,14 +250,14 @@ func TestRecorder_SweepEventSpool_DeletesOnlyStaleUnreferencedSegments(t *testin
 	const preRollS = 5
 	r := newEventsModeRecorder(t, segStore, preRollS, 0)
 
-	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
-	nowMs := now.UnixMilli()
+	const nowMs = int64(1_700_000_000_000)
+	r.nowFn = fixedClock(nowMs)
 
 	stale := seedSegment(t, dir, segStore, nowMs-20_000, nowMs-19_000, false)       // unreferenced, well past preRoll
 	fresh := seedSegment(t, dir, segStore, nowMs-3_000, nowMs-2_000, false)         // unreferenced, still within preRoll
 	staleButKept := seedSegment(t, dir, segStore, nowMs-20_000, nowMs-19_000, true) // referenced, same age as stale
 
-	r.sweepEventSpool(now)
+	r.sweepEventSpool()
 
 	if segmentExists(t, segStore, stale) {
 		t.Errorf("stale unreferenced segment should have been deleted from the store")
@@ -285,12 +299,182 @@ func TestRecorder_SweepEventSpool_NoOpOutsideEventsMode(t *testing.T) {
 		PostRollS: 5,
 	}
 	r := NewRecorder(cfg, segStore, &FFmpeg{}, nil)
+	r.nowFn = fixedClock(time.Now().Add(time.Hour).UnixMilli())
 
 	old := seedSegment(t, dir, segStore, 0, 1000, false)
 
-	r.sweepEventSpool(time.Now().Add(time.Hour))
+	r.sweepEventSpool()
 
 	if !segmentExists(t, segStore, old) {
 		t.Errorf("sweepEventSpool must not delete anything outside events mode")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Full multi-message lifecycle, driven by the injected clock (Task 8
+// follow-up fix): this is the test that would have failed against the
+// original one-shot-MarkEvent design (see event_mode.go's package doc for
+// the three bugs it proves are fixed).
+// ---------------------------------------------------------------------------
+
+// TestRecorder_EventLifecycle_PreRollSurvivesAndPostRollPromotedAfterEnd
+// drives a single event through a "start" message (EndTime==0) and, much
+// later on the injected clock, an "end" message (EndTime set) — exactly the
+// sdk.DetectionEvent lifecycle shape that hid the original bugs — and
+// asserts all three required properties:
+//
+//   - the pre-roll segment (started at eventStart-preRoll, already indexed
+//     before the event even started) is retained and NOT swept, even
+//     though the clock advances well past it (and well past a naive
+//     `now-preRoll` cutoff) while the event is still active with no end
+//     message yet (Critical 2's fix: the window has no known end while
+//     rawEnd==0, so it can't be treated as stale);
+//   - a segment finalized AFTER the end message, within
+//     [eventEnd, eventEnd+postRoll], gets promoted via promoteIfCovered —
+//     the hook recorder.go's sweepSegments calls for every newly finalized
+//     segment (Critical 1's fix: post-roll segments don't exist yet at
+//     MarkEvent's own promotion-pass time);
+//   - a segment entirely outside [eventStart-preRoll, eventEnd+postRoll]
+//     and older than preRoll IS swept, proving the janitor still discards
+//     what nothing protects.
+func TestRecorder_EventLifecycle_PreRollSurvivesAndPostRollPromotedAfterEnd(t *testing.T) {
+	segStore := newTestSegmentStore(t)
+	dir := t.TempDir()
+
+	const preRollS = 5
+	const postRollS = 5
+	r := newEventsModeRecorder(t, segStore, preRollS, postRollS)
+
+	clockMs := int64(100_000)
+	r.nowFn = func() int64 { return clockMs }
+
+	const eventStart = int64(102_000) // 2s after the clock starts
+
+	// Pre-roll segment: already recorded before the event started, covering
+	// exactly [eventStart-preRoll, eventStart-preRoll+999] = [97000, 97999].
+	preRollSeg := seedSegment(t, dir, segStore, eventStart-preRollS*1000, eventStart-preRollS*1000+999, false)
+
+	// Entirely unrelated, far-past segment: covered by no window, ever.
+	unrelated := seedSegment(t, dir, segStore, 0, 500, false)
+
+	// "start" message: EndTime == 0 (the event is active, end unknown).
+	r.MarkEvent("evt-1", eventStart, 0)
+
+	// Advance the clock well past both the pre-roll segment's own timestamp
+	// and a naive `now-preRoll` cutoff, WHILE THE EVENT IS STILL ACTIVE (no
+	// end message yet), and sweep repeatedly. The pre-roll segment must
+	// survive every sweep because its window has no known end yet.
+	clockMs += 60_000 // now = 160000; naive cutoff now-preRoll = 155000 >> 97999
+	r.sweepEventSpool()
+	r.sweepEventSpool() // idempotent: a second sweep must not change anything
+
+	if !segmentExists(t, segStore, preRollSeg) {
+		t.Fatalf("pre-roll segment must survive while its event is still active, however stale it looks")
+	}
+	if segmentExists(t, segStore, unrelated) {
+		t.Fatalf("unrelated, unprotected stale segment should already have been swept")
+	}
+
+	// Terminal "end" message: EndTime freezes the window's end.
+	const eventEnd = int64(161_000) // 1s after the current clock value
+	clockMs = eventEnd
+	r.MarkEvent("evt-1", eventStart, eventEnd)
+
+	// Post-roll segment finalized AFTER the end message — simulating
+	// recorder.go's sweepSegments indexing it some time later, within
+	// [eventEnd, eventEnd+postRoll] — via the same promoteIfCovered hook
+	// sweepSegments calls for every newly finalized segment.
+	clockMs = eventEnd + 2_000 // 2s after end, still within the 5s post-roll
+	postRollSeg := seedSegment(t, dir, segStore, eventEnd+1000, eventEnd+1999, false)
+	r.promoteIfCovered(postRollSeg)
+
+	if !segmentReferenced(t, segStore, postRollSeg) {
+		t.Fatalf("post-roll segment finalized after the end message must be promoted")
+	}
+
+	// Advance well past eventEnd+postRoll and sweep again: the window
+	// retires, but both already-promoted segments must remain (the janitor
+	// never deletes a referenced segment, window or no window).
+	clockMs = eventEnd + (postRollS+10)*1000
+	r.sweepEventSpool()
+
+	if !segmentExists(t, segStore, preRollSeg) {
+		t.Fatalf("promoted pre-roll segment must not be deleted after window retirement")
+	}
+	if !segmentExists(t, segStore, postRollSeg) {
+		t.Fatalf("promoted post-roll segment must not be deleted after window retirement")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Concurrency: promotion vs. sweep, under -race.
+// ---------------------------------------------------------------------------
+
+// TestRecorder_MarkEventAndSweepEventSpool_ConcurrentNoRace runs a producer
+// goroutine (simulating the ingestion path: finalizing new spool segments
+// and calling MarkEvent, much like recorder.go's sweepSegments +
+// events_ingest.go do from separate goroutines in production) concurrently
+// against a sweeper goroutine (simulating the watcher's periodic
+// sweepEventSpool tick) for a short, real-time duration, and asserts only
+// that nothing panics, errors, or — run under `go test -race` — races. This
+// is the IMPORTANT/TOCTOU fix's regression test: promotion
+// (InRange-then-MarkReferenced) and the sweep's own
+// query-then-filter-then-delete now both hold r.retentionMu for their whole
+// sequence, so they can never interleave.
+//
+// Deliberately avoids calling any *testing.T method from the background
+// goroutines (t.Fatal et al. are documented as safe only from the test's
+// own goroutine) — errors are instead captured via setErr and asserted
+// after both goroutines have finished.
+func TestRecorder_MarkEventAndSweepEventSpool_ConcurrentNoRace(t *testing.T) {
+	segStore := newTestSegmentStore(t)
+	dir := t.TempDir()
+	r := newEventsModeRecorder(t, segStore, 2, 2)
+
+	const testDuration = 100 * time.Millisecond
+	deadline := time.Now().Add(testDuration)
+
+	var errOnce sync.Once
+	var firstErr error
+	setErr := func(err error) {
+		if err == nil {
+			return
+		}
+		errOnce.Do(func() { firstErr = err })
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		i := 0
+		for time.Now().Before(deadline) {
+			now := r.nowFn()
+			path := filepath.Join(dir, fmt.Sprintf("prod-%d.mp4", i))
+			if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+				setErr(err)
+				return
+			}
+			seg := store.Segment{CameraID: "cam1", Role: "high", Path: path, StartMs: now, EndMs: now + 900}
+			if _, err := segStore.Add(seg); err != nil {
+				setErr(err)
+				return
+			}
+			r.MarkEvent(fmt.Sprintf("evt-%d", i%5), now-1000, now)
+			i++
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		for time.Now().Before(deadline) {
+			r.sweepEventSpool()
+		}
+	}()
+
+	wg.Wait()
+	if firstErr != nil {
+		t.Fatalf("concurrent producer/sweeper error: %v", firstErr)
 	}
 }

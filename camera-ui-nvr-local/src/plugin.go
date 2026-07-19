@@ -272,8 +272,9 @@ func (p *NVRPlugin) OnCameraReleased(cameraID string) error {
 // DetectionEvent. OnCameraReleased above already calls Remove so a stale
 // entry doesn't outlive its camera once something starts adding them.
 //
-// *recorder.Recorder satisfies eventRecorder (MarkEvent(startMs, endMs
-// int64)) directly — no adapter needed, unlike sdkManagedCamera above.
+// *recorder.Recorder satisfies eventRecorder (MarkEvent(eventID string,
+// startMs, endMs int64)) directly — no adapter needed, unlike
+// sdkManagedCamera above.
 type recorderRegistry struct {
 	mu   sync.Mutex
 	recs map[string]*recorder.Recorder

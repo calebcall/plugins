@@ -20,10 +20,14 @@ type eventUpserter interface {
 // trigger Task 8's event-mode retention: *recorder.Recorder.MarkEvent
 // satisfies it directly (see recorder/event_mode.go — it is itself a no-op
 // outside RecordingModeEvents, so the ingester never needs to know a
-// camera's mode to decide whether calling it is safe). Tests substitute a
-// spy to assert MarkEvent is invoked with the right window.
+// camera's mode to decide whether calling it is safe). eventID keys the
+// recorder's per-event protected window (event_mode.go's eventWindowSet) —
+// without it, repeated calls for the same event across its start/update/end
+// lifecycle messages couldn't be told apart from calls for different
+// events. Tests substitute a spy to assert MarkEvent is invoked with the
+// right (eventID, startMs, endMs).
 type eventRecorder interface {
-	MarkEvent(startMs, endMs int64)
+	MarkEvent(eventID string, startMs, endMs int64)
 }
 
 // eventRecorderLookup resolves a camera ID to the eventRecorder responsible
@@ -76,13 +80,14 @@ func newDetectionEventIngester(store eventUpserter, recorders eventRecorderLooku
 // already carry everything Upsert needs to decide insert vs. replace.
 //
 // After upserting, handle also calls markEvent for the same event: every
-// lifecycle message carries the event's current StartTime/EndTime, so
-// MarkEvent is called repeatedly (once per message) with a window that only
-// grows as EndTime advances from 0 (event still active) to its final value
-// — each call promotes whatever segments are coverable so far, which is
-// simpler and safer than trying to call it only once on some particular
-// eventType, and is idempotent because MarkReferenced (store/segments.go) is
-// itself idempotent.
+// lifecycle message (start, update(s), end, segment-*) carries the event's
+// current StartTime/EndTime, and MarkEvent is called on EVERY one of them —
+// not just a particular eventType — because EndTime is 0 (sdk.DetectionEvent's
+// omitempty zero value) until the terminal message, and *recorder.Recorder
+// needs every intermediate call too, to keep the event's protected window
+// open and rolling forward while it's still active (see event_mode.go's
+// package doc for why calling MarkEvent only once, on the terminal message,
+// is exactly the bug this now avoids).
 func (i *detectionEventIngester) handle(eventType sdk.DetectionEventType, event sdk.DetectionEvent) {
 	if err := i.store.Upsert([]store.DetectionEvent{event}); err != nil && i.logger != nil {
 		i.logger.Error("nvr-local: upsert detection event failed:", err)
@@ -90,7 +95,7 @@ func (i *detectionEventIngester) handle(eventType sdk.DetectionEventType, event 
 	i.markEvent(event)
 }
 
-// markEvent calls MarkEvent(event.StartTime, event.EndTime) on the
+// markEvent calls MarkEvent(event.ID, event.StartTime, event.EndTime) on the
 // eventRecorder registered for event.CameraID, if any. A no-op when
 // i.recorders is nil or has no recorder registered for this camera — see
 // newDetectionEventIngester's doc comment for why that's not an error.
@@ -102,7 +107,7 @@ func (i *detectionEventIngester) markEvent(event sdk.DetectionEvent) {
 	if !ok {
 		return
 	}
-	rec.MarkEvent(event.StartTime, event.EndTime)
+	rec.MarkEvent(event.ID, event.StartTime, event.EndTime)
 }
 
 // detectionSubscriptions tracks the per-camera sdk.Disposable returned by

@@ -11,10 +11,10 @@ import (
 //
 // Referenced (Task 8) distinguishes permanently-retained segments from
 // events-mode "spool" segments that haven't (yet, or ever) been claimed by
-// a detection event: see MarkReferenced and DeleteUnreferencedOlderThan,
-// and recorder/event_mode.go which drives both. Continuous-mode recording
-// always inserts segments with Referenced=true; nothing in this store ever
-// flips it back to false.
+// a detection event: see MarkReferenced and UnreferencedOlderThan/
+// DeleteByIDs, and recorder/event_mode.go which drives all three.
+// Continuous-mode recording always inserts segments with Referenced=true;
+// nothing in this store ever flips it back to false.
 type Segment struct {
 	ID         int64
 	CameraID   string
@@ -239,12 +239,13 @@ func (s *SegmentStore) DeleteOlderThan(cameraID string, cutoffMs int64) ([]strin
 }
 
 // MarkReferenced flips referenced = 1 for every segment id given, promoting
-// them out of the events-mode "spool" so DeleteUnreferencedOlderThan's
-// janitor sweep never removes them. Called by recorder.Recorder.MarkEvent
-// once it has resolved which segments cover a detection event's
-// [start-preRoll, end+postRoll] window (recorder/event_mode.go). A no-op,
-// not an error, when ids is empty (MarkEvent's usual case when a role has no
-// segments in the event's window yet).
+// them out of the events-mode "spool" so the janitor (UnreferencedOlderThan
+// + DeleteByIDs, driven by recorder.Recorder.sweepEventSpool) never removes
+// them. Called by recorder.Recorder's promotion paths (MarkEvent,
+// promoteIfCovered, promoteRangeLocked) once they've resolved which
+// segments cover one of a camera's currently protected detection-event
+// windows (recorder/event_mode.go). A no-op, not an error, when ids is
+// empty (the common case when a query found nothing new to promote).
 func (s *SegmentStore) MarkReferenced(ids []int64) error {
 	if len(ids) == 0 {
 		return nil
@@ -273,73 +274,25 @@ func (s *SegmentStore) MarkReferenced(ids []int64) error {
 	return nil
 }
 
-// DeleteUnreferencedOlderThan removes every segment row for cameraID that is
-// still unreferenced (referenced = 0 — an events-mode spool segment never
-// claimed by MarkEvent) and whose end_ms falls strictly before cutoffMs,
-// returning the file paths of the rows removed so the caller can delete the
-// underlying files too (this method only touches the DB rows, matching
-// DeleteOlderThan's contract).
-//
-// This is the events-mode janitor's mechanism (recorder/event_mode.go): the
-// recorder calls it on a timer with cutoffMs = now - preRollS, so a spool
-// segment is only ever discarded once it's older than the camera's
-// configured pre-roll — guaranteeing a fresh detection event can always
-// still find, and MarkReferenced promote, the pre-roll segments it needs.
-// Referenced segments are never touched here regardless of age; pruning
-// those by age/retention is DeleteOlderThan's (a later retention-GC task's)
-// separate job.
-func (s *SegmentStore) DeleteUnreferencedOlderThan(cameraID string, cutoffMs int64) ([]string, error) {
+// UnreferencedOlderThan returns (read-only — no delete) every segment row
+// for cameraID that is unreferenced (referenced = 0 — an events-mode spool
+// segment never claimed by any promotion path) and whose end_ms falls
+// strictly before cutoffMs: the events-mode janitor's candidate set, before
+// recorder.Recorder.sweepEventSpool filters out anything still covered by a
+// currently open protected detection-event window (recorder/event_mode.go
+// — that filtering needs each candidate's own StartMs/EndMs to check
+// against a set of windows that can't be expressed as a single additional
+// SQL predicate here, hence the read-then-filter-then-DeleteByIDs split
+// instead of one combined delete statement like DeleteOlderThan's).
+func (s *SegmentStore) UnreferencedOlderThan(cameraID string, cutoffMs int64) ([]Segment, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	conn := s.db.Conn()
-
-	if err := conn.Exec("BEGIN IMMEDIATE"); err != nil {
-		return nil, fmt.Errorf("store: begin delete unreferenced older than: %w", err)
-	}
-
-	paths, err := s.unreferencedPathsOlderThan(cameraID, cutoffMs)
-	if err != nil {
-		_ = conn.Exec("ROLLBACK")
-		return nil, err
-	}
-
-	stmt, _, err := conn.Prepare(`DELETE FROM segments WHERE camera_id = ? AND referenced = 0 AND end_ms < ?`)
-	if err != nil {
-		_ = conn.Exec("ROLLBACK")
-		return nil, fmt.Errorf("store: prepare delete unreferenced older than: %w", err)
-	}
-	bindErr := func() error {
-		defer stmt.Close()
-		if err := stmt.BindText(1, cameraID); err != nil {
-			return err
-		}
-		if err := stmt.BindInt64(2, cutoffMs); err != nil {
-			return err
-		}
-		return stmt.Exec()
-	}()
-	if bindErr != nil {
-		_ = conn.Exec("ROLLBACK")
-		return nil, fmt.Errorf("store: delete unreferenced older than: %w", bindErr)
-	}
-
-	if err := conn.Exec("COMMIT"); err != nil {
-		return nil, fmt.Errorf("store: commit delete unreferenced older than: %w", err)
-	}
-	return paths, nil
-}
-
-// unreferencedPathsOlderThan returns the paths of the segments matching the
-// same predicate used by DeleteUnreferencedOlderThan's DELETE, so the two
-// stay in sync. Internal helper only called from DeleteUnreferencedOlderThan,
-// which already holds s.mu — it must not lock again itself (sync.Mutex isn't
-// reentrant).
-func (s *SegmentStore) unreferencedPathsOlderThan(cameraID string, cutoffMs int64) ([]string, error) {
 	stmt, _, err := s.db.Conn().Prepare(`
-		SELECT path FROM segments WHERE camera_id = ? AND referenced = 0 AND end_ms < ?`)
+		SELECT id, camera_id, role, path, start_ms, end_ms, has_video, has_audio, codec, referenced
+		FROM segments WHERE camera_id = ? AND referenced = 0 AND end_ms < ?`)
 	if err != nil {
-		return nil, fmt.Errorf("store: prepare select unreferenced older than: %w", err)
+		return nil, fmt.Errorf("store: prepare unreferenced older than: %w", err)
 	}
 	defer stmt.Close()
 
@@ -350,12 +303,110 @@ func (s *SegmentStore) unreferencedPathsOlderThan(cameraID string, cutoffMs int6
 		return nil, err
 	}
 
-	var paths []string
+	var segs []Segment
 	for stmt.Step() {
-		paths = append(paths, stmt.ColumnText(0))
+		segs = append(segs, Segment{
+			ID:         stmt.ColumnInt64(0),
+			CameraID:   stmt.ColumnText(1),
+			Role:       stmt.ColumnText(2),
+			Path:       stmt.ColumnText(3),
+			StartMs:    stmt.ColumnInt64(4),
+			EndMs:      stmt.ColumnInt64(5),
+			HasVideo:   stmt.ColumnBool(6),
+			HasAudio:   stmt.ColumnBool(7),
+			Codec:      stmt.ColumnText(8),
+			Referenced: stmt.ColumnBool(9),
+		})
 	}
 	if err := stmt.Err(); err != nil {
-		return nil, fmt.Errorf("store: scan select unreferenced older than: %w", err)
+		return nil, fmt.Errorf("store: scan unreferenced older than: %w", err)
+	}
+	return segs, nil
+}
+
+// DeleteByIDs removes exactly the given segment rows, regardless of their
+// referenced flag or age, and returns their file paths — the second half of
+// the events-mode janitor's UnreferencedOlderThan-then-filter-then-
+// DeleteByIDs sequence (recorder.Recorder.sweepEventSpool), for a caller
+// that has already independently decided, via its own predicate (there:
+// "unreferenced, stale, AND not covered by any open protected window"),
+// exactly which rows to remove. A no-op, not an error, when ids is empty.
+func (s *SegmentStore) DeleteByIDs(ids []int64) ([]string, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	conn := s.db.Conn()
+
+	if err := conn.Exec("BEGIN IMMEDIATE"); err != nil {
+		return nil, fmt.Errorf("store: begin delete by ids: %w", err)
+	}
+
+	paths, err := s.pathsByIDs(ids)
+	if err != nil {
+		_ = conn.Exec("ROLLBACK")
+		return nil, err
+	}
+
+	stmt, _, err := conn.Prepare(`DELETE FROM segments WHERE id = ?`)
+	if err != nil {
+		_ = conn.Exec("ROLLBACK")
+		return nil, fmt.Errorf("store: prepare delete by ids: %w", err)
+	}
+	execErr := func() error {
+		defer stmt.Close()
+		for _, id := range ids {
+			if err := stmt.BindInt64(1, id); err != nil {
+				return err
+			}
+			if err := stmt.Exec(); err != nil {
+				return err
+			}
+			if err := stmt.Reset(); err != nil {
+				return err
+			}
+		}
+		return nil
+	}()
+	if execErr != nil {
+		_ = conn.Exec("ROLLBACK")
+		return nil, fmt.Errorf("store: delete by ids: %w", execErr)
+	}
+
+	if err := conn.Exec("COMMIT"); err != nil {
+		return nil, fmt.Errorf("store: commit delete by ids: %w", err)
+	}
+	return paths, nil
+}
+
+// pathsByIDs returns the paths of the segments matching ids, so DeleteByIDs
+// can report what it removed. Internal helper only called from
+// DeleteByIDs, which already holds s.mu — it must not lock again itself
+// (sync.Mutex isn't reentrant).
+func (s *SegmentStore) pathsByIDs(ids []int64) ([]string, error) {
+	stmt, _, err := s.db.Conn().Prepare(`SELECT path FROM segments WHERE id = ?`)
+	if err != nil {
+		return nil, fmt.Errorf("store: prepare select by ids: %w", err)
+	}
+	defer stmt.Close()
+
+	var paths []string
+	for _, id := range ids {
+		if err := stmt.BindInt64(1, id); err != nil {
+			return nil, err
+		}
+		if stmt.Step() {
+			paths = append(paths, stmt.ColumnText(0))
+		}
+		if err := stmt.Err(); err != nil {
+			return nil, fmt.Errorf("store: scan select by ids: %w", err)
+		}
+		if err := stmt.Reset(); err != nil {
+			return nil, fmt.Errorf("store: reset select by ids: %w", err)
+		}
 	}
 	return paths, nil
 }
