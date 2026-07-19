@@ -62,6 +62,13 @@ const instanceIDStorageKey = "instanceId"
 // storage is wiped — exactly the semantics the frontend's cache-invalidation
 // consumer needs, achievable entirely from this plugin's own state with no
 // core/SDK change required.
+//
+// This only actually persists because NVRPlugin.StorageSchema (plugin.go)
+// declares a schema for instanceIDStorageKey with Store: true.
+// sdk.DeviceStorage.SetValue silently no-ops for any key with no declared
+// schema — see the "Correction" note in plugin.go's doc comment for the bug
+// this caused before StorageSchema existed, and why run.go's registration
+// order guarantees the schema is in place before any RPC call reaches here.
 func (p *NVRPlugin) GetInstanceId() (string, error) {
 	if existing, ok := p.store.GetValue(instanceIDStorageKey, "").(string); ok && existing != "" {
 		return existing, nil

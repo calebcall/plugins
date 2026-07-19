@@ -73,6 +73,37 @@
 // wiped — exactly the change-token semantics the frontend's cache consumer
 // needs, achieved entirely from this plugin's own state with no core/SDK
 // change required.
+//
+// Correction (second review pass): the first cut of this fix persisted via
+// p.store.SetValue(instanceIDStorageKey, id) without ever declaring a schema
+// for that key. sdk.DeviceStorage.SetValue (storage.go) silently no-ops when
+// no schema exists for the key —
+//
+//	schema := ds.findSchemaByKey(key)
+//	if schema == nil {
+//	    ds.mu.Unlock()
+//	    return nil
+//	}
+//
+// — so the "persisted" UUID was never actually written, and every call
+// regenerated a fresh one (worse than the original PLUGIN_ID bug: the
+// frontend's change-token would flip on every poll instead of never).
+// NVRPlugin now implements sdk.StorageSchemaProvider (StorageSchema, below)
+// to declare a schema for instanceIDStorageKey. Ordering is confirmed safe
+// from run.go: the host constructs the plugin, then — *before* registering
+// any RPC handler — calls StorageSchema() and DefineSchemas() on the result:
+//
+//	plugin = constructor(logger, api, pluginStorage)
+//	if schemaProvider, ok := plugin.(StorageSchemaProvider); ok {
+//	    schemas := schemaProvider.StorageSchema()
+//	    if len(schemas) > 0 {
+//	        pluginStorage.DefineSchemas(schemas)
+//	    }
+//	}
+//	cleanupRPC, err = client.RegisterHandler(namespaces.PluginChildRPC, plugin)
+//
+// so the schema is always registered before the first getInstanceId RPC
+// call could possibly arrive.
 package main
 
 import sdk "github.com/cameraui/sdk/go"
@@ -93,12 +124,38 @@ type NVRPlugin struct {
 	store instanceIDStore
 }
 
+// Compile-time assertions that NVRPlugin implements the optional SDK
+// interfaces it relies on.
+var _ sdk.StorageSchemaProvider = (*NVRPlugin)(nil)
+
 // RPCMethods restricts this plugin's RPC surface to the wire names listed
 // here (see the casing/allow-list findings above). Extend this list as later
 // tasks add RPC-visible methods; every entry must be the camelCase wire name,
 // not the Go method name.
 func (p *NVRPlugin) RPCMethods() []string {
 	return []string{"getManagedCameraIds", "getInstanceId"}
+}
+
+// StorageSchema declares the plugin-level storage schema. sdk.Run calls this
+// (via sdk.StorageSchemaProvider) right after construction and feeds the
+// result into DeviceStorage.DefineSchemas — before RPC handlers are
+// registered — so every key here is writable via SetValue from the first RPC
+// call onward (see the "Correction" note above for why this matters).
+//
+// instanceIDStorageKey is hidden (internal bookkeeping, not a user-facing
+// setting) and stored (Store: true) so GetInstanceId's generated UUID
+// actually persists across restarts.
+func (p *NVRPlugin) StorageSchema() []sdk.JsonSchema {
+	storeTrue := true
+	return []sdk.JsonSchema{
+		{
+			Type:   sdk.JsonSchemaTypeString,
+			Key:    instanceIDStorageKey,
+			Title:  "Instance ID",
+			Hidden: true,
+			Store:  &storeTrue,
+		},
+	}
 }
 
 func NewPlugin(logger *sdk.Logger, api *sdk.PluginAPI, storage *sdk.DeviceStorage) sdk.Plugin {
