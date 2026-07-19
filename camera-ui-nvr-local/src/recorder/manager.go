@@ -38,12 +38,6 @@ const (
 	keyPreRollS      = "preRollS"
 	keyPostRollS     = "postRollS"
 	keyRoles         = "roles"
-	// keyNvrQuotaGB (Task 9): an optional per-camera disk cap, in gigabytes,
-	// enforced by RecorderManager.RunRetentionOnce (retention.go) alongside
-	// retentionDays's age-based cutoff. 0 (the default) disables the cap
-	// entirely — a camera with no configured quota is only ever pruned by
-	// age.
-	keyNvrQuotaGB = "nvrQuotaGB"
 )
 
 // Defaults applied when a camera has no stored value for a given key.
@@ -51,7 +45,6 @@ const (
 	defaultRetentionDays = 7
 	defaultPreRollS      = 5
 	defaultPostRollS     = 10
-	defaultNvrQuotaGB    = 0
 )
 
 // defaultRoles is the stream source role recorded when a camera has no
@@ -84,16 +77,18 @@ type ManagedCamera interface {
 }
 
 // RecordingConfig is one camera's resolved recording settings.
+//
+// There is deliberately no per-camera disk-quota field here: the retention
+// disk cap (Task 9, retention.go) is instance-wide, matching the frontend
+// contract's single top-level StorageStats.nvrQuotaGB — see retention.go's
+// package doc comment for why. That value lives on the plugin's own
+// instance-level storage (plugin.go), not any camera's RecordingConfig.
 type RecordingConfig struct {
 	Mode          RecordingMode
 	RetentionDays int
 	PreRollS      int
 	PostRollS     int
 	Roles         []string
-	// NvrQuotaGB (Task 9): optional disk cap, in gigabytes, for this
-	// camera's recorded segments; 0 means uncapped (age-based retention
-	// only). See retention.go's disk-cap garbage collection.
-	NvrQuotaGB float64
 }
 
 // RecorderEntry is a managed camera's identity plus its resolved recording
@@ -288,15 +283,6 @@ func recordingConfigSchema() []sdk.JsonSchema {
 			Store:  &storeTrue,
 			Items:  &sdk.JsonSchema{Type: sdk.JsonSchemaTypeString},
 		},
-		{
-			Type:         sdk.JsonSchemaTypeNumber,
-			Key:          keyNvrQuotaGB,
-			Title:        "Disk Quota (GB)",
-			Description:  "Optional cap on this camera's recorded storage. 0 disables the cap (age-based retention only); once exceeded, the oldest segments are deleted first.",
-			DefaultValue: float64(defaultNvrQuotaGB),
-			Minimum:      sdk.Float64(0),
-			Store:        &storeTrue,
-		},
 	}
 }
 
@@ -323,7 +309,6 @@ func readRecordingConfig(storage CameraStorage) RecordingConfig {
 		PreRollS:      intValue(storage.GetValue(keyPreRollS, defaultPreRollS), defaultPreRollS),
 		PostRollS:     intValue(storage.GetValue(keyPostRollS, defaultPostRollS), defaultPostRollS),
 		Roles:         stringSliceValue(storage.GetValue(keyRoles, defaultRoles)),
-		NvrQuotaGB:    floatValue(storage.GetValue(keyNvrQuotaGB, float64(defaultNvrQuotaGB)), float64(defaultNvrQuotaGB)),
 	}
 }
 
@@ -342,28 +327,6 @@ func intValue(v any, fallback int) int {
 		return int(t)
 	case float64:
 		return int(t)
-	default:
-		return fallback
-	}
-}
-
-// floatValue coerces a GetValue result (which may be any of the numeric
-// types intValue's doc comment describes) into a float64, falling back to
-// fallback for any other/missing type. Unlike intValue, this preserves a
-// fractional value (e.g. a 0.5 GB quota), which intValue's truncation to int
-// would silently drop.
-func floatValue(v any, fallback float64) float64 {
-	switch t := v.(type) {
-	case float64:
-		return t
-	case float32:
-		return float64(t)
-	case int:
-		return float64(t)
-	case int32:
-		return float64(t)
-	case int64:
-		return float64(t)
 	default:
 		return fallback
 	}

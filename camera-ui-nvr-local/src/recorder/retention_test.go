@@ -127,15 +127,24 @@ func vectorExists(t *testing.T, backend store.VectorBackend, id string, embeddin
 }
 
 // newRetentionCamera returns a ManagedCamera whose recording config has the
-// given retentionDays/nvrQuotaGB stored explicitly (bypassing the
-// RecordingModeOff default — mode is set to continuous so it's a plausible
-// managed camera, though RunRetentionOnce processes every entriesSnapshot
-// camera regardless of mode).
-func newRetentionCamera(id string, retentionDays int, nvrQuotaGB float64) *fakeCamera {
+// given retentionDays stored explicitly (bypassing the RecordingModeOff
+// default — mode is set to continuous so it's a plausible managed camera,
+// though RunRetentionOnce processes every entriesSnapshot camera regardless
+// of mode). There is no per-camera quota parameter: the disk cap is
+// instance-wide (see retention.go's package doc comment) — tests that need
+// one pass a quotaGB getter to ConfigureRetention directly (fixedQuota,
+// below), not through camera config.
+func newRetentionCamera(id string, retentionDays int) *fakeCamera {
 	cam := newFakeCamera(id, id, RecordingModeContinuous)
 	cam.storage.set(keyRetentionDays, float64(retentionDays))
-	cam.storage.set(keyNvrQuotaGB, nvrQuotaGB)
 	return cam
+}
+
+// fixedQuota returns a quotaGB getter (ConfigureRetention's third argument)
+// that always reports gb — the test equivalent of a fixed, never-changing
+// instance-wide disk cap setting.
+func fixedQuota(gb float64) func() float64 {
+	return func() float64 { return gb }
 }
 
 // ---------------------------------------------------------------------------
@@ -158,12 +167,12 @@ func TestRunRetentionOnce_AgeGC_DeletesOnlyExpiredAndCascades(t *testing.T) {
 
 	m := NewRecorderManager()
 	if err := m.Configure([]ManagedCamera{
-		newRetentionCamera("cam1", 1, 0),
-		newRetentionCamera("cam2", 10, 0),
+		newRetentionCamera("cam1", 1),
+		newRetentionCamera("cam2", 10),
 	}); err != nil {
 		t.Fatalf("Configure: %v", err)
 	}
-	m.ConfigureRetention(segStore, eventStore, db.ClipVectors, db.FaceVectors)
+	m.ConfigureRetention(segStore, eventStore, nil, db.ClipVectors, db.FaceVectors)
 
 	// cam1: one segment safely past its 1-day cutoff, one well within it.
 	oldSeg := addRetentionSegment(t, segStore, dir, "cam1", "main", cam1Cutoff-5000, cam1Cutoff-1000, 100)
@@ -255,10 +264,10 @@ func TestRunRetentionOnce_MissingSegmentFileToleratesGracefully(t *testing.T) {
 	cutoff := now - 1*msPerDay
 
 	m := NewRecorderManager()
-	if err := m.Configure([]ManagedCamera{newRetentionCamera("cam1", 1, 0)}); err != nil {
+	if err := m.Configure([]ManagedCamera{newRetentionCamera("cam1", 1)}); err != nil {
 		t.Fatal(err)
 	}
-	m.ConfigureRetention(segStore, eventStore)
+	m.ConfigureRetention(segStore, eventStore, nil)
 
 	seg := addRetentionSegment(t, segStore, dir, "cam1", "main", cutoff-5000, cutoff-1000, 100)
 	if err := os.Remove(seg.Path); err != nil {
@@ -282,89 +291,113 @@ func TestRunRetentionOnce_MissingSegmentFileToleratesGracefully(t *testing.T) {
 // Disk-cap GC
 // ---------------------------------------------------------------------------
 
-// TestRunRetentionOnce_DiskCapGC_DeletesOldestFirstUntilUnderCap proves the
-// disk-cap sweep, given usage over nvrQuotaGB, deletes the oldest segments
-// first (fewest possible) until total usage is back under the cap, and
-// leaves the newest segments (and anything already within age-based
-// retention) alone.
-func TestRunRetentionOnce_DiskCapGC_DeletesOldestFirstUntilUnderCap(t *testing.T) {
+// TestRunRetentionOnce_DiskCapGC_DeletesOldestFirstAcrossCamerasUntilUnderCap
+// proves the disk-cap sweep is instance-wide, not per-camera: given two
+// cameras whose combined usage exceeds a single configured quotaGB, it
+// deletes the globally oldest segments first — regardless of which camera
+// they belong to — until total usage across both cameras is back under the
+// one cap, and leaves every newer segment (on either camera) alone. Segment
+// start times are interleaved across the two cameras specifically so a
+// per-camera (rather than truly global) implementation would produce a
+// different result here.
+func TestRunRetentionOnce_DiskCapGC_DeletesOldestFirstAcrossCamerasUntilUnderCap(t *testing.T) {
 	dir := t.TempDir()
 	db, segStore, eventStore := openRetentionStores(t)
 
-	now := time.Date(2024, 6, 15, 0, 0, 0, 0, time.UTC).UnixMilli()
-
 	m := NewRecorderManager()
-	// retentionDays large enough that age GC never fires in this test —
-	// only the quota sweep should delete anything. quotaGB chosen so 5
-	// segments of 1000 bytes each (5000 bytes total) exceed it, and
-	// removing exactly the 2 oldest (2000 bytes) brings it back under.
-	quotaGB := 3500.0 / bytesPerGB
-	if err := m.Configure([]ManagedCamera{newRetentionCamera("cam1", 365, quotaGB)}); err != nil {
+	// retentionDays large enough that age GC never fires in this test — only
+	// the instance-wide quota sweep should delete anything.
+	if err := m.Configure([]ManagedCamera{
+		newRetentionCamera("cam1", 365),
+		newRetentionCamera("cam2", 365),
+	}); err != nil {
 		t.Fatal(err)
 	}
-	m.ConfigureRetention(segStore, eventStore, db.ClipVectors, db.FaceVectors)
+	// 6 segments of 1000 bytes each (6000 bytes total, across both cameras)
+	// against a 4500-byte cap: removing the 2 globally-oldest (2000 bytes)
+	// brings total usage to 4000, back under the cap.
+	quotaGB := 4500.0 / bytesPerGB
+	m.ConfigureRetention(segStore, eventStore, fixedQuota(quotaGB), db.ClipVectors, db.FaceVectors)
 
-	var segs []store.Segment
-	for i := 0; i < 5; i++ {
-		start := now - int64(5-i)*10000
-		end := start + 500
-		segs = append(segs, addRetentionSegment(t, segStore, dir, "cam1", "main", start, end, 1000))
-	}
+	// All six segments are recent relative to "now" (well within the
+	// 365-day age cutoff, so age GC never touches them) — every timestamp
+	// below is now-relative, not epoch-relative, precisely so this test
+	// exercises only the quota sweep.
+	now := time.Date(2024, 6, 15, 0, 0, 0, 0, time.UTC).UnixMilli()
+
+	// Interleaved by start time across the two cameras: cam1Oldest is the
+	// globally oldest, cam2Oldest the second-oldest — one segment from EACH
+	// camera, not two from the same one.
+	cam1Oldest := addRetentionSegment(t, segStore, dir, "cam1", "main", now-100000, now-99995, 1000)
+	cam2Oldest := addRetentionSegment(t, segStore, dir, "cam2", "main", now-90000, now-89995, 1000)
+	cam1Mid := addRetentionSegment(t, segStore, dir, "cam1", "main", now-60000, now-59995, 1000)
+	cam2Mid := addRetentionSegment(t, segStore, dir, "cam2", "main", now-50000, now-49995, 1000)
+	cam1Newest := addRetentionSegment(t, segStore, dir, "cam1", "main", now-20000, now-19995, 1000)
+	cam2Newest := addRetentionSegment(t, segStore, dir, "cam2", "main", now-10000, now-9995, 1000)
 
 	if err := m.RunRetentionOnce(now); err != nil {
 		t.Fatalf("RunRetentionOnce: %v", err)
 	}
 
-	for i, seg := range segs {
-		_, err := os.Stat(seg.Path)
-		if i < 2 {
-			if !os.IsNotExist(err) {
-				t.Errorf("expected oldest segment %d (%s) to be removed, stat err=%v", i, seg.Path, err)
-			}
-		} else {
-			if err != nil {
-				t.Errorf("expected newer segment %d (%s) to survive, stat err=%v", i, seg.Path, err)
-			}
+	removed := []store.Segment{cam1Oldest, cam2Oldest}
+	kept := []store.Segment{cam1Mid, cam2Mid, cam1Newest, cam2Newest}
+	for _, seg := range removed {
+		if _, err := os.Stat(seg.Path); !os.IsNotExist(err) {
+			t.Errorf("expected globally-oldest segment %s (camera %s) to be removed, stat err=%v", seg.Path, seg.CameraID, err)
+		}
+	}
+	for _, seg := range kept {
+		if _, err := os.Stat(seg.Path); err != nil {
+			t.Errorf("expected segment %s (camera %s) to survive, stat err=%v", seg.Path, seg.CameraID, err)
 		}
 	}
 
-	remaining, err := segStore.AllByCamera("cam1")
+	remainingCam1, err := segStore.AllByCamera("cam1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(remaining) != 3 {
-		t.Fatalf("expected 3 segments to remain under the cap, got %d: %+v", len(remaining), remaining)
+	if len(remainingCam1) != 2 {
+		t.Errorf("expected 2 cam1 segments to remain, got %d: %+v", len(remainingCam1), remainingCam1)
 	}
-	for _, seg := range remaining {
-		if seg.ID == segs[0].ID || seg.ID == segs[1].ID {
-			t.Errorf("expected the two oldest segments to be gone, found id %d still present", seg.ID)
-		}
+	remainingCam2, err := segStore.AllByCamera("cam2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(remainingCam2) != 2 {
+		t.Errorf("expected 2 cam2 segments to remain, got %d: %+v", len(remainingCam2), remainingCam2)
 	}
 }
 
-// TestRunRetentionOnce_DiskCapGC_NoOpWhenUnderQuota proves a camera whose
-// usage is already under its configured nvrQuotaGB is left untouched by the
-// quota sweep.
+// TestRunRetentionOnce_DiskCapGC_NoOpWhenUnderQuota proves cameras whose
+// combined usage is already under the configured instance-wide quotaGB are
+// left untouched by the quota sweep.
 func TestRunRetentionOnce_DiskCapGC_NoOpWhenUnderQuota(t *testing.T) {
 	dir := t.TempDir()
 	db, segStore, eventStore := openRetentionStores(t)
 	now := time.Date(2024, 6, 15, 0, 0, 0, 0, time.UTC).UnixMilli()
 
 	m := NewRecorderManager()
-	quotaGB := 10000.0 / bytesPerGB // well above the 1000 bytes seeded below
-	if err := m.Configure([]ManagedCamera{newRetentionCamera("cam1", 365, quotaGB)}); err != nil {
+	if err := m.Configure([]ManagedCamera{
+		newRetentionCamera("cam1", 365),
+		newRetentionCamera("cam2", 365),
+	}); err != nil {
 		t.Fatal(err)
 	}
-	m.ConfigureRetention(segStore, eventStore, db.ClipVectors, db.FaceVectors)
+	quotaGB := 10000.0 / bytesPerGB // well above the 2000 bytes seeded below
+	m.ConfigureRetention(segStore, eventStore, fixedQuota(quotaGB), db.ClipVectors, db.FaceVectors)
 
-	seg := addRetentionSegment(t, segStore, dir, "cam1", "main", now-5000, now-4500, 1000)
+	seg1 := addRetentionSegment(t, segStore, dir, "cam1", "main", now-5000, now-4500, 1000)
+	seg2 := addRetentionSegment(t, segStore, dir, "cam2", "main", now-5000, now-4500, 1000)
 
 	if err := m.RunRetentionOnce(now); err != nil {
 		t.Fatalf("RunRetentionOnce: %v", err)
 	}
 
-	if _, err := os.Stat(seg.Path); err != nil {
-		t.Errorf("expected under-quota segment to survive, stat err=%v", err)
+	if _, err := os.Stat(seg1.Path); err != nil {
+		t.Errorf("expected under-quota cam1 segment to survive, stat err=%v", err)
+	}
+	if _, err := os.Stat(seg2.Path); err != nil {
+		t.Errorf("expected under-quota cam2 segment to survive, stat err=%v", err)
 	}
 }
 
@@ -397,10 +430,10 @@ func TestStartRetention_TickTriggersRunRetentionOnce(t *testing.T) {
 	db, segStore, eventStore := openRetentionStores(t)
 
 	m := NewRecorderManager()
-	if err := m.Configure([]ManagedCamera{newRetentionCamera("cam1", 1, 0)}); err != nil {
+	if err := m.Configure([]ManagedCamera{newRetentionCamera("cam1", 1)}); err != nil {
 		t.Fatal(err)
 	}
-	m.ConfigureRetention(segStore, eventStore, db.ClipVectors, db.FaceVectors)
+	m.ConfigureRetention(segStore, eventStore, nil, db.ClipVectors, db.FaceVectors)
 
 	now := time.Date(2024, 6, 15, 0, 0, 0, 0, time.UTC).UnixMilli()
 	cutoff := now - 1*msPerDay
@@ -450,7 +483,7 @@ func TestStartRetention_NoOpWhenNotConfigured(t *testing.T) {
 func TestStartRetention_SecondStartIsNoop(t *testing.T) {
 	_, segStore, eventStore := openRetentionStores(t)
 	m := NewRecorderManager()
-	m.ConfigureRetention(segStore, eventStore)
+	m.ConfigureRetention(segStore, eventStore, nil)
 
 	ft1 := newFakeTicker()
 	m.gc.newTicker = func(time.Duration) ticker { return ft1 }
@@ -482,7 +515,7 @@ func TestStartRetention_SecondStartIsNoop(t *testing.T) {
 func TestStopRetention_CancelsCleanlyWithoutLeaking(t *testing.T) {
 	_, segStore, eventStore := openRetentionStores(t)
 	m := NewRecorderManager()
-	m.ConfigureRetention(segStore, eventStore)
+	m.ConfigureRetention(segStore, eventStore, nil)
 
 	ft := newFakeTicker()
 	m.gc.newTicker = func(time.Duration) ticker { return ft }

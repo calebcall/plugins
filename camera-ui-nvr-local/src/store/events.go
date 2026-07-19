@@ -59,6 +59,18 @@ const defaultEventsLimit = 100
 // and ordered newest-first for the getEvents/getCameraEvents RPC methods a
 // later task adds.
 //
+// Every exported method locks db (s.db.Lock()/Unlock()) around its conn
+// access, for exactly the reason documented on the DB type in db.go:
+// EventStore shares one *sqlite3.Conn with SegmentStore and every
+// VectorBackend, and that connection is not safe for concurrent use from
+// multiple goroutines regardless of which store is calling it — event
+// ingestion (Task 5's detection-event callbacks) upserts from one goroutine
+// while, since Task 9, the retention ticker deletes from another. (An
+// earlier version of this file had no locking at all, which was the same
+// class of bug the Task 9 review found and fixed for SegmentStore's
+// then-private mutex — just further along, since EventStore never even had
+// a per-store lock to begin with.)
+//
 // Every row's raw column holds the full DetectionEvent as JSON, so Query
 // round-trips exactly what was upserted (thumbnail bytes, segments,
 // triggers, everything) rather than reconstructing a lossy approximation
@@ -89,6 +101,9 @@ func (s *EventStore) Upsert(events []DetectionEvent) error {
 	if len(events) == 0 {
 		return nil
 	}
+
+	s.db.Lock()
+	defer s.db.Unlock()
 
 	stmt, _, err := s.db.Conn().Prepare(`
 		INSERT INTO events (id, camera_id, ts_ms, end_ms, types, label, confidence, box, has_recording, raw)
@@ -261,6 +276,9 @@ type DeletedEvent struct {
 // Mirrors SegmentStore.DeleteOlderThan's read-then-delete-in-one-transaction
 // shape, so the rows returned always match exactly what was removed.
 func (s *EventStore) DeleteOlderThan(cameraID string, cutoffMs int64) ([]DeletedEvent, error) {
+	s.db.Lock()
+	defer s.db.Unlock()
+
 	conn := s.db.Conn()
 
 	if err := conn.Exec("BEGIN IMMEDIATE"); err != nil {
@@ -301,7 +319,9 @@ func (s *EventStore) DeleteOlderThan(cameraID string, cutoffMs int64) ([]Deleted
 
 // deletedEventsOlderThan returns the id/thumb_ref of the rows matching the
 // same predicate used by DeleteOlderThan's DELETE, so the two stay in sync.
-// Internal helper only called from DeleteOlderThan, inside its transaction.
+// Internal helper only called from DeleteOlderThan, which already holds the
+// db lock (s.db.Lock()) — it must not lock again itself (sync.Mutex isn't
+// reentrant).
 func (s *EventStore) deletedEventsOlderThan(cameraID string, cutoffMs int64) ([]DeletedEvent, error) {
 	stmt, _, err := s.db.Conn().Prepare(`
 		SELECT id, thumb_ref FROM events WHERE camera_id = ? AND end_ms > 0 AND end_ms < ?`)
@@ -353,6 +373,9 @@ func (s *EventStore) deletedEventsOlderThan(cameraID string, cutoffMs int64) ([]
 //     time window) and avoids decoding rows that would just be discarded.
 func (s *EventStore) Query(cameraIDs []string, opts GetEventsOptions) (GetEventsResult, error) {
 	query, args, limit := buildEventsQuery(cameraIDs, opts)
+
+	s.db.Lock()
+	defer s.db.Unlock()
 
 	stmt, _, err := s.db.Conn().Prepare(query)
 	if err != nil {

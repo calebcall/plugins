@@ -2,7 +2,6 @@ package store
 
 import (
 	"fmt"
-	"sync"
 )
 
 // Segment is one indexed recorded video segment: a single file on disk
@@ -32,16 +31,18 @@ type Segment struct {
 // indexing recorded segments and querying them by time range or by day, and
 // pruning rows past a retention cutoff.
 //
-// mu serializes every method against the shared *DB.Conn(): go-sqlite3's
-// *sqlite3.Conn is documented as "not safe for concurrent use by multiple
-// goroutines" (conn.go), but SegmentStore itself is: the recorder (Task 7)
-// runs one goroutine per recorded role, each indexing finished segments into
-// the same SegmentStore concurrently, and RPC read handlers (later tasks)
-// query it from yet another goroutine while recording is ongoing. Without
-// this lock those goroutines would race directly on the underlying
-// connection's internal state, not just risk an app-level SQLITE_BUSY.
+// Every method locks db (s.db.Lock()/Unlock(), the *DB.Conn()-guarding lock
+// documented on the DB type in db.go) around its conn access, rather than a
+// SegmentStore-private mutex: the recorder (Task 7) runs one goroutine per
+// recorded role, each indexing finished segments into the same SegmentStore
+// concurrently, RPC read handlers (later tasks) query it from yet another
+// goroutine while recording is ongoing, and — since Task 9 — the retention
+// ticker deletes from it concurrently with EventStore/VectorBackend calls
+// touching the very same underlying connection. A private mutex here would
+// only ever have serialized SegmentStore's own methods against each other,
+// not against those other stores sharing the same conn — exactly the gap
+// the Task 9 review found and fixed by moving to one connection-level lock.
 type SegmentStore struct {
-	mu sync.Mutex
 	db *DB
 }
 
@@ -52,8 +53,8 @@ func NewSegmentStore(db *DB) *SegmentStore {
 
 // Add inserts seg as a new row and returns its assigned id.
 func (s *SegmentStore) Add(seg Segment) (int64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.db.Lock()
+	defer s.db.Unlock()
 
 	stmt, _, err := s.db.Conn().Prepare(`
 		INSERT INTO segments (camera_id, role, path, start_ms, end_ms, has_video, has_audio, codec, referenced)
@@ -103,8 +104,8 @@ func (s *SegmentStore) Add(seg Segment) (int64, error) {
 // inclusive on both ends (end_ms >= startMs AND start_ms <= endMs) so a
 // segment merely touching a window boundary is still included.
 func (s *SegmentStore) InRange(cameraID, role string, startMs, endMs int64) ([]Segment, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.db.Lock()
+	defer s.db.Unlock()
 
 	stmt, _, err := s.db.Conn().Prepare(`
 		SELECT id, camera_id, role, path, start_ms, end_ms, has_video, has_audio, codec, referenced
@@ -157,8 +158,8 @@ func (s *SegmentStore) InRange(cameraID, role string, startMs, endMs int64) ([]S
 // functions operate in UTC by default; no other convention is established
 // elsewhere in this package, so UTC is used here).
 func (s *SegmentStore) Days(cameraID string, year, month int) ([]string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.db.Lock()
+	defer s.db.Unlock()
 
 	stmt, _, err := s.db.Conn().Prepare(`
 		SELECT DISTINCT date(start_ms / 1000, 'unixepoch') AS day
@@ -197,8 +198,8 @@ func (s *SegmentStore) Days(cameraID string, year, month int) ([]string, error) 
 // This only deletes the SQLite index rows; deleting the underlying files at
 // those paths is the caller's (retention task's) responsibility.
 func (s *SegmentStore) DeleteOlderThan(cameraID string, cutoffMs int64) ([]string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.db.Lock()
+	defer s.db.Unlock()
 
 	conn := s.db.Conn()
 
@@ -245,8 +246,8 @@ func (s *SegmentStore) DeleteOlderThan(cameraID string, cutoffMs int64) ([]strin
 // to compute total on-disk usage and identify the oldest segments to delete
 // first when a camera's configured quota is exceeded.
 func (s *SegmentStore) AllByCamera(cameraID string) ([]Segment, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.db.Lock()
+	defer s.db.Unlock()
 
 	stmt, _, err := s.db.Conn().Prepare(`
 		SELECT id, camera_id, role, path, start_ms, end_ms, has_video, has_audio, codec, referenced
@@ -296,8 +297,8 @@ func (s *SegmentStore) MarkReferenced(ids []int64) error {
 		return nil
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.db.Lock()
+	defer s.db.Unlock()
 
 	stmt, _, err := s.db.Conn().Prepare(`UPDATE segments SET referenced = 1 WHERE id = ?`)
 	if err != nil {
@@ -330,8 +331,8 @@ func (s *SegmentStore) MarkReferenced(ids []int64) error {
 // SQL predicate here, hence the read-then-filter-then-DeleteByIDs split
 // instead of one combined delete statement like DeleteOlderThan's).
 func (s *SegmentStore) UnreferencedOlderThan(cameraID string, cutoffMs int64) ([]Segment, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.db.Lock()
+	defer s.db.Unlock()
 
 	stmt, _, err := s.db.Conn().Prepare(`
 		SELECT id, camera_id, role, path, start_ms, end_ms, has_video, has_audio, codec, referenced
@@ -381,8 +382,8 @@ func (s *SegmentStore) DeleteByIDs(ids []int64) ([]string, error) {
 		return nil, nil
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.db.Lock()
+	defer s.db.Unlock()
 
 	conn := s.db.Conn()
 
@@ -429,8 +430,8 @@ func (s *SegmentStore) DeleteByIDs(ids []int64) ([]string, error) {
 
 // pathsByIDs returns the paths of the segments matching ids, so DeleteByIDs
 // can report what it removed. Internal helper only called from
-// DeleteByIDs, which already holds s.mu — it must not lock again itself
-// (sync.Mutex isn't reentrant).
+// DeleteByIDs, which already holds the db lock (s.db.Lock()) — it must not
+// lock again itself (sync.Mutex isn't reentrant).
 func (s *SegmentStore) pathsByIDs(ids []int64) ([]string, error) {
 	stmt, _, err := s.db.Conn().Prepare(`SELECT path FROM segments WHERE id = ?`)
 	if err != nil {
@@ -459,7 +460,8 @@ func (s *SegmentStore) pathsByIDs(ids []int64) ([]string, error) {
 // pathsOlderThan returns the paths of the segments matching the same
 // predicate used by DeleteOlderThan's DELETE, so the two stay in sync.
 // Internal helper only called from DeleteOlderThan, which already holds
-// s.mu — it must not lock again itself (sync.Mutex isn't reentrant).
+// the db lock (s.db.Lock()) — it must not lock again itself (sync.Mutex
+// isn't reentrant).
 func (s *SegmentStore) pathsOlderThan(cameraID string, cutoffMs int64) ([]string, error) {
 	stmt, _, err := s.db.Conn().Prepare(`
 		SELECT path FROM segments WHERE camera_id = ? AND end_ms < ?`)

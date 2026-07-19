@@ -193,9 +193,6 @@ func TestReadRecordingConfig_DefaultsAppliedWhenUnset(t *testing.T) {
 	if len(cfg.Roles) != 1 || cfg.Roles[0] != string(sdk.CameraRoleHighRes) {
 		t.Fatalf("expected default roles %v, got %v", defaultRoles, cfg.Roles)
 	}
-	if cfg.NvrQuotaGB != defaultNvrQuotaGB {
-		t.Fatalf("expected default nvrQuotaGB %v, got %v", defaultNvrQuotaGB, cfg.NvrQuotaGB)
-	}
 }
 
 func TestReadRecordingConfig_StoredValuesOverrideDefaults(t *testing.T) {
@@ -205,14 +202,13 @@ func TestReadRecordingConfig_StoredValuesOverrideDefaults(t *testing.T) {
 	storage.set(keyPreRollS, float64(3))
 	storage.set(keyPostRollS, float64(15))
 	storage.set(keyRoles, []string{"low-resolution"})
-	storage.set(keyNvrQuotaGB, float64(2.5))
 
 	cfg := readRecordingConfig(storage)
 
 	if cfg.Mode != RecordingModeContinuous {
 		t.Fatalf("expected mode continuous, got %q", cfg.Mode)
 	}
-	if cfg.RetentionDays != 30 || cfg.PreRollS != 3 || cfg.PostRollS != 15 || cfg.NvrQuotaGB != 2.5 {
+	if cfg.RetentionDays != 30 || cfg.PreRollS != 3 || cfg.PostRollS != 15 {
 		t.Fatalf("expected stored numeric overrides, got %+v", cfg)
 	}
 	if len(cfg.Roles) != 1 || cfg.Roles[0] != "low-resolution" {

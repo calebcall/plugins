@@ -15,6 +15,7 @@ import (
 	_ "embed"
 	"fmt"
 	"path/filepath"
+	"sync"
 
 	"github.com/ncruces/go-sqlite3"
 )
@@ -41,8 +42,48 @@ const dbFileName = "nvr.db"
 
 // DB wraps a single connection to the plugin's SQLite database plus the
 // vector-search backends used for face and CLIP embeddings.
+//
+// # Locking (Task 9 review fix)
+//
+// go-sqlite3's *sqlite3.Conn (a pure-Go/WASM build driven through wazero) is
+// documented as not safe for concurrent use by multiple goroutines — not
+// just "concurrent writes might conflict", but literally unsafe to have two
+// goroutines calling into the same *sqlite3.Conn's methods at the same
+// time, since every call runs the shared WASM VM's linear memory/stack.
+// This plugin has exactly one *sqlite3.Conn per *DB (Open below), shared by
+// every store built on top of it: SegmentStore, EventStore, and every
+// VectorBackend (FaceVectors/ClipVectors) — and each of those is driven
+// from its own goroutines in production (Task 7's recorder goroutines index
+// segments; Task 5's detection-event callbacks upsert events; Task 9's
+// retention ticker deletes from all three; RPC handlers read from yet
+// another goroutine).
+//
+// An earlier version of this file gave SegmentStore its own private
+// sync.Mutex, on the theory that serializing SegmentStore's own methods
+// against each other was enough. It wasn't: two different stores (say,
+// EventStore.Upsert from an ingestion goroutine and SegmentStore.
+// DeleteOlderThan from the retention ticker) could still call into the same
+// underlying conn at the same time, since each store's mutex only ever
+// guarded that one store's own call sites. Reviewer reproduced this as an
+// actual `panic: slice bounds out of range` inside the sqlite WASM VM under
+// -race with EventStore/SegmentStore/VectorBackend operations running
+// concurrently — not a hypothetical.
+//
+// The fix: exactly one lock, on the connection itself (DB.mu), and every
+// store operation that touches conn — regardless of which store it's a
+// method on — acquires it via Lock/Unlock (or the withConn helper) for the
+// full duration of that operation, including any multi-statement
+// transaction (BEGIN/.../COMMIT). SegmentStore's old per-store mutex is
+// gone; there is now exactly one lock guarding this connection, not two
+// independent ones that could each believe they had exclusive access.
 type DB struct {
 	conn *sqlite3.Conn
+
+	// mu serializes every access to conn across every store built on this
+	// DB (SegmentStore, EventStore, VectorBackend, and any future store) —
+	// see the type doc comment above for why a single connection-level lock
+	// is required instead of one per store.
+	mu sync.Mutex
 
 	// FaceVectors and ClipVectors implement VectorBackend for the
 	// face_embeddings and clip_embeddings tables respectively. See
@@ -74,24 +115,62 @@ func Open(dir string) (*DB, error) {
 		return nil, fmt.Errorf("store: set foreign_keys: %w", err)
 	}
 
+	// No DB.Lock() needed for this call: migrate runs here, before Open has
+	// returned a *DB to anything else, so by construction no other
+	// goroutine can be touching conn yet.
 	if err := migrate(conn); err != nil {
 		conn.Close()
 		return nil, err
 	}
 
-	return &DB{
-		conn:        conn,
-		FaceVectors: newBruteForceVectorBackend(conn, "face_embeddings"),
-		ClipVectors: newBruteForceVectorBackend(conn, "clip_embeddings"),
-	}, nil
+	db := &DB{conn: conn}
+	// FaceVectors/ClipVectors are constructed after db exists (rather than
+	// inline in the composite literal above) because bruteForceVectorBackend
+	// now holds a *DB — so it can go through db.Lock()/Unlock() like every
+	// other store — not a bare *sqlite3.Conn.
+	db.FaceVectors = newBruteForceVectorBackend(db, "face_embeddings")
+	db.ClipVectors = newBruteForceVectorBackend(db, "clip_embeddings")
+	return db, nil
 }
 
-// Conn exposes the underlying connection for lower-level access by later
-// tasks (segment/event/face stores, vector backends).
+// Conn exposes the underlying connection for lower-level access by stores
+// (segment/event/face stores, vector backends). Callers MUST hold the lock
+// (Lock/Unlock, or withConn) for as long as they use the returned *Conn —
+// this method does not lock on its own, since callers typically need the
+// lock held across several conn calls (Prepare/Bind/Step/...), not just
+// this one accessor.
 func (db *DB) Conn() *sqlite3.Conn { return db.conn }
 
+// Lock acquires the single mutex guarding this DB's shared connection.
+// Every store operation that touches conn must call Lock (directly, or via
+// withConn) before its first conn access and Unlock after its last —
+// including across an entire multi-statement transaction — so that no two
+// goroutines, regardless of which store they're calling through, are ever
+// inside the underlying *sqlite3.Conn at the same time. See the DB type doc
+// comment for why this must be connection-scoped rather than per-store.
+func (db *DB) Lock() { db.mu.Lock() }
+
+// Unlock releases the lock acquired by Lock.
+func (db *DB) Unlock() { db.mu.Unlock() }
+
+// withConn locks db, calls fn with the connection, and unlocks — a
+// convenience wrapper for the common "one self-contained operation" case.
+// Callers whose operation needs finer-grained control over exactly when the
+// lock is released (e.g. SegmentStore.DeleteOlderThan's helper split across
+// pathsOlderThan + the DELETE itself) call Lock/Unlock directly instead;
+// both routes serialize on the exact same db.mu.
+func (db *DB) withConn(fn func(conn *sqlite3.Conn) error) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	return fn(db.conn)
+}
+
 // Close releases the underlying SQLite connection.
-func (db *DB) Close() error { return db.conn.Close() }
+func (db *DB) Close() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	return db.conn.Close()
+}
 
 // migrate brings the database from whatever PRAGMA user_version it's
 // currently at up to schemaVersion, applying each step in order inside a
@@ -216,6 +295,9 @@ func userVersion(conn *sqlite3.Conn) (int, error) {
 // test helper for asserting schema bootstrap; production code that needs to
 // branch on schema state should prefer an explicit migration version check.
 func (db *DB) hasTable(tbl string) bool {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
 	stmt, _, err := db.conn.Prepare(
 		"SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
 	if err != nil {

@@ -1,10 +1,27 @@
 // retention.go implements Task 9's retention garbage collection: a
 // background housekeeping pass, run periodically across every camera this
 // RecorderManager manages, that deletes recorded segments (and their files)
-// once they fall outside the camera's configured retention window — by age
-// (RetentionDays) and/or an optional disk cap (NvrQuotaGB, oldest-first) —
-// cascading to the events/thumbnails/vector rows tied to whatever was
-// removed.
+// once they fall outside retention — by age (per-camera RetentionDays)
+// and/or an instance-wide disk cap (nvrQuotaGB, oldest-first across every
+// managed camera) — cascading to the events/thumbnails/vector rows tied to
+// whatever was removed.
+//
+// # Quota scope (Task 9 review fix)
+//
+// The disk cap is deliberately instance-wide, not per-camera: the frontend
+// contract (docs/superpowers/specs/2026-07-19-nvr-frontend-contract.d.ts,
+// StorageStats) has exactly one top-level nvrQuotaGB/nvrUsedGB for the whole
+// NVR, and getStorageStats() takes no camera argument — CameraStorageStats
+// has no quota field of its own. An earlier version of this file stored
+// nvrQuotaGB per-camera (in the same per-camera DeviceStorage RecordingConfig
+// reads from) and enforced it independently for each one, which would let N
+// cameras each consume up to the "cap" for N times the intended total usage,
+// and can't be surfaced by a future getStorageStats() the way the contract
+// shape implies. ConfigureRetention now takes a quotaGB func() float64
+// instead — read from the plugin's own instance-level storage (plugin.go),
+// not any camera's — and enforceInstanceQuota (below) computes total usage
+// and deletes oldest-first across every managed camera against that single
+// cap.
 //
 // This is deliberately distinct from Task 8's event-mode spool sweep
 // (event_mode.go's sweepEventSpool): that runs per-Recorder, every
@@ -44,6 +61,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"sync"
 	"time"
 
@@ -51,15 +69,15 @@ import (
 )
 
 // msPerDay converts RecordingConfig.RetentionDays into milliseconds for the
-// age cutoff computed in ageGC.
+// age cutoff computed in RunRetentionOnce.
 const msPerDay = 24 * 60 * 60 * 1000
 
-// bytesPerGB converts RecordingConfig.NvrQuotaGB into bytes for enforceQuota.
-// Decimal (1e9), matching how disk quotas are conventionally advertised
-// (GB, not GiB) — this task has no other convention to match, and the exact
-// boundary doesn't matter for correctness (the cap is enforced by comparing
-// this same constant on both the "are we over" check and the "how much do
-// we need to free" loop).
+// bytesPerGB converts the instance-wide nvrQuotaGB setting into bytes for
+// enforceInstanceQuota. Decimal (1e9), matching how disk quotas are
+// conventionally advertised (GB, not GiB) — this task has no other
+// convention to match, and the exact boundary doesn't matter for correctness
+// (the cap is enforced by comparing this same constant on both the "are we
+// over" check and the "how much do we need to free" loop).
 const bytesPerGB = 1_000_000_000
 
 // defaultRetentionInterval is the ticker period StartRetention uses when
@@ -97,6 +115,17 @@ type retentionGC struct {
 	eventStore *store.EventStore
 	vectors    []store.VectorBackend
 
+	// quotaGB, if non-nil, returns the current instance-wide disk cap in
+	// gigabytes (0/negative means uncapped) — called fresh on every
+	// RunRetentionOnce pass rather than captured once, so a config change
+	// (the user editing the plugin's own nvrQuotaGB storage value, see
+	// plugin.go) takes effect on the next pass without restarting. Reading
+	// this is the caller's (plugin.go's) responsibility — retentionGC has no
+	// storage dependency of its own for it, only this getter, since the
+	// value now lives on the plugin's own instance-level storage rather than
+	// any per-camera one (see this file's package doc comment).
+	quotaGB func() float64
+
 	// newTicker constructs the tick source StartRetention's background loop
 	// reads from. Defaults to newRealTicker in ConfigureRetention; tests in
 	// this package override it directly (white-box, same pattern as
@@ -118,49 +147,58 @@ type retentionGC struct {
 	running bool
 }
 
-// ConfigureRetention wires the SQLite-backed stores RunRetentionOnce/
-// StartRetention need to actually delete anything: segStore and eventStore
-// back the age/disk-cap GC itself, and vectors (typically db.ClipVectors,
-// db.FaceVectors — both satisfy store.VectorBackend) are every vector
-// backend whose row for a deleted event's ID should be removed alongside it
-// (VectorBackend.Delete is documented as a no-op, not an error, for an id
-// that was never stored, so passing backends that happen to hold nothing
-// for a given event is harmless). Passing no vectors at all is valid — there
-// is simply nothing to cascade to.
+// ConfigureRetention wires the dependencies RunRetentionOnce/StartRetention
+// need to actually delete anything: segStore and eventStore back the
+// age/disk-cap GC itself, quotaGB (may be nil, meaning "no instance-wide
+// cap — age-based retention only") returns the current instance-wide disk
+// cap in gigabytes on every call (see retentionGC.quotaGB's doc comment for
+// why it's a getter, not a captured value), and vectors (typically
+// db.ClipVectors, db.FaceVectors — both satisfy store.VectorBackend) are
+// every vector backend whose row for a deleted event's ID should be removed
+// alongside it (VectorBackend.Delete is documented as a no-op, not an
+// error, for an id that was never stored, so passing backends that happen
+// to hold nothing for a given event is harmless). Passing no vectors at all
+// is valid — there is simply nothing to cascade to.
 //
 // Safe to call once, before RunRetentionOnce/StartRetention are ever
 // invoked; calling it again replaces the previous configuration (and, if a
 // ticker was running under the old one, orphans it — callers should
 // StopRetention first if reconfiguring a live manager, though production
 // wiring (plugin.go) only ever calls this once at startup).
-func (m *RecorderManager) ConfigureRetention(segStore *store.SegmentStore, eventStore *store.EventStore, vectors ...store.VectorBackend) {
+func (m *RecorderManager) ConfigureRetention(segStore *store.SegmentStore, eventStore *store.EventStore, quotaGB func() float64, vectors ...store.VectorBackend) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.gc = &retentionGC{
 		segStore:   segStore,
 		eventStore: eventStore,
+		quotaGB:    quotaGB,
 		vectors:    vectors,
 		newTicker:  newRealTicker,
 	}
 }
 
-// RunRetentionOnce performs a single garbage-collection pass across every
-// camera this manager tracks (entriesSnapshot — every registered camera,
-// regardless of current Config.Mode; see its doc comment for why). For each
-// one: if RetentionDays > 0, deletes segment rows (+ files) whose end_ms
-// falls before nowMs - RetentionDays*24h, cascading to that camera's
-// fully-ended events (+ thumbnail files/vector rows) older than the same
-// cutoff (ageGC). Then, if NvrQuotaGB > 0, and only if the camera's current
-// on-disk usage still exceeds that cap after the age pass, deletes the
-// oldest remaining segments (+ the same cascade) until it no longer does
-// (enforceQuota).
+// RunRetentionOnce performs a single garbage-collection pass:
+//
+//  1. Age GC, per camera: for every camera this manager tracks
+//     (entriesSnapshot — every registered camera, regardless of current
+//     Config.Mode; see its doc comment for why), if RetentionDays > 0,
+//     deletes segment rows (+ files) whose end_ms falls before
+//     nowMs - RetentionDays*24h, cascading to that camera's fully-ended
+//     events (+ thumbnail files/vector rows) older than the same cutoff.
+//  2. Disk-cap GC, instance-wide: once every camera's age pass has run, if
+//     gc.quotaGB() > 0, computes total on-disk usage across every managed
+//     camera and, if it still exceeds that single cap, deletes the oldest
+//     remaining segments — regardless of which camera they belong to — (+
+//     the same cascade) until it no longer does (enforceInstanceQuota). See
+//     this file's package doc comment for why this is instance-wide rather
+//     than per-camera.
 //
 // A no-op returning nil when retention hasn't been configured
 // (ConfigureRetention never called) — every pre-Task-9 caller/test that
-// never touches retention is unaffected. Every per-camera error
-// encountered is collected (via errors.Join) rather than aborting the whole
-// pass early, so one camera's I/O error (e.g. a permission problem removing
-// one file) doesn't prevent every other managed camera's GC from running.
+// never touches retention is unaffected. Every error encountered is
+// collected (via errors.Join) rather than aborting the whole pass early, so
+// one camera's I/O error (e.g. a permission problem removing one file)
+// doesn't prevent every other managed camera's GC from running.
 func (m *RecorderManager) RunRetentionOnce(nowMs int64) error {
 	m.mu.RLock()
 	gc := m.gc
@@ -169,23 +207,29 @@ func (m *RecorderManager) RunRetentionOnce(nowMs int64) error {
 		return nil
 	}
 
-	var errs []error
-	for _, entry := range m.entriesSnapshot() {
-		cfg := entry.Config
+	entries := m.entriesSnapshot()
 
-		if cfg.RetentionDays > 0 {
-			cutoffMs := nowMs - int64(cfg.RetentionDays)*msPerDay
+	var errs []error
+	cameraIDs := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		cameraIDs = append(cameraIDs, entry.CameraID)
+
+		if entry.Config.RetentionDays > 0 {
+			cutoffMs := nowMs - int64(entry.Config.RetentionDays)*msPerDay
 			if err := gc.deleteSegmentsAndCascadeOlderThan(entry.CameraID, cutoffMs); err != nil {
 				errs = append(errs, fmt.Errorf("retention: camera %s: age gc: %w", entry.CameraID, err))
 			}
 		}
+	}
 
-		if cfg.NvrQuotaGB > 0 {
-			if err := gc.enforceQuota(entry.CameraID, cfg.NvrQuotaGB); err != nil {
-				errs = append(errs, fmt.Errorf("retention: camera %s: quota gc: %w", entry.CameraID, err))
+	if gc.quotaGB != nil {
+		if quota := gc.quotaGB(); quota > 0 {
+			if err := gc.enforceInstanceQuota(cameraIDs, quota); err != nil {
+				errs = append(errs, fmt.Errorf("retention: instance quota gc: %w", err))
 			}
 		}
 	}
+
 	return errors.Join(errs...)
 }
 
@@ -340,59 +384,85 @@ func (gc *retentionGC) cascadeDeletedEvents(events []store.DeletedEvent) []error
 	return errs
 }
 
-// enforceQuota lists cameraID's segments oldest-first (SegmentStore.
-// AllByCamera), sums their on-disk size (fileSize — 0 for an already-missing
-// file, the same missing-file tolerance removeFile below applies on the
-// delete side), and — only if that total exceeds quotaGB converted to bytes
-// — walks the oldest-first list accumulating how much would be freed by
-// deleting each one in turn, until the running total drops back under the
-// cap. The EndMs of the last segment that decision includes becomes a
-// cutoff, and the actual deletion (rows, files, and the event/thumbnail/
-// vector cascade) is performed by a single
-// deleteSegmentsAndCascadeOlderThan(cameraID, cutoff+1) call — reusing
-// exactly the same deletion path ageGC uses, rather than deleting segments
-// one at a time, so the disk-cap sweep gets the identical cascade behavior
-// for free. cutoff+1 (not cutoff) so the boundary segment itself — whose
-// EndMs == cutoff — is included (DeleteOlderThan's predicate is end_ms <
-// cutoffMs, strict).
-func (gc *retentionGC) enforceQuota(cameraID string, quotaGB float64) error {
+// cameraSegment pairs a segment with the camera it belongs to, so
+// enforceInstanceQuota can merge every managed camera's segments into one
+// list and sort it oldest-first across the whole instance, rather than per
+// camera.
+type cameraSegment struct {
+	cameraID string
+	seg      store.Segment
+}
+
+// enforceInstanceQuota lists every segment across every camera in
+// cameraIDs (SegmentStore.AllByCamera, once per camera), merges them into a
+// single oldest-first (by StartMs) list spanning the whole instance, sums
+// their on-disk size (fileSize — 0 for an already-missing file, the same
+// missing-file tolerance removeFile below applies on the delete side), and
+// — only if that total exceeds quotaGB converted to bytes — walks the
+// merged oldest-first list accumulating how much would be freed by deleting
+// each one in turn, until the running total drops back under the single
+// instance-wide cap. This is deliberately global, not per-camera: see this
+// file's package doc comment for why (StorageStats' nvrQuotaGB is one
+// instance-wide value, not one per camera).
+//
+// Each segment walked contributes to that owning camera's own cutoff (the
+// highest EndMs removed for that camera) — a plain map, since different
+// cameras' segments are interleaved in the merged oldest-first walk and
+// each one's actual row/file/cascade deletion is still necessarily
+// per-camera (SegmentStore.DeleteOlderThan and EventStore.DeleteOlderThan
+// are both scoped to one cameraID). Once the walk is done, every camera
+// that had at least one segment removed gets exactly one
+// deleteSegmentsAndCascadeOlderThan(cameraID, cutoff+1) call — reusing the
+// exact same deletion path the age GC uses, so the disk-cap sweep gets the
+// identical cascade behavior for free. cutoff+1 (not cutoff) so the
+// boundary segment itself — whose EndMs == cutoff — is included
+// (DeleteOlderThan's predicate is end_ms < cutoffMs, strict).
+func (gc *retentionGC) enforceInstanceQuota(cameraIDs []string, quotaGB float64) error {
 	if gc.segStore == nil {
 		return nil
 	}
 
-	segs, err := gc.segStore.AllByCamera(cameraID)
-	if err != nil {
-		return fmt.Errorf("list segments for quota: %w", err)
+	var all []cameraSegment
+	for _, camID := range cameraIDs {
+		segs, err := gc.segStore.AllByCamera(camID)
+		if err != nil {
+			return fmt.Errorf("list segments for camera %s: %w", camID, err)
+		}
+		for _, seg := range segs {
+			all = append(all, cameraSegment{cameraID: camID, seg: seg})
+		}
 	}
+	sort.Slice(all, func(i, j int) bool { return all[i].seg.StartMs < all[j].seg.StartMs })
 
 	quotaBytes := int64(quotaGB * bytesPerGB)
-	sizes := make([]int64, len(segs))
+	sizes := make([]int64, len(all))
 	var total int64
-	for i, seg := range segs {
-		sizes[i] = fileSize(seg.Path)
+	for i, cs := range all {
+		sizes[i] = fileSize(cs.seg.Path)
 		total += sizes[i]
 	}
 	if total <= quotaBytes {
 		return nil
 	}
 
-	var cutoffMs int64 = -1
-	for i, seg := range segs {
+	cutoffs := make(map[string]int64)
+	for i, cs := range all {
 		if total <= quotaBytes {
 			break
 		}
 		total -= sizes[i]
-		if seg.EndMs > cutoffMs {
-			cutoffMs = seg.EndMs
+		if cs.seg.EndMs > cutoffs[cs.cameraID] {
+			cutoffs[cs.cameraID] = cs.seg.EndMs
 		}
 	}
-	if cutoffMs < 0 {
-		// Every segment is already accounted for (quotaBytes itself was
-		// negative, or segs was empty) — nothing to delete.
-		return nil
-	}
 
-	return gc.deleteSegmentsAndCascadeOlderThan(cameraID, cutoffMs+1)
+	var errs []error
+	for camID, cutoffMs := range cutoffs {
+		if err := gc.deleteSegmentsAndCascadeOlderThan(camID, cutoffMs+1); err != nil {
+			errs = append(errs, fmt.Errorf("camera %s: %w", camID, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // fileSize returns path's size in bytes, or 0 if it can't be stat'd

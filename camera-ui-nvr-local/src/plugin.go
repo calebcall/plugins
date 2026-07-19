@@ -179,6 +179,19 @@ func (p *NVRPlugin) RPCMethods() []string {
 	return []string{"getManagedCameraIds", "getInstanceId"}
 }
 
+// nvrQuotaGBStorageKey is the plugin (instance-level, not per-camera)
+// storage key holding the optional whole-NVR disk cap, in gigabytes, that
+// retention's disk-cap GC (recorder/retention.go, RunRetentionOnce) enforces
+// across every managed camera. Deliberately plugin-level rather than a
+// per-camera DeviceStorage key: the frontend contract
+// (docs/superpowers/specs/2026-07-19-nvr-frontend-contract.d.ts,
+// StorageStats) has exactly one top-level nvrQuotaGB for the whole NVR, not
+// one per camera — see retention.go's package doc comment for the full
+// reasoning (an earlier version of this plugin stored this per-camera, which
+// a review caught as wrong: N cameras could then each consume up to the
+// "cap", for N times the intended total).
+const nvrQuotaGBStorageKey = "nvrQuotaGB"
+
 // StorageSchema declares the plugin-level storage schema. sdk.Run calls this
 // (via sdk.StorageSchemaProvider) right after construction and feeds the
 // result into DeviceStorage.DefineSchemas — before RPC handlers are
@@ -187,7 +200,10 @@ func (p *NVRPlugin) RPCMethods() []string {
 //
 // instanceIDStorageKey is hidden (internal bookkeeping, not a user-facing
 // setting) and stored (Store: true) so GetInstanceId's generated UUID
-// actually persists across restarts.
+// actually persists across restarts. nvrQuotaGBStorageKey is user-facing (a
+// real setting, not hidden) and stored so it survives restarts and can be
+// edited like any other plugin setting; 0 (the default) means uncapped —
+// retention only prunes by each camera's own retentionDays.
 func (p *NVRPlugin) StorageSchema() []sdk.JsonSchema {
 	storeTrue := true
 	return []sdk.JsonSchema{
@@ -198,6 +214,39 @@ func (p *NVRPlugin) StorageSchema() []sdk.JsonSchema {
 			Hidden: true,
 			Store:  &storeTrue,
 		},
+		{
+			Type:         sdk.JsonSchemaTypeNumber,
+			Key:          nvrQuotaGBStorageKey,
+			Title:        "Disk Quota (GB)",
+			Description:  "Optional cap on this NVR instance's total recorded storage, across every camera. 0 disables the cap (age-based retention only); once exceeded, the oldest segments across every camera are deleted first.",
+			DefaultValue: float64(0),
+			Minimum:      sdk.Float64(0),
+			Store:        &storeTrue,
+		},
+	}
+}
+
+// nvrQuotaGB reads the current instance-wide disk cap (see
+// nvrQuotaGBStorageKey) from this plugin's own storage, coercing whatever
+// numeric type GetValue hands back (float64 from a JSON/schema default,
+// or one of the narrower types msgpack may decode onto the wire) into a
+// float64. Passed to recorder.RecorderManager.ConfigureRetention as a
+// getter (not read once) so an in-place config edit takes effect on the
+// next retention pass without a restart.
+func (p *NVRPlugin) nvrQuotaGB() float64 {
+	switch v := p.store.GetValue(nvrQuotaGBStorageKey, float64(0)).(type) {
+	case float64:
+		return v
+	case float32:
+		return float64(v)
+	case int:
+		return float64(v)
+	case int32:
+		return float64(v)
+	case int64:
+		return float64(v)
+	default:
+		return 0
 	}
 }
 
@@ -221,12 +270,15 @@ func NewPlugin(logger *sdk.Logger, api *sdk.PluginAPI, storage *sdk.DeviceStorag
 		p.segments = store.NewSegmentStore(db)
 		// Wires RunRetentionOnce/the background ticker (Task 9,
 		// recorder/retention.go) with the stores it needs to actually delete
-		// anything; ClipVectors/FaceVectors are where a deleted event's face/
-		// clip embedding rows (if any — nothing populates them for events
-		// yet) get cascaded to. A no-op call when db failed to open above:
-		// p.recorder.ConfigureRetention is simply never reached, so
-		// StartRetention below stays a no-op too (see its own doc comment).
-		p.recorder.ConfigureRetention(p.segments, p.events, db.ClipVectors, db.FaceVectors)
+		// anything; p.nvrQuotaGB is the instance-wide disk cap getter (read
+		// from this plugin's own storage, not any camera's — see
+		// nvrQuotaGBStorageKey's doc comment), and ClipVectors/FaceVectors
+		// are where a deleted event's face/clip embedding rows (if any —
+		// nothing populates them for events yet) get cascaded to. A no-op
+		// call when db failed to open above: p.recorder.ConfigureRetention is
+		// simply never reached, so StartRetention below stays a no-op too
+		// (see its own doc comment).
+		p.recorder.ConfigureRetention(p.segments, p.events, p.nvrQuotaGB, db.ClipVectors, db.FaceVectors)
 	}
 
 	api.On(string(sdk.APIEventFinishLaunching), func(...any) {

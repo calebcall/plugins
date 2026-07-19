@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"math"
 	"sort"
-
-	"github.com/ncruces/go-sqlite3"
 )
 
 // VectorBackend abstracts nearest-neighbor search over embeddings keyed by
@@ -77,12 +75,19 @@ type VectorMatch struct {
 // it sits behind VectorBackend precisely so it can be swapped for an
 // index-backed implementation later without touching callers.
 type bruteForceVectorBackend struct {
-	conn  *sqlite3.Conn
+	// db, not a bare *sqlite3.Conn: every method below must go through
+	// db.Lock()/Unlock() (or withConn) around its conn access, same as every
+	// other store, since this backend's face_embeddings/clip_embeddings
+	// tables live on the exact same shared connection SegmentStore/
+	// EventStore do — see the DB type doc comment (db.go) for why that
+	// connection-level lock exists and why a backend-private lock (or none
+	// at all, as this type had before the Task 9 review fix) isn't enough.
+	db    *DB
 	table string
 }
 
-func newBruteForceVectorBackend(conn *sqlite3.Conn, table string) *bruteForceVectorBackend {
-	return &bruteForceVectorBackend{conn: conn, table: table}
+func newBruteForceVectorBackend(db *DB, table string) *bruteForceVectorBackend {
+	return &bruteForceVectorBackend{db: db, table: table}
 }
 
 func (b *bruteForceVectorBackend) Upsert(id string, embedding []float32) error {
@@ -91,7 +96,10 @@ func (b *bruteForceVectorBackend) Upsert(id string, embedding []float32) error {
 		return fmt.Errorf("store: encode embedding for %s: %w", id, err)
 	}
 
-	stmt, _, err := b.conn.Prepare(fmt.Sprintf(
+	b.db.Lock()
+	defer b.db.Unlock()
+
+	stmt, _, err := b.db.Conn().Prepare(fmt.Sprintf(
 		`INSERT INTO %s (id, embedding, dim) VALUES (?, ?, ?)
 		 ON CONFLICT(id) DO UPDATE SET embedding = excluded.embedding, dim = excluded.dim`,
 		b.table))
@@ -113,7 +121,10 @@ func (b *bruteForceVectorBackend) Upsert(id string, embedding []float32) error {
 }
 
 func (b *bruteForceVectorBackend) Delete(id string) error {
-	stmt, _, err := b.conn.Prepare(fmt.Sprintf("DELETE FROM %s WHERE id = ?", b.table))
+	b.db.Lock()
+	defer b.db.Unlock()
+
+	stmt, _, err := b.db.Conn().Prepare(fmt.Sprintf("DELETE FROM %s WHERE id = ?", b.table))
 	if err != nil {
 		return fmt.Errorf("store: prepare delete from %s: %w", b.table, err)
 	}
@@ -130,13 +141,16 @@ func (b *bruteForceVectorBackend) Query(embedding []float32, k int) ([]VectorMat
 		return nil, nil
 	}
 
+	b.db.Lock()
+	defer b.db.Unlock()
+
 	// Only compare rows whose stored dimension matches the query vector.
 	// Without this filter, a single row left over from a different
 	// embedding model (a different dim) would make cosineDistance error
 	// out and abort the whole query, discarding every valid same-dimension
 	// match — exactly the case the dim column exists to guard against
 	// (e.g. migrating to a new embedding model without a data migration).
-	stmt, _, err := b.conn.Prepare(fmt.Sprintf("SELECT id, embedding FROM %s WHERE dim = ?", b.table))
+	stmt, _, err := b.db.Conn().Prepare(fmt.Sprintf("SELECT id, embedding FROM %s WHERE dim = ?", b.table))
 	if err != nil {
 		return nil, fmt.Errorf("store: prepare scan of %s: %w", b.table, err)
 	}
