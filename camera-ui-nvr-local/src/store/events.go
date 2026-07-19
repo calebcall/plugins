@@ -1,0 +1,536 @@
+package store
+
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+
+	sdk "github.com/cameraui/sdk/go"
+	"github.com/ncruces/go-sqlite3"
+)
+
+// DetectionEvent is the event type EventStore stores and returns. It is a
+// type alias (not a redefinition) for sdk.DetectionEvent: the frontend's
+// reconstructed contract (docs/superpowers/specs/2026-07-19-nvr-frontend-contract.d.ts)
+// imports its own DetectionEvent from '@camera.ui/sdk', and the Go SDK's
+// sdk.DetectionEvent (camera_events.go) already carries msgpack tags for
+// every one of that type's fields (id, cameraId, state, startTime, endTime,
+// lastUpdate, types, triggers, segments, segmentIndex, expectedEndTime,
+// thumbnail, hasRecording) — there is nothing left to transcribe, and
+// redefining it would risk silent drift from what
+// sdk.CameraDevice.OnDetectionEvent actually delivers.
+type DetectionEvent = sdk.DetectionEvent
+
+// GetEventsOptions mirrors the frontend's GetEventsOptions (see the d.ts
+// above). Every field is optional on the wire (TS `?`); the pointer fields
+// (*bool, *float64, *int64) exist specifically so "not provided" can be told
+// apart from the zero value (false/0), which matters for hasRecording,
+// minConfidence, and the ms-timestamp fields.
+type GetEventsOptions struct {
+	Types                 []string `msgpack:"types,omitempty" json:"types,omitempty"`
+	Triggers              []string `msgpack:"triggers,omitempty" json:"triggers,omitempty"`
+	TriggerLabels         []string `msgpack:"triggerLabels,omitempty" json:"triggerLabels,omitempty"`
+	Attributes            []string `msgpack:"attributes,omitempty" json:"attributes,omitempty"`
+	FilterLogicTriggers   string   `msgpack:"filterLogicTriggers,omitempty" json:"filterLogicTriggers,omitempty"`
+	FilterLogicAttributes string   `msgpack:"filterLogicAttributes,omitempty" json:"filterLogicAttributes,omitempty"`
+	State                 string   `msgpack:"state,omitempty" json:"state,omitempty"`
+	Search                string   `msgpack:"search,omitempty" json:"search,omitempty"`
+	HasDetections         *bool    `msgpack:"hasDetections,omitempty" json:"hasDetections,omitempty"`
+	MinConfidence         *float64 `msgpack:"minConfidence,omitempty" json:"minConfidence,omitempty"`
+	HasRecording          *bool    `msgpack:"hasRecording,omitempty" json:"hasRecording,omitempty"`
+	WithRecordingInfo     *bool    `msgpack:"withRecordingInfo,omitempty" json:"withRecordingInfo,omitempty"`
+	StartMs               *int64   `msgpack:"startMs,omitempty" json:"startMs,omitempty"`
+	EndMs                 *int64   `msgpack:"endMs,omitempty" json:"endMs,omitempty"`
+	Limit                 *int64   `msgpack:"limit,omitempty" json:"limit,omitempty"`
+	Before                *int64   `msgpack:"before,omitempty" json:"before,omitempty"`
+}
+
+// GetEventsResult mirrors the frontend's GetEventsResult.
+type GetEventsResult struct {
+	Events  []DetectionEvent `msgpack:"events" json:"events"`
+	HasMore bool             `msgpack:"hasMore" json:"hasMore"`
+}
+
+// defaultEventsLimit is the page size Query uses when opts.Limit is unset.
+const defaultEventsLimit = 100
+
+// EventStore is the typed API over the events table (see schema.sql):
+// upserting DetectionEvents and querying them back out filtered, paginated,
+// and ordered newest-first for the getEvents/getCameraEvents RPC methods a
+// later task adds.
+//
+// Every row's raw column holds the full DetectionEvent as JSON, so Query
+// round-trips exactly what was upserted (thumbnail bytes, segments,
+// triggers, everything) rather than reconstructing a lossy approximation
+// from the flat indexed columns. Those flat columns (camera_id, ts_ms,
+// end_ms, types, label, confidence, box, has_recording) exist purely to let
+// SQL narrow down candidate rows cheaply before the full JSON is decoded and
+// (for the filters that need structure SQL can't easily see into — trigger
+// types/labels, attributes, free-text search, per-segment detection
+// presence) filtered again in Go. See Query's doc comment for exactly which
+// filters run in SQL vs. in Go.
+type EventStore struct {
+	db *DB
+}
+
+// NewEventStore returns an EventStore backed by db.
+func NewEventStore(db *DB) *EventStore {
+	return &EventStore{db: db}
+}
+
+// Upsert inserts or replaces each event by id. thumb_ref is deliberately
+// left untouched by both the INSERT and the ON CONFLICT UPDATE: it is owned
+// by the (later) thumbnail-persistence task, which writes it via a separate
+// update once it has generated a JPEG on disk. Upserting the same event
+// again here (e.g. an 'update' or 'segment-*' message for an event already
+// stored from its 'start' message) must not clobber a thumb_ref set in the
+// meantime.
+func (s *EventStore) Upsert(events []DetectionEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
+
+	stmt, _, err := s.db.Conn().Prepare(`
+		INSERT INTO events (id, camera_id, ts_ms, end_ms, types, label, confidence, box, has_recording, raw)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			camera_id = excluded.camera_id,
+			ts_ms = excluded.ts_ms,
+			end_ms = excluded.end_ms,
+			types = excluded.types,
+			label = excluded.label,
+			confidence = excluded.confidence,
+			box = excluded.box,
+			has_recording = excluded.has_recording,
+			raw = excluded.raw`)
+	if err != nil {
+		return fmt.Errorf("store: prepare upsert event: %w", err)
+	}
+	defer stmt.Close()
+
+	for _, ev := range events {
+		if err := upsertOneEvent(stmt, ev); err != nil {
+			return err
+		}
+		if err := stmt.Reset(); err != nil {
+			return fmt.Errorf("store: reset upsert event statement: %w", err)
+		}
+	}
+	return nil
+}
+
+// upsertOneEvent binds ev's columns onto stmt (already prepared by Upsert)
+// and executes it. Split out of Upsert so the multi-event loop stays
+// readable.
+func upsertOneEvent(stmt *sqlite3.Stmt, ev DetectionEvent) error {
+	raw, err := json.Marshal(ev)
+	if err != nil {
+		return fmt.Errorf("store: marshal event %s: %w", ev.ID, err)
+	}
+	typesJSON, err := json.Marshal(ev.Types)
+	if err != nil {
+		return fmt.Errorf("store: marshal event %s types: %w", ev.ID, err)
+	}
+
+	if err := stmt.BindText(1, ev.ID); err != nil {
+		return err
+	}
+	if err := stmt.BindText(2, ev.CameraID); err != nil {
+		return err
+	}
+	if err := stmt.BindInt64(3, ev.StartTime); err != nil {
+		return err
+	}
+	if err := stmt.BindInt64(4, ev.EndTime); err != nil {
+		return err
+	}
+	if err := stmt.BindText(5, string(typesJSON)); err != nil {
+		return err
+	}
+	if err := stmt.BindText(6, primaryLabel(ev)); err != nil {
+		return err
+	}
+	if err := stmt.BindFloat(7, bestConfidence(ev)); err != nil {
+		return err
+	}
+	if box := bestBox(ev); box != nil {
+		boxJSON, err := json.Marshal(box)
+		if err != nil {
+			return fmt.Errorf("store: marshal event %s box: %w", ev.ID, err)
+		}
+		if err := stmt.BindText(8, string(boxJSON)); err != nil {
+			return err
+		}
+	} else {
+		if err := stmt.BindNull(8); err != nil {
+			return err
+		}
+	}
+	if err := stmt.BindBool(9, ev.HasRecording); err != nil {
+		return err
+	}
+	if err := stmt.BindText(10, string(raw)); err != nil {
+		return err
+	}
+
+	if err := stmt.Exec(); err != nil {
+		return fmt.Errorf("store: upsert event %s: %w", ev.ID, err)
+	}
+	return nil
+}
+
+// primaryLabel picks a best-effort single label for the event's indexed
+// `label` column (used only as a coarse hint; Query's Types/Triggers
+// filters decode the full raw JSON rather than relying on this column).
+// Prefers the first detection type, falling back to the first trigger's
+// label.
+func primaryLabel(ev DetectionEvent) string {
+	if len(ev.Types) > 0 {
+		return ev.Types[0]
+	}
+	for _, t := range ev.Triggers {
+		if t.Label != "" {
+			return t.Label
+		}
+	}
+	return ""
+}
+
+// bestConfidence returns the highest confidence score across the event's
+// triggers, detections, and attributes, for the indexed `confidence` column
+// that Query's MinConfidence filter runs against directly in SQL.
+func bestConfidence(ev DetectionEvent) float64 {
+	var best float64
+	for _, t := range ev.Triggers {
+		if t.Score > best {
+			best = t.Score
+		}
+	}
+	for _, seg := range ev.Segments {
+		for _, d := range seg.Detections {
+			if d.Score > best {
+				best = d.Score
+			}
+		}
+		for _, a := range seg.Attributes {
+			if a.Confidence > best {
+				best = a.Confidence
+			}
+		}
+	}
+	return best
+}
+
+// bestBox returns the bounding box of the first detection that has one,
+// across all of the event's segments, or nil if none do.
+func bestBox(ev DetectionEvent) *sdk.BoundingBox {
+	for _, seg := range ev.Segments {
+		for _, d := range seg.Detections {
+			if d.Box != nil {
+				return d.Box
+			}
+		}
+	}
+	return nil
+}
+
+// Query returns events for cameraIDs (all cameras if empty, matching
+// NVRInterface.getEvents' no-cameraIDs vs. getCameraEvents' cameraIDs
+// distinction) matching opts, newest-first by start time, with HasMore
+// reporting whether more rows exist past the returned page.
+//
+// Filters split two ways:
+//   - CameraID/StartMs/EndMs/Before/MinConfidence/HasRecording run in SQL
+//     against the indexed flat columns (camera_id, ts_ms, confidence,
+//     has_recording), because they map directly onto a single column.
+//   - Types/Triggers/TriggerLabels/Attributes/Search/HasDetections/State
+//     don't: State has no dedicated column at all (see the package doc
+//     below), and the others need the event's nested trigger/segment
+//     structure that only the decoded raw JSON has. When any of these are
+//     requested, Query fetches every SQL-matched row (skipping the SQL
+//     LIMIT), decodes each one, filters in Go, and only then applies
+//     Limit+1 pagination — correct at the event volumes a single-site local
+//     NVR accumulates, but something to revisit (e.g. a JSON1 predicate or
+//     dedicated columns) if that stops being true. When none of them are
+//     requested, Query pushes `LIMIT <limit+1>` into the SQL itself, which
+//     is the common case (Query with only pagination, MinConfidence, or a
+//     time window) and avoids decoding rows that would just be discarded.
+func (s *EventStore) Query(cameraIDs []string, opts GetEventsOptions) (GetEventsResult, error) {
+	query, args, limit := buildEventsQuery(cameraIDs, opts)
+
+	stmt, _, err := s.db.Conn().Prepare(query)
+	if err != nil {
+		return GetEventsResult{}, fmt.Errorf("store: prepare query events: %w", err)
+	}
+	defer stmt.Close()
+
+	if err := bindEventsQueryArgs(stmt, args); err != nil {
+		return GetEventsResult{}, err
+	}
+
+	var rows []DetectionEvent
+	for stmt.Step() {
+		var ev DetectionEvent
+		if err := json.Unmarshal([]byte(stmt.ColumnText(0)), &ev); err != nil {
+			return GetEventsResult{}, fmt.Errorf("store: decode event raw json: %w", err)
+		}
+		rows = append(rows, ev)
+	}
+	if err := stmt.Err(); err != nil {
+		return GetEventsResult{}, fmt.Errorf("store: scan events: %w", err)
+	}
+
+	if needsPostFilter(opts) {
+		rows = filterEvents(rows, opts)
+	}
+
+	hasMore := len(rows) > limit
+	if hasMore {
+		rows = rows[:limit]
+	}
+
+	return GetEventsResult{Events: rows, HasMore: hasMore}, nil
+}
+
+// buildEventsQuery constructs the SQL text and positional bind args for
+// Query, plus the effective page size (opts.Limit or defaultEventsLimit)
+// the caller should slice/HasMore-check against. It only appends a SQL
+// `LIMIT` clause (fetching limit+1 rows, per the brief) when no option
+// requiring a Go-side post-filter pass is set; see Query's doc comment.
+func buildEventsQuery(cameraIDs []string, opts GetEventsOptions) (string, []any, int) {
+	var clauses []string
+	var args []any
+
+	if len(cameraIDs) > 0 {
+		placeholders := make([]string, len(cameraIDs))
+		for i, id := range cameraIDs {
+			placeholders[i] = "?"
+			args = append(args, id)
+		}
+		clauses = append(clauses, fmt.Sprintf("camera_id IN (%s)", strings.Join(placeholders, ",")))
+	}
+	if opts.StartMs != nil {
+		clauses = append(clauses, "ts_ms >= ?")
+		args = append(args, *opts.StartMs)
+	}
+	if opts.EndMs != nil {
+		clauses = append(clauses, "ts_ms <= ?")
+		args = append(args, *opts.EndMs)
+	}
+	if opts.Before != nil {
+		clauses = append(clauses, "ts_ms < ?")
+		args = append(args, *opts.Before)
+	}
+	if opts.MinConfidence != nil {
+		clauses = append(clauses, "confidence >= ?")
+		args = append(args, *opts.MinConfidence)
+	}
+	if opts.HasRecording != nil {
+		clauses = append(clauses, "has_recording = ?")
+		args = append(args, *opts.HasRecording)
+	}
+
+	query := "SELECT raw FROM events"
+	if len(clauses) > 0 {
+		query += " WHERE " + strings.Join(clauses, " AND ")
+	}
+	query += " ORDER BY ts_ms DESC"
+
+	limit := defaultEventsLimit
+	if opts.Limit != nil && *opts.Limit > 0 {
+		limit = int(*opts.Limit)
+	}
+
+	if !needsPostFilter(opts) {
+		query += " LIMIT ?"
+		args = append(args, limit+1)
+	}
+
+	return query, args, limit
+}
+
+// needsPostFilter reports whether opts has any filter that Query cannot
+// express against the flat SQL columns and must instead apply in Go after
+// decoding each row's raw JSON.
+func needsPostFilter(opts GetEventsOptions) bool {
+	return len(opts.Types) > 0 ||
+		len(opts.Triggers) > 0 ||
+		len(opts.TriggerLabels) > 0 ||
+		len(opts.Attributes) > 0 ||
+		opts.Search != "" ||
+		opts.HasDetections != nil ||
+		opts.State != ""
+}
+
+// bindEventsQueryArgs binds args (built by buildEventsQuery, always string,
+// int64, float64, or bool) onto stmt in order.
+func bindEventsQueryArgs(stmt *sqlite3.Stmt, args []any) error {
+	for i, arg := range args {
+		idx := i + 1
+		var err error
+		switch v := arg.(type) {
+		case string:
+			err = stmt.BindText(idx, v)
+		case int64:
+			err = stmt.BindInt64(idx, v)
+		case int:
+			err = stmt.BindInt64(idx, int64(v))
+		case float64:
+			err = stmt.BindFloat(idx, v)
+		case bool:
+			err = stmt.BindBool(idx, v)
+		default:
+			return fmt.Errorf("store: unsupported bind arg type %T", v)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// filterEvents applies every opts filter that needsPostFilter identified as
+// requiring the decoded event structure, in Go.
+func filterEvents(events []DetectionEvent, opts GetEventsOptions) []DetectionEvent {
+	var out []DetectionEvent
+	for _, ev := range events {
+		if matchesFilters(ev, opts) {
+			out = append(out, ev)
+		}
+	}
+	return out
+}
+
+func matchesFilters(ev DetectionEvent, opts GetEventsOptions) bool {
+	if opts.State != "" && ev.State != opts.State {
+		return false
+	}
+	if len(opts.Types) > 0 && !hasAny(ev.Types, opts.Types) {
+		return false
+	}
+	if len(opts.Triggers) > 0 {
+		types := make([]string, 0, len(ev.Triggers))
+		for _, t := range ev.Triggers {
+			types = append(types, t.Type)
+		}
+		if !matchLogic(types, opts.Triggers, opts.FilterLogicTriggers) {
+			return false
+		}
+	}
+	if len(opts.TriggerLabels) > 0 {
+		labels := make([]string, 0, len(ev.Triggers))
+		for _, t := range ev.Triggers {
+			if t.Label != "" {
+				labels = append(labels, t.Label)
+			}
+		}
+		if !hasAny(labels, opts.TriggerLabels) {
+			return false
+		}
+	}
+	if len(opts.Attributes) > 0 {
+		var attrTypes []string
+		for _, seg := range ev.Segments {
+			for _, a := range seg.Attributes {
+				attrTypes = append(attrTypes, a.Type)
+			}
+		}
+		if !matchLogic(attrTypes, opts.Attributes, opts.FilterLogicAttributes) {
+			return false
+		}
+	}
+	if opts.HasDetections != nil && eventHasDetections(ev) != *opts.HasDetections {
+		return false
+	}
+	if opts.Search != "" && !matchesSearch(ev, opts.Search) {
+		return false
+	}
+	return true
+}
+
+// hasAny reports whether haystack and needles share at least one element
+// (membership / OR semantics).
+func hasAny(haystack, needles []string) bool {
+	set := make(map[string]struct{}, len(haystack))
+	for _, h := range haystack {
+		set[h] = struct{}{}
+	}
+	for _, n := range needles {
+		if _, ok := set[n]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// hasAll reports whether haystack contains every element of needles (AND
+// semantics).
+func hasAll(haystack, needles []string) bool {
+	set := make(map[string]struct{}, len(haystack))
+	for _, h := range haystack {
+		set[h] = struct{}{}
+	}
+	for _, n := range needles {
+		if _, ok := set[n]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// matchLogic dispatches to hasAll for logic == "and", hasAny otherwise
+// (covers "or" and the unset/default case) — GetEventsOptions.FilterLogic*
+// per the d.ts is 'and' | 'or' with 'or' implied when omitted.
+func matchLogic(haystack, needles []string, logic string) bool {
+	if logic == "and" {
+		return hasAll(haystack, needles)
+	}
+	return hasAny(haystack, needles)
+}
+
+// eventHasDetections reports whether any of the event's segments carry at
+// least one object detection.
+func eventHasDetections(ev DetectionEvent) bool {
+	for _, seg := range ev.Segments {
+		if len(seg.Detections) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// matchesSearch is a simple case-insensitive substring match against the
+// event's camera id, detection types, trigger labels, and per-segment
+// detection/attribute labels. Good enough for a local single-box NVR's
+// event list search box; not a ranked or tokenized search (that's
+// searchEventsByText's CLIP-embedding job, a different, later feature).
+func matchesSearch(ev DetectionEvent, search string) bool {
+	q := strings.ToLower(search)
+
+	if strings.Contains(strings.ToLower(ev.CameraID), q) {
+		return true
+	}
+	for _, t := range ev.Types {
+		if strings.Contains(strings.ToLower(t), q) {
+			return true
+		}
+	}
+	for _, trig := range ev.Triggers {
+		if strings.Contains(strings.ToLower(trig.Label), q) {
+			return true
+		}
+	}
+	for _, seg := range ev.Segments {
+		for _, d := range seg.Detections {
+			if strings.Contains(strings.ToLower(d.Label), q) {
+				return true
+			}
+		}
+		for _, a := range seg.Attributes {
+			if strings.Contains(strings.ToLower(a.Label), q) {
+				return true
+			}
+		}
+	}
+	return false
+}

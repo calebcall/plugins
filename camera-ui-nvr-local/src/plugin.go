@@ -106,10 +106,14 @@
 // call could possibly arrive.
 package main
 
-import sdk "github.com/cameraui/sdk/go"
+import (
+	sdk "github.com/cameraui/sdk/go"
+
+	"github.com/calebcall/plugins/camera-ui-nvr-local/src/store"
+)
 
 // NVRPlugin is the minimal boot skeleton for the local NVR hub plugin.
-// Storage, recording, and playback are implemented in later tasks.
+// Recording and playback are implemented in later tasks.
 type NVRPlugin struct {
 	sdk.BasePlugin
 
@@ -122,6 +126,25 @@ type NVRPlugin struct {
 	// sdk.DeviceStorage (the same value as BasePlugin.Storage) in NewPlugin;
 	// tests substitute an in-memory fake.
 	store instanceIDStore
+
+	// db is this plugin's embedded SQLite database (store.Open), holding
+	// events, segments, faces, and vector tables. Opened against
+	// api.StoragePath in NewPlugin; nil in unit tests that construct
+	// NVRPlugin directly rather than going through NewPlugin, and left nil
+	// in production too if store.Open fails (logged, not fatal — see
+	// NewPlugin) since sdk's pluginConstructor signature has no error return
+	// for a failure here to propagate through.
+	db *store.DB
+
+	// events is the EventStore backing DetectionEvent ingestion
+	// (attachDetectionIngestion, events_ingest.go) and, in a later task, the
+	// getEvents/getCameraEvents RPC handlers. nil whenever db is nil.
+	events *store.EventStore
+
+	// detectionSubs tracks the per-camera sdk.Disposable returned by
+	// CameraDevice.OnDetectionEvent so OnCameraReleased can unsubscribe
+	// exactly the released camera (see events_ingest.go).
+	detectionSubs detectionSubscriptions
 }
 
 // Compile-time assertions that NVRPlugin implements the optional SDK
@@ -161,17 +184,80 @@ func (p *NVRPlugin) StorageSchema() []sdk.JsonSchema {
 func NewPlugin(logger *sdk.Logger, api *sdk.PluginAPI, storage *sdk.DeviceStorage) sdk.Plugin {
 	p := &NVRPlugin{BasePlugin: sdk.NewBasePlugin(logger, api, storage), recorders: noRecorders{}, store: storage}
 
+	// Open the embedded SQLite database against the host-provided storage
+	// directory (api.StoragePath — see plugin_api.go: "absolute path to the
+	// plugin's writable storage directory"). A failure here is logged, not
+	// fatal: NewPlugin's signature (sdk.pluginConstructor) has no error
+	// return, so the alternative would be a panic that takes the whole
+	// plugin process down over what later tasks can treat as "events/
+	// recording unavailable this run" — p.events stays nil and
+	// attachDetectionIngestion/-Released below no-op accordingly.
+	db, err := store.Open(api.StoragePath)
+	if err != nil {
+		logger.Error("nvr-local: open store failed:", err)
+	} else {
+		p.db = db
+		p.events = store.NewEventStore(db)
+	}
+
 	api.On(string(sdk.APIEventFinishLaunching), func(...any) { p.Logger.Log("nvr-local: finished launching") })
-	api.On(string(sdk.APIEventShutdown), func(...any) { p.Logger.Log("nvr-local: shutdown") })
+	api.On(string(sdk.APIEventShutdown), func(...any) {
+		p.Logger.Log("nvr-local: shutdown")
+		if p.db != nil {
+			if err := p.db.Close(); err != nil {
+				p.Logger.Error("nvr-local: close store failed:", err)
+			}
+		}
+	})
 
 	return p
 }
 
 // ConfigureCameras, OnCameraAdded and OnCameraReleased satisfy sdk.Plugin.
-// This is a Hub-role plugin with no managed cameras of its own, so these are
-// no-ops for now; camera-aware recording logic lands in a later task.
-func (p *NVRPlugin) ConfigureCameras(cameras []*sdk.CameraDevice) error { return nil }
+// This is a Hub-role plugin (PluginRoleHub, contract.ts) that "attaches to
+// cameras owned by other plugins" — cameras are handed to it here via the
+// host's hub assignment, not because it owns them. Recording (ffmpeg,
+// segment writing) is still a later task's no-op-for-now scope, but
+// DetectionEvent ingestion — the one piece of camera-aware wiring this task
+// owns — is real: every camera handed in gets subscribed via
+// attachDetectionIngestion, and released cameras are unsubscribed via
+// detectionSubs.remove (events_ingest.go).
+func (p *NVRPlugin) ConfigureCameras(cameras []*sdk.CameraDevice) error {
+	for _, cam := range cameras {
+		p.attachDetectionIngestion(cam)
+	}
+	return nil
+}
 
-func (p *NVRPlugin) OnCameraAdded(camera *sdk.CameraDevice) error { return nil }
+func (p *NVRPlugin) OnCameraAdded(camera *sdk.CameraDevice) error {
+	p.attachDetectionIngestion(camera)
+	return nil
+}
 
-func (p *NVRPlugin) OnCameraReleased(cameraID string) error { return nil }
+func (p *NVRPlugin) OnCameraReleased(cameraID string) error {
+	p.detectionSubs.remove(cameraID)
+	return nil
+}
+
+// attachDetectionIngestion subscribes to cam's detection-event stream via
+// sdk.CameraDevice.OnDetectionEvent (camera_device.go:547) and upserts every
+// event into p.events through a detectionEventIngester (events_ingest.go).
+// A no-op if p.events is nil (store.Open failed in NewPlugin — see there).
+//
+// DEFERRED live-verification: this subscription line itself — cam.
+// OnDetectionEvent(ingester.handle) actually firing when a live core
+// delivers a detection-event NATS message — is not covered by a unit test.
+// sdk.CameraDevice's only constructor, newCameraDeviceProxy
+// (camera_device.go), is unexported, so no test outside package sdk can
+// build a real *sdk.CameraDevice to subscribe against; doing so needs a
+// live core + NATS connection. What IS unit-tested (events_ingest_test.go)
+// is detectionEventIngester.handle itself, called directly with a
+// synthetic sdk.DetectionEvent and a fake eventUpserter — i.e. everything
+// on this side of the OnDetectionEvent callback boundary.
+func (p *NVRPlugin) attachDetectionIngestion(cam *sdk.CameraDevice) {
+	if p.events == nil {
+		return
+	}
+	ingester := newDetectionEventIngester(p.events, p.Logger)
+	p.detectionSubs.add(cam.ID(), cam.OnDetectionEvent(ingester.handle))
+}
