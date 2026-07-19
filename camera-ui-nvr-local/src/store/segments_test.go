@@ -228,3 +228,38 @@ func TestSegmentStore_DeleteOlderThan(t *testing.T) {
 		t.Fatalf("expected the other camera's old segment to be untouched, got %+v", remainingCam2)
 	}
 }
+
+// TestSegmentStore_AllByCamera proves AllByCamera returns every segment for
+// the requested camera, across every role, ordered oldest (start_ms) first,
+// and excludes other cameras' segments.
+func TestSegmentStore_AllByCamera(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	segs := NewSegmentStore(db)
+
+	for _, seg := range []Segment{
+		{CameraID: "cam1", Role: "sub", Path: "/rec/c.mp4", StartMs: 5000, EndMs: 6000},
+		{CameraID: "cam1", Role: "main", Path: "/rec/a.mp4", StartMs: 1000, EndMs: 2000},
+		{CameraID: "cam1", Role: "main", Path: "/rec/b.mp4", StartMs: 3000, EndMs: 4000},
+		{CameraID: "cam2", Role: "main", Path: "/rec/other.mp4", StartMs: 500, EndMs: 900},
+	} {
+		if _, err := segs.Add(seg); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := segs.AllByCamera("cam1")
+	if err != nil {
+		t.Fatalf("AllByCamera: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("expected 3 segments for cam1, got %d: %+v", len(got), got)
+	}
+	if got[0].Path != "/rec/a.mp4" || got[1].Path != "/rec/b.mp4" || got[2].Path != "/rec/c.mp4" {
+		t.Fatalf("expected oldest-first [a,b,c] across roles, got [%s,%s,%s]", got[0].Path, got[1].Path, got[2].Path)
+	}
+}

@@ -238,6 +238,51 @@ func (s *SegmentStore) DeleteOlderThan(cameraID string, cutoffMs int64) ([]strin
 	return paths, nil
 }
 
+// AllByCamera returns every segment row for cameraID, across every role,
+// ordered by start_ms ascending (oldest first). Unlike InRange (scoped to a
+// single role and time window) this is a full per-camera listing — used by
+// the retention task's disk-cap garbage collection (recorder/retention.go)
+// to compute total on-disk usage and identify the oldest segments to delete
+// first when a camera's configured quota is exceeded.
+func (s *SegmentStore) AllByCamera(cameraID string) ([]Segment, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	stmt, _, err := s.db.Conn().Prepare(`
+		SELECT id, camera_id, role, path, start_ms, end_ms, has_video, has_audio, codec, referenced
+		FROM segments
+		WHERE camera_id = ?
+		ORDER BY start_ms ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("store: prepare all by camera: %w", err)
+	}
+	defer stmt.Close()
+
+	if err := stmt.BindText(1, cameraID); err != nil {
+		return nil, err
+	}
+
+	var segs []Segment
+	for stmt.Step() {
+		segs = append(segs, Segment{
+			ID:         stmt.ColumnInt64(0),
+			CameraID:   stmt.ColumnText(1),
+			Role:       stmt.ColumnText(2),
+			Path:       stmt.ColumnText(3),
+			StartMs:    stmt.ColumnInt64(4),
+			EndMs:      stmt.ColumnInt64(5),
+			HasVideo:   stmt.ColumnBool(6),
+			HasAudio:   stmt.ColumnBool(7),
+			Codec:      stmt.ColumnText(8),
+			Referenced: stmt.ColumnBool(9),
+		})
+	}
+	if err := stmt.Err(); err != nil {
+		return nil, fmt.Errorf("store: scan all by camera: %w", err)
+	}
+	return segs, nil
+}
+
 // MarkReferenced flips referenced = 1 for every segment id given, promoting
 // them out of the events-mode "spool" so the janitor (UnreferencedOlderThan
 // + DeleteByIDs, driven by recorder.Recorder.sweepEventSpool) never removes

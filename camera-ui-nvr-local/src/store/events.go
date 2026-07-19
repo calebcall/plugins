@@ -234,6 +234,102 @@ func bestBox(ev DetectionEvent) *sdk.BoundingBox {
 	return nil
 }
 
+// DeletedEvent is one row DeleteOlderThan removed: just enough (ID, for
+// cascading to any face/clip vector rows keyed by an event's id; ThumbRef,
+// for removing its thumbnail file) for the retention task's cascade step.
+// ThumbRef is "" for every row today — no code in this plugin populates
+// thumb_ref yet (see Upsert's doc comment: that's a separate, still-unbuilt
+// thumbnail-persistence task) — but DeleteOlderThan returns it regardless so
+// the retention cascade needs no changes once that task lands.
+type DeletedEvent struct {
+	ID       string
+	ThumbRef string
+}
+
+// DeleteOlderThan removes every event row for cameraID that has both fully
+// ended and ended strictly before cutoffMs, and returns each removed row's
+// id/thumb_ref for the caller (retention's cascade step) to remove its
+// thumbnail file and any face/clip vector rows keyed by its id.
+//
+// "Fully ended" means end_ms > 0: sdk.DetectionEvent.EndTime is 0
+// (omitempty) until an event's terminal lifecycle message, so an in-progress
+// event's end_ms is 0 regardless of how old its start_ms is. Without this
+// guard, `end_ms < cutoffMs` would be true for every still-active event too
+// (0 is less than any positive cutoff), deleting events retention should
+// never touch just because they started a while ago and haven't ended yet.
+//
+// Mirrors SegmentStore.DeleteOlderThan's read-then-delete-in-one-transaction
+// shape, so the rows returned always match exactly what was removed.
+func (s *EventStore) DeleteOlderThan(cameraID string, cutoffMs int64) ([]DeletedEvent, error) {
+	conn := s.db.Conn()
+
+	if err := conn.Exec("BEGIN IMMEDIATE"); err != nil {
+		return nil, fmt.Errorf("store: begin delete events older than: %w", err)
+	}
+
+	deleted, err := s.deletedEventsOlderThan(cameraID, cutoffMs)
+	if err != nil {
+		_ = conn.Exec("ROLLBACK")
+		return nil, err
+	}
+
+	stmt, _, err := conn.Prepare(`DELETE FROM events WHERE camera_id = ? AND end_ms > 0 AND end_ms < ?`)
+	if err != nil {
+		_ = conn.Exec("ROLLBACK")
+		return nil, fmt.Errorf("store: prepare delete events older than: %w", err)
+	}
+	bindErr := func() error {
+		defer stmt.Close()
+		if err := stmt.BindText(1, cameraID); err != nil {
+			return err
+		}
+		if err := stmt.BindInt64(2, cutoffMs); err != nil {
+			return err
+		}
+		return stmt.Exec()
+	}()
+	if bindErr != nil {
+		_ = conn.Exec("ROLLBACK")
+		return nil, fmt.Errorf("store: delete events older than: %w", bindErr)
+	}
+
+	if err := conn.Exec("COMMIT"); err != nil {
+		return nil, fmt.Errorf("store: commit delete events older than: %w", err)
+	}
+	return deleted, nil
+}
+
+// deletedEventsOlderThan returns the id/thumb_ref of the rows matching the
+// same predicate used by DeleteOlderThan's DELETE, so the two stay in sync.
+// Internal helper only called from DeleteOlderThan, inside its transaction.
+func (s *EventStore) deletedEventsOlderThan(cameraID string, cutoffMs int64) ([]DeletedEvent, error) {
+	stmt, _, err := s.db.Conn().Prepare(`
+		SELECT id, thumb_ref FROM events WHERE camera_id = ? AND end_ms > 0 AND end_ms < ?`)
+	if err != nil {
+		return nil, fmt.Errorf("store: prepare select events older than: %w", err)
+	}
+	defer stmt.Close()
+
+	if err := stmt.BindText(1, cameraID); err != nil {
+		return nil, err
+	}
+	if err := stmt.BindInt64(2, cutoffMs); err != nil {
+		return nil, err
+	}
+
+	var out []DeletedEvent
+	for stmt.Step() {
+		// ColumnText on a NULL thumb_ref (every row, until the later
+		// thumbnail-persistence task starts populating it) returns "",
+		// matching DeletedEvent.ThumbRef's documented "" zero value.
+		out = append(out, DeletedEvent{ID: stmt.ColumnText(0), ThumbRef: stmt.ColumnText(1)})
+	}
+	if err := stmt.Err(); err != nil {
+		return nil, fmt.Errorf("store: scan events older than: %w", err)
+	}
+	return out, nil
+}
+
 // Query returns events for cameraIDs (all cameras if empty, matching
 // NVRInterface.getEvents' no-cameraIDs vs. getCameraEvents' cameraIDs
 // distinction) matching opts, newest-first by start time, with HasMore

@@ -306,3 +306,93 @@ func TestEventStore_Upsert_RoundTripsFullEvent(t *testing.T) {
 		t.Fatalf("expected HasRecording to round-trip as true")
 	}
 }
+
+// setThumbRef writes id's thumb_ref column directly (white-box: no
+// production code sets this column yet — see Upsert's doc comment), so
+// TestEventStore_DeleteOlderThan can prove DeleteOlderThan returns it.
+func setThumbRef(t *testing.T, db *DB, id, thumbRef string) {
+	t.Helper()
+	stmt, _, err := db.Conn().Prepare(`UPDATE events SET thumb_ref = ? WHERE id = ?`)
+	if err != nil {
+		t.Fatalf("prepare set thumb_ref: %v", err)
+	}
+	defer stmt.Close()
+	if err := stmt.BindText(1, thumbRef); err != nil {
+		t.Fatal(err)
+	}
+	if err := stmt.BindText(2, id); err != nil {
+		t.Fatal(err)
+	}
+	if err := stmt.Exec(); err != nil {
+		t.Fatalf("set thumb_ref: %v", err)
+	}
+}
+
+// endedEvent builds a DetectionEvent that has already ended at endMs (unlike
+// newTestEvent, which leaves EndTime unset) — DeleteOlderThan's cutoff only
+// ever considers ended events.
+func endedEvent(id, cameraID string, startMs, endMs int64) DetectionEvent {
+	ev := newTestEvent(id, cameraID, startMs, 0.5, "ended", "motion")
+	ev.EndTime = endMs
+	return ev
+}
+
+// TestEventStore_DeleteOlderThan proves DeleteOlderThan removes only the
+// fully-ended rows for the requested camera whose end_ms falls before the
+// cutoff, leaves an active (EndTime==0) event untouched regardless of how
+// old its start time is, leaves another camera's equally-old event
+// untouched, and returns each removed row's id/thumb_ref for the caller's
+// cascade step.
+func TestEventStore_DeleteOlderThan(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	events := NewEventStore(db)
+
+	old := endedEvent("old", "cam1", 1000, 2000)
+	recent := endedEvent("recent", "cam1", 9000, 10000)
+	stillActive := endedEvent("active", "cam1", 500, 0) // EndTime reset below
+	stillActive.EndTime = 0
+	otherCameraOld := endedEvent("other-old", "cam2", 1000, 2000)
+
+	if err := events.Upsert([]DetectionEvent{old, recent, stillActive, otherCameraOld}); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	setThumbRef(t, db, "old", "/thumbs/old.jpg")
+
+	deleted, err := events.DeleteOlderThan("cam1", 5000)
+	if err != nil {
+		t.Fatalf("DeleteOlderThan: %v", err)
+	}
+	if len(deleted) != 1 || deleted[0].ID != "old" || deleted[0].ThumbRef != "/thumbs/old.jpg" {
+		t.Fatalf("expected exactly [{old /thumbs/old.jpg}], got %+v", deleted)
+	}
+
+	remaining, err := events.Query([]string{"cam1"}, GetEventsOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	remainingIDs := map[string]bool{}
+	for _, ev := range remaining.Events {
+		remainingIDs[ev.ID] = true
+	}
+	if remainingIDs["old"] {
+		t.Errorf("expected old event to be deleted")
+	}
+	if !remainingIDs["recent"] {
+		t.Errorf("expected recent event (end_ms >= cutoff) to remain")
+	}
+	if !remainingIDs["active"] {
+		t.Errorf("expected still-active (EndTime==0) event to remain regardless of age")
+	}
+
+	remainingCam2, err := events.Query([]string{"cam2"}, GetEventsOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(remainingCam2.Events) != 1 || remainingCam2.Events[0].ID != "other-old" {
+		t.Fatalf("expected other camera's equally-old event to be untouched, got %+v", remainingCam2.Events)
+	}
+}

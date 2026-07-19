@@ -149,6 +149,11 @@ type NVRPlugin struct {
 	// getEvents/getCameraEvents RPC handlers. nil whenever db is nil.
 	events *store.EventStore
 
+	// segments is the SegmentStore backing retention garbage collection
+	// (Task 9: recorder.RecorderManager.RunRetentionOnce, wired via
+	// p.recorder.ConfigureRetention below). nil whenever db is nil.
+	segments *store.SegmentStore
+
 	// detectionSubs tracks the per-camera sdk.Disposable returned by
 	// CameraDevice.OnDetectionEvent so OnCameraReleased can unsubscribe
 	// exactly the released camera (see events_ingest.go).
@@ -213,11 +218,26 @@ func NewPlugin(logger *sdk.Logger, api *sdk.PluginAPI, storage *sdk.DeviceStorag
 	} else {
 		p.db = db
 		p.events = store.NewEventStore(db)
+		p.segments = store.NewSegmentStore(db)
+		// Wires RunRetentionOnce/the background ticker (Task 9,
+		// recorder/retention.go) with the stores it needs to actually delete
+		// anything; ClipVectors/FaceVectors are where a deleted event's face/
+		// clip embedding rows (if any — nothing populates them for events
+		// yet) get cascaded to. A no-op call when db failed to open above:
+		// p.recorder.ConfigureRetention is simply never reached, so
+		// StartRetention below stays a no-op too (see its own doc comment).
+		p.recorder.ConfigureRetention(p.segments, p.events, db.ClipVectors, db.FaceVectors)
 	}
 
-	api.On(string(sdk.APIEventFinishLaunching), func(...any) { p.Logger.Log("nvr-local: finished launching") })
+	api.On(string(sdk.APIEventFinishLaunching), func(...any) {
+		p.Logger.Log("nvr-local: finished launching")
+		if err := p.recorder.StartRetention(0, nil); err != nil {
+			p.Logger.Error("nvr-local: start retention gc failed:", err)
+		}
+	})
 	api.On(string(sdk.APIEventShutdown), func(...any) {
 		p.Logger.Log("nvr-local: shutdown")
+		p.recorder.StopRetention()
 		if p.db != nil {
 			if err := p.db.Close(); err != nil {
 				p.Logger.Error("nvr-local: close store failed:", err)

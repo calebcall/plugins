@@ -38,6 +38,12 @@ const (
 	keyPreRollS      = "preRollS"
 	keyPostRollS     = "postRollS"
 	keyRoles         = "roles"
+	// keyNvrQuotaGB (Task 9): an optional per-camera disk cap, in gigabytes,
+	// enforced by RecorderManager.RunRetentionOnce (retention.go) alongside
+	// retentionDays's age-based cutoff. 0 (the default) disables the cap
+	// entirely — a camera with no configured quota is only ever pruned by
+	// age.
+	keyNvrQuotaGB = "nvrQuotaGB"
 )
 
 // Defaults applied when a camera has no stored value for a given key.
@@ -45,6 +51,7 @@ const (
 	defaultRetentionDays = 7
 	defaultPreRollS      = 5
 	defaultPostRollS     = 10
+	defaultNvrQuotaGB    = 0
 )
 
 // defaultRoles is the stream source role recorded when a camera has no
@@ -83,6 +90,10 @@ type RecordingConfig struct {
 	PreRollS      int
 	PostRollS     int
 	Roles         []string
+	// NvrQuotaGB (Task 9): optional disk cap, in gigabytes, for this
+	// camera's recorded segments; 0 means uncapped (age-based retention
+	// only). See retention.go's disk-cap garbage collection.
+	NvrQuotaGB float64
 }
 
 // RecorderEntry is a managed camera's identity plus its resolved recording
@@ -111,6 +122,15 @@ type RecorderEntry struct {
 type RecorderManager struct {
 	mu        sync.RWMutex
 	recorders map[string]*RecorderEntry
+
+	// gc holds the retention garbage-collection dependencies (SQLite stores,
+	// vector backends) and background-ticker state — see retention.go. Left
+	// nil by NewRecorderManager; every pre-Task-9 caller (including every
+	// existing test in this package) never touches retention, so
+	// RunRetentionOnce/StartRetention/StopRetention must all treat a nil gc
+	// as "not configured, nothing to do" rather than panicking. Set once via
+	// ConfigureRetention (production wiring lives in plugin.go).
+	gc *retentionGC
 }
 
 // NewRecorderManager returns an empty manager. Recording config lives on
@@ -184,6 +204,27 @@ func (m *RecorderManager) ManagedCameraIDs() []string {
 	return ids
 }
 
+// entriesSnapshot returns a value-copy of every registered RecorderEntry —
+// regardless of Config.Mode, unlike ManagedCameraIDs, since retention (Task
+// 9) must still clean up a camera's old footage even if its mode was since
+// switched to "off" — for a caller (retention.go) that needs to iterate the
+// full managed set without holding m.mu itself or racing a concurrent
+// Configure/Add/Remove. Copying each *RecorderEntry by value (rather than
+// handing out the live pointers stored in m.recorders) means a retention
+// pass sees a consistent snapshot even if the registry changes while it
+// runs. Sorted by CameraID for stable/deterministic iteration order (tests).
+func (m *RecorderManager) entriesSnapshot() []RecorderEntry {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	out := make([]RecorderEntry, 0, len(m.recorders))
+	for _, r := range m.recorders {
+		out = append(out, *r)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CameraID < out[j].CameraID })
+	return out
+}
+
 func newRecorder(cam ManagedCamera) *RecorderEntry {
 	return &RecorderEntry{
 		CameraID: cam.ID(),
@@ -247,6 +288,15 @@ func recordingConfigSchema() []sdk.JsonSchema {
 			Store:  &storeTrue,
 			Items:  &sdk.JsonSchema{Type: sdk.JsonSchemaTypeString},
 		},
+		{
+			Type:         sdk.JsonSchemaTypeNumber,
+			Key:          keyNvrQuotaGB,
+			Title:        "Disk Quota (GB)",
+			Description:  "Optional cap on this camera's recorded storage. 0 disables the cap (age-based retention only); once exceeded, the oldest segments are deleted first.",
+			DefaultValue: float64(defaultNvrQuotaGB),
+			Minimum:      sdk.Float64(0),
+			Store:        &storeTrue,
+		},
 	}
 }
 
@@ -273,6 +323,7 @@ func readRecordingConfig(storage CameraStorage) RecordingConfig {
 		PreRollS:      intValue(storage.GetValue(keyPreRollS, defaultPreRollS), defaultPreRollS),
 		PostRollS:     intValue(storage.GetValue(keyPostRollS, defaultPostRollS), defaultPostRollS),
 		Roles:         stringSliceValue(storage.GetValue(keyRoles, defaultRoles)),
+		NvrQuotaGB:    floatValue(storage.GetValue(keyNvrQuotaGB, float64(defaultNvrQuotaGB)), float64(defaultNvrQuotaGB)),
 	}
 }
 
@@ -291,6 +342,28 @@ func intValue(v any, fallback int) int {
 		return int(t)
 	case float64:
 		return int(t)
+	default:
+		return fallback
+	}
+}
+
+// floatValue coerces a GetValue result (which may be any of the numeric
+// types intValue's doc comment describes) into a float64, falling back to
+// fallback for any other/missing type. Unlike intValue, this preserves a
+// fractional value (e.g. a 0.5 GB quota), which intValue's truncation to int
+// would silently drop.
+func floatValue(v any, fallback float64) float64 {
+	switch t := v.(type) {
+	case float64:
+		return t
+	case float32:
+		return float64(t)
+	case int:
+		return float64(t)
+	case int32:
+		return float64(t)
+	case int64:
+		return float64(t)
 	default:
 		return fallback
 	}
