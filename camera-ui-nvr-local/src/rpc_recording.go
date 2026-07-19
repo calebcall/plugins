@@ -1,6 +1,10 @@
 package main
 
-import "os"
+import (
+	"fmt"
+
+	"github.com/google/uuid"
+)
 
 // managedCameraSource is the minimal interface the RPC layer needs from the
 // recorder registry. Implemented for real by the recorder manager (Task 6);
@@ -25,14 +29,47 @@ func (p *NVRPlugin) GetManagedCameraIds() ([]string, error) {
 	return p.recorders.ManagedCameraIDs(), nil
 }
 
-// GetInstanceId returns the plugin instance ID the host assigned this
-// process. Registered as the RPC method "getInstanceId".
+// instanceIDStore is the minimal storage interface GetInstanceId needs to
+// read and persist its generated instance id. sdk.DeviceStorage satisfies
+// this exactly (see GetValue/SetValue in storage.go) — p.Storage is used in
+// production; tests substitute an in-memory fake.
+type instanceIDStore interface {
+	GetValue(key string, defaultValue ...any) any
+	SetValue(key string, value any) error
+}
+
+// instanceIDStorageKey is the plugin storage key the persistent instance id
+// is kept under.
+const instanceIDStorageKey = "instanceId"
+
+// GetInstanceId returns a persistent, per-plugin-install UUID. Registered as
+// the RPC method "getInstanceId".
 //
-// See the "Instance ID" findings at the top of plugin.go: the SDK exposes no
-// public accessor for this value, so this reads the same PLUGIN_ID
-// environment variable sdk.Run itself reads to build the RPC namespace the
-// frontend calls into, guaranteeing the value matches what the core already
-// uses to address this plugin.
+// Revised finding (task 2 review): the compiled frontend uses getInstanceId()
+// purely as a cache-invalidation change-token — it polls the value and, when
+// it CHANGES from whatever it last saw, flushes the NVR event cache. It is
+// never compared against the core's own settings.instanceId, and (per the
+// findings at the top of plugin.go) no SDK/core accessor for that core value
+// exists to plugin authors anyway. The original implementation returned
+// os.Getenv("PLUGIN_ID") — the plugin's constant package id
+// (e.g. "@calebcall/camera-ui-nvr-local") — which never changes across
+// restarts and therefore could never drive the intended cache flush; it was
+// the wrong value for the contract this method actually serves.
+//
+// The correct value is a UUID generated once and persisted in this plugin's
+// own DeviceStorage (p.Storage), keyed under instanceIDStorageKey: stable
+// across restarts and unique per install, changing only if the plugin's
+// storage is wiped — exactly the semantics the frontend's cache-invalidation
+// consumer needs, achievable entirely from this plugin's own state with no
+// core/SDK change required.
 func (p *NVRPlugin) GetInstanceId() (string, error) {
-	return os.Getenv("PLUGIN_ID"), nil
+	if existing, ok := p.store.GetValue(instanceIDStorageKey, "").(string); ok && existing != "" {
+		return existing, nil
+	}
+
+	id := uuid.NewString()
+	if err := p.store.SetValue(instanceIDStorageKey, id); err != nil {
+		return "", fmt.Errorf("persist instance id: %w", err)
+	}
+	return id, nil
 }

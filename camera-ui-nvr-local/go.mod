@@ -2,7 +2,10 @@ module github.com/calebcall/plugins/camera-ui-nvr-local
 
 go 1.26.3
 
-require github.com/cameraui/sdk/go v1.1.11
+require (
+	github.com/cameraui/sdk/go v1.1.11
+	github.com/google/uuid v1.6.0
+)
 
 require (
 	github.com/cameraui/rpc/go v1.0.6 // indirect

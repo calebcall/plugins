@@ -48,29 +48,31 @@
 //     tasks add RPC-visible methods. Names in the allow-list are the
 //     lowercase-first-letter wire names, not the Go method names.
 //
-// Instance ID (findings, task 2)
+// Instance ID (findings, task 2 — revised after review)
 //
 // There is no public SDK accessor for a plugin's own instance/runtime ID —
 // neither on CoreManager (GetFFmpegPath, GetServerAddresses,
 // GetCloudServerID, GetPluginsByInterface, ConnectToPlugin — none return the
 // caller's own ID) nor on PluginAPI/BasePlugin/Logger (Logger stores an
-// unexported pluginID field with no getter). The only place the ID exists at
-// all is the PLUGIN_ID environment variable that sdk.Run reads before the
-// plugin constructor even runs:
+// unexported pluginID field with no getter) — nor is there any SDK/core
+// accessor for the core's own settings.instanceId. This was initially taken
+// to mean GetInstanceId should mirror sdk.Run's os.Getenv("PLUGIN_ID"), but
+// review of the compiled @camera.ui/nvr frontend showed that's the wrong
+// contract: getInstanceId() is polled by the frontend purely as a
+// cache-invalidation change-token — when the returned value CHANGES from
+// what it last saw, the client flushes its NVR event cache. It is never
+// compared to the core's instanceId. PLUGIN_ID is the plugin's constant
+// package id (e.g. "@calebcall/camera-ui-nvr-local") and never changes
+// across restarts, so it could never drive that flush — it was simply the
+// wrong value for what this method is actually for.
 //
-//	pluginID := os.Getenv("PLUGIN_ID")
-//	namespaces := getPluginNamespaces(pluginID)
-//	...
-//	cleanupRPC, err = client.RegisterHandler(namespaces.PluginChildRPC, plugin)
-//
-// That same pluginID is what builds namespaces.PluginChildRPC — the exact
-// subject prefix ("plugin.<id>.child.rpc") the frontend calls into. So
-// GetInstanceId (rpc_recording.go) reads os.Getenv("PLUGIN_ID") directly:
-// it is guaranteed to be the identical value the core already addresses this
-// plugin by, since it's the same value used to construct that address.
-// (The SDK's own internal helper, manager_download.go's remotePluginID(),
-// reads the same env var for the same reason, though it is unexported and
-// gated to remote mode only.)
+// GetInstanceId (rpc_recording.go) instead returns a UUID generated once and
+// persisted in this plugin's own DeviceStorage (p.store, backed by
+// p.Storage in production) under instanceIDStorageKey. That's stable across
+// restarts and unique per install, changing only if the plugin's storage is
+// wiped — exactly the change-token semantics the frontend's cache consumer
+// needs, achieved entirely from this plugin's own state with no core/SDK
+// change required.
 package main
 
 import sdk "github.com/cameraui/sdk/go"
@@ -84,6 +86,11 @@ type NVRPlugin struct {
 	// recording. Stubbed with noRecorders until Task 6 introduces the real
 	// recorder registry.
 	recorders managedCameraSource
+
+	// store backs GetInstanceId's persistent UUID. Set to the plugin's real
+	// sdk.DeviceStorage (the same value as BasePlugin.Storage) in NewPlugin;
+	// tests substitute an in-memory fake.
+	store instanceIDStore
 }
 
 // RPCMethods restricts this plugin's RPC surface to the wire names listed
@@ -95,7 +102,7 @@ func (p *NVRPlugin) RPCMethods() []string {
 }
 
 func NewPlugin(logger *sdk.Logger, api *sdk.PluginAPI, storage *sdk.DeviceStorage) sdk.Plugin {
-	p := &NVRPlugin{BasePlugin: sdk.NewBasePlugin(logger, api, storage), recorders: noRecorders{}}
+	p := &NVRPlugin{BasePlugin: sdk.NewBasePlugin(logger, api, storage), recorders: noRecorders{}, store: storage}
 
 	api.On(string(sdk.APIEventFinishLaunching), func(...any) { p.Logger.Log("nvr-local: finished launching") })
 	api.On(string(sdk.APIEventShutdown), func(...any) { p.Logger.Log("nvr-local: shutdown") })
