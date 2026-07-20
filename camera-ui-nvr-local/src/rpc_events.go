@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 )
@@ -37,6 +38,10 @@ func (p *NVRPlugin) GetEvents(opts GetEventsOptions) (GetEventsResult, error) {
 	if err != nil {
 		return GetEventsResult{}, err
 	}
+	if p.Logger != nil {
+		raw, _ := json.Marshal(opts)
+		p.Logger.Debug(fmt.Sprintf("nvr-local: getEvents -> %d events hasMore=%v opts=%s", len(result.Events), result.HasMore, string(raw)))
+	}
 	return normalizeEventsResult(result), nil
 }
 
@@ -50,6 +55,10 @@ func (p *NVRPlugin) GetCameraEvents(cameraIDs []string, opts GetEventsOptions) (
 	result, err := p.events.Query(cameraIDs, opts)
 	if err != nil {
 		return GetEventsResult{}, err
+	}
+	if p.Logger != nil {
+		raw, _ := json.Marshal(opts)
+		p.Logger.Debug(fmt.Sprintf("nvr-local: getCameraEvents cams=%d -> %d events hasMore=%v opts=%s", len(cameraIDs), len(result.Events), result.HasMore, string(raw)))
 	}
 	return normalizeEventsResult(result), nil
 }

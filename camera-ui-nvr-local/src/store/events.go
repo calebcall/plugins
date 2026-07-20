@@ -669,11 +669,22 @@ func matchLogic(haystack, needles []string, logic string) bool {
 	return hasAny(haystack, needles)
 }
 
-// eventHasDetections reports whether any of the event's segments carry at
-// least one object detection.
+// eventHasDetections reports whether the event represents an object
+// detection (person/vehicle/animal/package/face/etc.) as opposed to a
+// motion-only or audio-only trigger.
+//
+// This mirrors the frontend's own client-side hasDetections predicate
+// (compiled @camera.ui/nvr: `hasDetections && !types.some(t => t!=='motion'
+// && t!=='audio')` hides an event) — i.e. an event "has detections" iff it
+// carries at least one type other than "motion" and "audio". We key off
+// ev.Types (not ev.Segments) deliberately: the core delivers detection
+// events with an empty Segments slice (observed: segments=0 for both motion
+// and object events), so the previous segment-based check filtered out ALL
+// events under hasDetections:true — including the person/vehicle events the
+// Recordings/home views default-request — leaving those views empty.
 func eventHasDetections(ev DetectionEvent) bool {
-	for _, seg := range ev.Segments {
-		if len(seg.Detections) > 0 {
+	for _, t := range ev.Types {
+		if t != "motion" && t != "audio" {
 			return true
 		}
 	}

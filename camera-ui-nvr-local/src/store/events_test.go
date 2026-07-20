@@ -35,6 +35,40 @@ func openTestEventStore(t *testing.T) *EventStore {
 	return NewEventStore(db)
 }
 
+// TestEventStore_Query_HasDetectionsIsTypeBased locks in the fix for the
+// filter that left the Recordings/home/timeline-detections views empty:
+// hasDetections keys off event Types (object type present), NOT ev.Segments
+// (the core delivers detection events with empty Segments). person1 has NO
+// segments yet must still pass hasDetections=true; motion/audio-only must not.
+func TestEventStore_Query_HasDetectionsIsTypeBased(t *testing.T) {
+	events := openTestEventStore(t)
+	if err := events.Upsert([]DetectionEvent{
+		newTestEvent("motion1", "cam", 1000, 0.9, "ended", "motion"),
+		newTestEvent("person1", "cam", 2000, 0.9, "ended", "person"),
+		newTestEvent("audio1", "cam", 3000, 0.9, "ended", "audio"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	yes := true
+	got, err := events.Query(nil, GetEventsOptions{HasDetections: &yes})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Events) != 1 || got.Events[0].ID != "person1" {
+		t.Fatalf("hasDetections=true expected only person1 (object type, empty Segments), got %d events", len(got.Events))
+	}
+
+	no := false
+	trigOnly, err := events.Query(nil, GetEventsOptions{HasDetections: &no})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(trigOnly.Events) != 2 {
+		t.Fatalf("hasDetections=false expected 2 trigger-only events (motion, audio), got %d", len(trigOnly.Events))
+	}
+}
+
 // TestEventStore_Query_NewestFirstPaginatedWithHasMore is the brief's
 // required proof: 5 events across 2 cameras/timestamps, Query with Limit=2 +
 // Before=<ts> returns 2 rows newest-first with HasMore=true.
