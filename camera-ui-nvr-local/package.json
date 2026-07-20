@@ -1,6 +1,6 @@
 {
   "displayName": "NVR (Local)",
-  "name": "@calebcall/camera-ui-nvr-local",
+  "name": "@camera.ui/camera-ui-nvr",
   "version": "0.1.0",
   "description": "An open-source, local NVR hub for camera.ui: stores and manages video recordings from your cameras entirely on your own hardware, with no cloud dependency.",
   "author": "calebcall (https://github.com/calebcall/plugins)",
@@ -52,13 +52,13 @@
   "os": [],
   "cpu": [],
   "optionalDependencies": {
-    "@calebcall/camera-ui-nvr-local-darwin-arm64": "0.1.0",
-    "@calebcall/camera-ui-nvr-local-darwin-amd64": "0.1.0",
-    "@calebcall/camera-ui-nvr-local-linux-amd64": "0.1.0",
-    "@calebcall/camera-ui-nvr-local-linux-arm64": "0.1.0",
-    "@calebcall/camera-ui-nvr-local-windows-amd64": "0.1.0",
-    "@calebcall/camera-ui-nvr-local-windows-arm64": "0.1.0",
-    "@calebcall/camera-ui-nvr-local-linux-amd64-musl": "0.1.0",
-    "@calebcall/camera-ui-nvr-local-linux-arm64-musl": "0.1.0"
+    "@camera.ui/camera-ui-nvr-darwin-arm64": "0.1.0",
+    "@camera.ui/camera-ui-nvr-darwin-amd64": "0.1.0",
+    "@camera.ui/camera-ui-nvr-linux-amd64": "0.1.0",
+    "@camera.ui/camera-ui-nvr-linux-arm64": "0.1.0",
+    "@camera.ui/camera-ui-nvr-windows-amd64": "0.1.0",
+    "@camera.ui/camera-ui-nvr-windows-arm64": "0.1.0",
+    "@camera.ui/camera-ui-nvr-linux-amd64-musl": "0.1.0",
+    "@camera.ui/camera-ui-nvr-linux-arm64-musl": "0.1.0"
   }
 }

@@ -25,6 +25,7 @@ import (
 // current by the Hub camera lifecycle hooks in plugin.go
 // (ConfigureCameras/OnCameraAdded/OnCameraReleased).
 func (p *NVRPlugin) GetManagedCameraIds() ([]string, error) {
+	p.logRPC("getManagedCameraIds")
 	return p.recorder.ManagedCameraIDs(), nil
 }
 
@@ -69,6 +70,7 @@ const instanceIDStorageKey = "instanceId"
 // this caused before StorageSchema existed, and why run.go's registration
 // order guarantees the schema is in place before any RPC call reaches here.
 func (p *NVRPlugin) GetInstanceId() (string, error) {
+	p.logRPC("getInstanceId")
 	if existing, ok := p.store.GetValue(instanceIDStorageKey, "").(string); ok && existing != "" {
 		return existing, nil
 	}
