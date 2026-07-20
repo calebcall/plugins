@@ -1,6 +1,7 @@
 package recorder
 
 import (
+	"reflect"
 	"testing"
 
 	sdk "github.com/cameraui/sdk/go"
@@ -54,6 +55,14 @@ type fakeCamera struct {
 	// fixed, deterministic URL per role so tests that don't care about the
 	// actual value (most of them) don't need to set it themselves.
 	streamURL func(role string) (string, error)
+
+	// sourceRoles backs SourceRoles below. Left nil by newFakeCamera — a
+	// camera reporting no sources at all — so every pre-existing test
+	// (which doesn't set this) keeps exercising the "no sources: keep
+	// configured/default roles as-is" fallback rather than any
+	// intersection/fallback-to-camera-roles behavior it isn't testing.
+	// Tests exercising SourceRoles set this field directly.
+	sourceRoles []string
 }
 
 func (f *fakeCamera) ID() string             { return f.id }
@@ -62,6 +71,7 @@ func (f *fakeCamera) Storage() CameraStorage { return f.storage }
 func (f *fakeCamera) StreamURL(role string) (string, error) {
 	return f.streamURL(role)
 }
+func (f *fakeCamera) SourceRoles() []string { return f.sourceRoles }
 
 func newFakeCamera(id, name string, mode RecordingMode) *fakeCamera {
 	storage := newFakeCameraStorage()
@@ -239,5 +249,85 @@ func TestReadRecordingConfig_InvalidModeFallsBackToOff(t *testing.T) {
 
 	if cfg.Mode != RecordingModeOff {
 		t.Fatalf("expected an invalid stored mode to fall back to %q, got %q", RecordingModeOff, cfg.Mode)
+	}
+}
+
+// TestReadRecordingConfig_EmptyStoredRolesFallsBackToDefault is the
+// regression test for the production bug: DefineSchemas seeded keyRoles with
+// no DefaultValue, so a camera that was ever loaded before this fix has an
+// explicitly-stored EMPTY roles value (not "unset") on disk. A stored value —
+// even an empty one — beats stringSliceValue's variadic default, so
+// readRecordingConfig used to return Roles=[] for every such camera, and the
+// recorder started with "no configured roles; nothing to record". Storing an
+// empty []string here (as opposed to just never calling storage.set at all,
+// which TestReadRecordingConfig_DefaultsAppliedWhenUnset already covers) is
+// what reproduces the actual on-disk state that broke production.
+func TestReadRecordingConfig_EmptyStoredRolesFallsBackToDefault(t *testing.T) {
+	storage := newFakeCameraStorage()
+	storage.set(keyRoles, []string{})
+
+	cfg := readRecordingConfig(storage)
+
+	if len(cfg.Roles) != 1 || cfg.Roles[0] != string(sdk.CameraRoleHighRes) {
+		t.Fatalf("expected a stored-empty roles value to fall back to defaultRoles %v, got %v", defaultRoles, cfg.Roles)
+	}
+}
+
+// TestRecordingConfigSchema_RolesHasDefaultValue guards against the
+// production bug recurring for any camera that hasn't stored a roles value
+// yet: keyRoles' schema entry must declare DefaultValue so
+// DeviceStorage.DefineSchemas seeds it with defaultRoles up front, the same
+// way every other recordingConfigSchema entry already does.
+func TestRecordingConfigSchema_RolesHasDefaultValue(t *testing.T) {
+	for _, s := range recordingConfigSchema() {
+		if s.Key != keyRoles {
+			continue
+		}
+		got, ok := s.DefaultValue.([]string)
+		if !ok {
+			t.Fatalf("expected keyRoles schema DefaultValue to be a []string, got %T (%v)", s.DefaultValue, s.DefaultValue)
+		}
+		if !reflect.DeepEqual(got, defaultRoles) {
+			t.Fatalf("expected keyRoles schema DefaultValue %v, got %v", defaultRoles, got)
+		}
+		return
+	}
+	t.Fatalf("expected a schema entry for key %q", keyRoles)
+}
+
+// TestResolveRoles exercises resolveRoles directly (the intersect/fallback
+// logic startRecorder applies to a camera's configured/default roles against
+// its actual SourceRoles) without needing the full manager start path.
+func TestResolveRoles(t *testing.T) {
+	cases := []struct {
+		name                 string
+		configured, available, want []string
+	}{
+		{
+			name:       "no sources at all keeps configured/default roles as-is",
+			configured: []string{"high-resolution"},
+			available:  nil,
+			want:       []string{"high-resolution"},
+		},
+		{
+			name:       "configured role offered by the camera is preserved",
+			configured: []string{"low-resolution"},
+			available:  []string{"high-resolution", "low-resolution"},
+			want:       []string{"low-resolution"},
+		},
+		{
+			name:       "configured role not offered falls back to the camera's actual roles",
+			configured: []string{"high-resolution"},
+			available:  []string{"main-hd"},
+			want:       []string{"main-hd"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := resolveRoles(c.configured, c.available)
+			if !reflect.DeepEqual(got, c.want) {
+				t.Fatalf("resolveRoles(%v, %v) = %v, want %v", c.configured, c.available, got, c.want)
+			}
+		})
 	}
 }

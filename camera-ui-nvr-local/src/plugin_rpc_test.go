@@ -148,6 +148,11 @@ func (f *fakeManagedCamera) StreamURL(role string) (string, error) {
 	return "rtsp://" + f.id + "/" + role, nil
 }
 
+// SourceRoles reports no sources: these tests only exercise
+// GetManagedCameraIds delegation, not recorder-start role resolution (see
+// recorder/manager_orch_test.go for that).
+func (f *fakeManagedCamera) SourceRoles() []string { return nil }
+
 func TestGetManagedCameraIds_DelegatesToRecorderManager(t *testing.T) {
 	p := newTestPlugin(t)
 	cam := newFakeManagedCamera("cam-1", "Front Door", "continuous")

@@ -11,6 +11,8 @@ import (
 	"errors"
 	"sync"
 	"testing"
+
+	sdk "github.com/cameraui/sdk/go"
 )
 
 // fakeRecorderHandle is an injectable stand-in for a live *Recorder,
@@ -195,6 +197,121 @@ func TestStartAll_BuildsConfigFromCameraRecordingConfigAndDefaults(t *testing.T)
 	url, err := cfg.StreamURL("low-resolution")
 	if err != nil || url != "rtsp://cam-1/low-resolution" {
 		t.Errorf("expected StreamURL to call through to the camera's StreamURL, got (%q, %v)", url, err)
+	}
+}
+
+// TestStartAll_StoredEmptyRolesFallBackToDefaultAndCameraSources is the
+// full-start-path regression test for the production bug reported live: a
+// camera with recordingMode=continuous whose stored roles value is an
+// explicitly-empty []string (every already-loaded camera, pre-fix — see
+// TestReadRecordingConfig_EmptyStoredRolesFallsBackToDefault for the
+// readRecordingConfig-level version of this same scenario) must still end up
+// with a non-empty RecorderConfig.Roles once it flows through StartAll: the
+// empty stored value falls back to defaultRoles ("high-resolution"), which
+// this camera's SourceRoles actually offers, so it's used as-is.
+func TestStartAll_StoredEmptyRolesFallBackToDefaultAndCameraSources(t *testing.T) {
+	m := NewRecorderManager()
+	cam := newFakeCamera("cam-1", "Front Door", RecordingModeContinuous)
+	cam.storage.set(keyRoles, []string{}) // the production bug: stored-empty
+	cam.sourceRoles = []string{string(sdk.CameraRoleHighRes)}
+	if err := m.Configure([]ManagedCamera{cam}); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+
+	factory := newFakeRecorderFactory()
+	m.ConfigureRecording("/data", 0, factory.factory())
+	if err := m.StartAll(); err != nil {
+		t.Fatalf("StartAll: %v", err)
+	}
+
+	cfg, ok := factory.configFor("cam-1")
+	if !ok {
+		t.Fatalf("expected a RecorderConfig built for cam-1")
+	}
+	if len(cfg.Roles) != 1 || cfg.Roles[0] != string(sdk.CameraRoleHighRes) {
+		t.Fatalf("production bug: expected Roles to fall back to defaultRoles %v, got %v", defaultRoles, cfg.Roles)
+	}
+}
+
+// TestStartAll_ConfiguredRoleNotOnCamera_FallsBackToCameraSourceRoles covers
+// a camera whose configured/default role ("high-resolution") isn't one its
+// actual sources report — e.g. a non-amcrest source named "main-hd" instead
+// — expecting the built RecorderConfig to fall back to the camera's real
+// SourceRoles rather than recording nothing.
+func TestStartAll_ConfiguredRoleNotOnCamera_FallsBackToCameraSourceRoles(t *testing.T) {
+	m := NewRecorderManager()
+	cam := newFakeCamera("cam-1", "Front Door", RecordingModeContinuous)
+	cam.sourceRoles = []string{"main-hd"}
+	if err := m.Configure([]ManagedCamera{cam}); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+
+	factory := newFakeRecorderFactory()
+	m.ConfigureRecording("/data", 0, factory.factory())
+	if err := m.StartAll(); err != nil {
+		t.Fatalf("StartAll: %v", err)
+	}
+
+	cfg, ok := factory.configFor("cam-1")
+	if !ok {
+		t.Fatalf("expected a RecorderConfig built for cam-1")
+	}
+	if len(cfg.Roles) != 1 || cfg.Roles[0] != "main-hd" {
+		t.Fatalf("expected fallback to the camera's actual source roles [main-hd], got %v", cfg.Roles)
+	}
+}
+
+// TestStartAll_ConfiguredRoleOnCamera_IntersectionPreserved covers a camera
+// whose configured role IS one of its actual sources: the configured value
+// must be used as-is, not widened to every source role the camera offers.
+func TestStartAll_ConfiguredRoleOnCamera_IntersectionPreserved(t *testing.T) {
+	m := NewRecorderManager()
+	cam := newFakeCamera("cam-1", "Front Door", RecordingModeContinuous)
+	cam.storage.set(keyRoles, []string{"low-resolution"})
+	cam.sourceRoles = []string{string(sdk.CameraRoleHighRes), "low-resolution"}
+	if err := m.Configure([]ManagedCamera{cam}); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+
+	factory := newFakeRecorderFactory()
+	m.ConfigureRecording("/data", 0, factory.factory())
+	if err := m.StartAll(); err != nil {
+		t.Fatalf("StartAll: %v", err)
+	}
+
+	cfg, ok := factory.configFor("cam-1")
+	if !ok {
+		t.Fatalf("expected a RecorderConfig built for cam-1")
+	}
+	if len(cfg.Roles) != 1 || cfg.Roles[0] != "low-resolution" {
+		t.Fatalf("expected the configured role preserved as-is [low-resolution], got %v", cfg.Roles)
+	}
+}
+
+// TestStartAll_NoCameraSources_KeepsConfiguredRoles covers a camera that
+// reports no sources at all (SourceRoles empty) — recorder.go's own
+// stream-error logging is the existing safety net for that case, so this
+// path must keep the configured/default roles as a best effort rather than
+// e.g. collapsing to no roles.
+func TestStartAll_NoCameraSources_KeepsConfiguredRoles(t *testing.T) {
+	m := NewRecorderManager()
+	cam := newFakeCamera("cam-1", "Front Door", RecordingModeContinuous) // sourceRoles left nil
+	if err := m.Configure([]ManagedCamera{cam}); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+
+	factory := newFakeRecorderFactory()
+	m.ConfigureRecording("/data", 0, factory.factory())
+	if err := m.StartAll(); err != nil {
+		t.Fatalf("StartAll: %v", err)
+	}
+
+	cfg, ok := factory.configFor("cam-1")
+	if !ok {
+		t.Fatalf("expected a RecorderConfig built for cam-1")
+	}
+	if len(cfg.Roles) != 1 || cfg.Roles[0] != string(sdk.CameraRoleHighRes) {
+		t.Fatalf("expected configured/default roles kept when the camera reports no sources, got %v", cfg.Roles)
 	}
 }
 

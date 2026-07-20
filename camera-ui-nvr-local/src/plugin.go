@@ -585,6 +585,27 @@ func (c sdkManagedCamera) StreamURL(role string) (string, error) {
 	return "", fmt.Errorf("nvr-local: camera %s: no stream source for role %q", c.dev.ID(), role)
 }
 
+// SourceRoles enumerates this camera's actual stream source roles, in
+// source order (e.g. ["high-resolution", "low-resolution"]) — the
+// recorder.ManagedCamera method startRecorder's resolveRoles uses to narrow
+// a camera's configured/default recording roles down to ones it actually
+// has, and to fall back to its real roles when the configured one (e.g. the
+// "high-resolution" default) doesn't exist on this camera's sources. Returns
+// nil, not an error, for a camera with no sources at all — resolveRoles
+// treats that as "can't narrow, keep the configured/default roles" rather
+// than "record nothing".
+func (c sdkManagedCamera) SourceRoles() []string {
+	sources := c.dev.Sources()
+	if len(sources) == 0 {
+		return nil
+	}
+	roles := make([]string, 0, len(sources))
+	for _, src := range sources {
+		roles = append(roles, string(src.Role()))
+	}
+	return roles
+}
+
 // attachDetectionIngestion subscribes to cam's detection-event stream via
 // sdk.CameraDevice.OnDetectionEvent (camera_device.go:547) and upserts every
 // event into p.events through a detectionEventIngester (events_ingest.go).

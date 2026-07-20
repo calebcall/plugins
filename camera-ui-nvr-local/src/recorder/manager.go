@@ -84,11 +84,23 @@ type CameraStorage interface {
 // RecorderManager reaching for *sdk.CameraDevice directly: the parent
 // package's sdkManagedCamera adapter (plugin.go) is the only place a real
 // device is bridged to it; tests use fakeCamera.
+//
+// SourceRoles enumerates the role strings this camera's actual stream
+// sources offer, in source order (e.g. ["high-resolution", "low-resolution"]
+// for a typical two-stream camera). It exists so startRecorder (see
+// resolveRoles) can narrow a camera's configured/default recording roles
+// down to ones the camera actually has, and fall back to the camera's real
+// roles when the configured one doesn't exist on it — robustness against the
+// stored/default role ("high-resolution") not matching every camera source's
+// naming. An empty return means "camera reports no sources at all" (rather
+// than "record nothing"): resolveRoles treats that as best-effort and keeps
+// the configured/default roles unchanged.
 type ManagedCamera interface {
 	ID() string
 	Name() string
 	Storage() CameraStorage
 	StreamURL(role string) (string, error)
+	SourceRoles() []string
 }
 
 // RecordingConfig is one camera's resolved recording settings.
@@ -131,6 +143,12 @@ type RecorderEntry struct {
 	// the registry, well after ConfigureCameras/Add's ManagedCamera
 	// argument has gone out of scope.
 	StreamURL func(role string) (string, error)
+
+	// SourceRoles is cam.SourceRoles(), captured at newRecorder time for the
+	// same reason StreamURL is: startRecorder needs it (via resolveRoles) to
+	// narrow/fall-back Config.Roles to what this camera's sources actually
+	// offer, well after the original ManagedCamera has gone out of scope.
+	SourceRoles []string
 }
 
 // RecorderHandle is the lifecycle surface RecorderManager needs from a live
@@ -561,10 +579,12 @@ func (m *RecorderManager) startRecorder(entry RecorderEntry) error {
 		return nil
 	}
 
+	roles := resolveRoles(entry.Config.Roles, entry.SourceRoles)
+
 	cfg := RecorderConfig{
 		CameraID:       entry.CameraID,
 		StreamURL:      entry.StreamURL,
-		Roles:          entry.Config.Roles,
+		Roles:          roles,
 		SegmentSeconds: segmentSeconds,
 		DataDir:        dataDir,
 		Mode:           entry.Config.Mode,
@@ -585,8 +605,54 @@ func (m *RecorderManager) startRecorder(entry RecorderEntry) error {
 	m.active[entry.CameraID] = handle
 	m.mu.Unlock()
 
-	m.logf("recorder: started camera %s (mode=%s roles=%v)", entry.CameraID, entry.Config.Mode, entry.Config.Roles)
+	m.logf("recorder: started camera %s (mode=%s roles=%v)", entry.CameraID, entry.Config.Mode, roles)
 	return nil
+}
+
+// resolveRoles narrows configured (entry.Config.Roles — the camera's
+// stored/default recording roles) down to the ones actually offered by
+// available (entry.SourceRoles — the camera's real stream sources),
+// preserving configured's order, so the recorder is never pointed at a role
+// string the camera doesn't have. This is the robustness fix layered on top
+// of readRecordingConfig's own empty->defaultRoles fallback: even a
+// correctly-resolved "high-resolution" default is wrong for a camera whose
+// sources are named something else entirely.
+//
+//   - available empty (camera reports no sources at all — a ManagedCamera
+//     that can't yet answer this, or a genuinely sourceless camera): returns
+//     configured unchanged. There's nothing more useful to narrow against,
+//     and the existing "no roles / stream error" logging in the recorder
+//     start path is the safety net for this case.
+//   - intersection non-empty: returns just the configured roles that
+//     available actually offers, in configured's order — e.g. configured
+//     ["high-resolution"] against available ["high-resolution",
+//     "low-resolution"] returns ["high-resolution"], not every role the
+//     camera has.
+//   - intersection empty (configured names a role this camera doesn't have
+//     — e.g. a non-amcrest source named "main-hd" instead of
+//     "high-resolution"): falls back to available itself, so recording still
+//     happens using whatever roles the camera actually offers instead of
+//     silently recording nothing.
+func resolveRoles(configured, available []string) []string {
+	if len(available) == 0 {
+		return configured
+	}
+
+	availableSet := make(map[string]struct{}, len(available))
+	for _, role := range available {
+		availableSet[role] = struct{}{}
+	}
+
+	var intersection []string
+	for _, role := range configured {
+		if _, ok := availableSet[role]; ok {
+			intersection = append(intersection, role)
+		}
+	}
+	if len(intersection) == 0 {
+		return available
+	}
+	return intersection
 }
 
 // stopRecorder stops and deregisters cameraID's currently active Recorder,
@@ -662,10 +728,11 @@ func (m *RecorderManager) entriesSnapshot() []RecorderEntry {
 
 func newRecorder(cam ManagedCamera) *RecorderEntry {
 	return &RecorderEntry{
-		CameraID:  cam.ID(),
-		Name:      cam.Name(),
-		Config:    readRecordingConfig(cam.Storage()),
-		StreamURL: cam.StreamURL,
+		CameraID:    cam.ID(),
+		Name:        cam.Name(),
+		Config:      readRecordingConfig(cam.Storage()),
+		StreamURL:   cam.StreamURL,
+		SourceRoles: cam.SourceRoles(),
 	}
 }
 
@@ -717,12 +784,13 @@ func recordingConfigSchema() []sdk.JsonSchema {
 			Store:        &storeTrue,
 		},
 		{
-			Type:   sdk.JsonSchemaTypeArray,
-			Key:    keyRoles,
-			Title:  "Recorded Stream Roles",
-			Hidden: true,
-			Store:  &storeTrue,
-			Items:  &sdk.JsonSchema{Type: sdk.JsonSchemaTypeString},
+			Type:         sdk.JsonSchemaTypeArray,
+			Key:          keyRoles,
+			Title:        "Recorded Stream Roles",
+			Hidden:       true,
+			Store:        &storeTrue,
+			DefaultValue: defaultRoles,
+			Items:        &sdk.JsonSchema{Type: sdk.JsonSchemaTypeString},
 		},
 	}
 }
@@ -733,6 +801,16 @@ func recordingConfigSchema() []sdk.JsonSchema {
 // an invalid/corrupt stored recordingMode (e.g. hand-edited storage.json,
 // or a value from a future schema version this build doesn't know) falls
 // back to RecordingModeOff rather than recording unexpectedly or panicking.
+//
+// Roles gets its own empty->defaultRoles fallback below, in addition to
+// (not instead of) recordingConfigSchema's own keyRoles DefaultValue: every
+// camera that was ever loaded before this fix has an explicitly-stored EMPTY
+// roles value on disk (DefineSchemas only seeds a DefaultValue for keys with
+// no stored value at all, and an empty []string still counts as stored), so
+// the schema DefaultValue alone only prevents this for cameras that haven't
+// stored anything yet — it can't retroactively fix an already-empty stored
+// value. This was the actual production bug: every managed camera started
+// its Recorder with roles=[] and recorded nothing.
 func readRecordingConfig(storage CameraStorage) RecordingConfig {
 	storage.DefineSchemas(recordingConfigSchema())
 
@@ -744,12 +822,17 @@ func readRecordingConfig(storage CameraStorage) RecordingConfig {
 		recordingMode = RecordingModeOff
 	}
 
+	roles := stringSliceValue(storage.GetValue(keyRoles, defaultRoles))
+	if len(roles) == 0 {
+		roles = append([]string(nil), defaultRoles...)
+	}
+
 	return RecordingConfig{
 		Mode:          recordingMode,
 		RetentionDays: intValue(storage.GetValue(keyRetentionDays, defaultRetentionDays), defaultRetentionDays),
 		PreRollS:      intValue(storage.GetValue(keyPreRollS, defaultPreRollS), defaultPreRollS),
 		PostRollS:     intValue(storage.GetValue(keyPostRollS, defaultPostRollS), defaultPostRollS),
-		Roles:         stringSliceValue(storage.GetValue(keyRoles, defaultRoles)),
+		Roles:         roles,
 	}
 }
 
