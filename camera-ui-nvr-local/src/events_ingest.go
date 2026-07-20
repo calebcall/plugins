@@ -40,6 +40,15 @@ type eventRecorderLookup interface {
 	RecorderFor(cameraID string) (eventRecorder, bool)
 }
 
+// eventThumbnailer is the minimal interface detectionEventIngester needs to
+// trigger Task 11's thumbnail generation: *media.Generator satisfies it
+// directly. GenerateAsync is fire-and-forget — see that method's doc
+// comment for why a slow, hung, or failing ffmpeg process must never block
+// or fail event ingestion.
+type eventThumbnailer interface {
+	GenerateAsync(event store.DetectionEvent)
+}
+
 // detectionEventIngester adapts sdk.CameraDevice.OnDetectionEvent's callback
 // shape into an EventStore.Upsert call, plus (Task 8) a MarkEvent call on
 // the event's camera's recorder, if one is registered. One instance is
@@ -50,20 +59,22 @@ type eventRecorderLookup interface {
 type detectionEventIngester struct {
 	store     eventUpserter
 	recorders eventRecorderLookup
+	thumbs    eventThumbnailer
 	logger    *sdk.Logger
 }
 
 // newDetectionEventIngester returns a detectionEventIngester that upserts
-// into store and, for a camera with a registered recorder, calls MarkEvent
-// via recorders. logger may be nil (as in unit tests); recorders may also be
-// nil — handle treats that identically to RecorderFor returning ok=false,
-// i.e. it just skips the MarkEvent step — so existing callers/tests that
-// don't care about event-mode wiring at all don't need to supply a lookup.
-// Errors are only logged, never surfaced, because OnDetectionEvent's
-// callback signature (see camera_device.go) has no error return for a
-// failed handler to report through.
-func newDetectionEventIngester(store eventUpserter, recorders eventRecorderLookup, logger *sdk.Logger) *detectionEventIngester {
-	return &detectionEventIngester{store: store, recorders: recorders, logger: logger}
+// into store, for a camera with a registered recorder calls MarkEvent via
+// recorders, and (Task 11) dispatches thumbnail generation via thumbs.
+// logger may be nil (as in unit tests); recorders and thumbs may also be
+// nil — handle treats a nil recorders identically to RecorderFor returning
+// ok=false (skips MarkEvent), and a nil thumbs skips thumbnail generation
+// entirely — so existing callers/tests that don't care about that wiring
+// don't need to supply one. Errors are only logged, never surfaced, because
+// OnDetectionEvent's callback signature (see camera_device.go) has no error
+// return for a failed handler to report through.
+func newDetectionEventIngester(store eventUpserter, recorders eventRecorderLookup, thumbs eventThumbnailer, logger *sdk.Logger) *detectionEventIngester {
+	return &detectionEventIngester{store: store, recorders: recorders, thumbs: thumbs, logger: logger}
 }
 
 // handle is the exact callback shape sdk.CameraDevice.OnDetectionEvent
@@ -93,6 +104,7 @@ func (i *detectionEventIngester) handle(eventType sdk.DetectionEventType, event 
 		i.logger.Error("nvr-local: upsert detection event failed:", err)
 	}
 	i.markEvent(event)
+	i.generateThumbnail(event)
 }
 
 // markEvent calls MarkEvent(event.ID, event.StartTime, event.EndTime) on the
@@ -108,6 +120,19 @@ func (i *detectionEventIngester) markEvent(event sdk.DetectionEvent) {
 		return
 	}
 	rec.MarkEvent(event.ID, event.StartTime, event.EndTime)
+}
+
+// generateThumbnail dispatches GenerateAsync(event) on i.thumbs, if one was
+// supplied. A no-op when i.thumbs is nil (see newDetectionEventIngester's
+// doc comment) — every lifecycle message calls this the same way markEvent
+// is called on every one, since Generator itself (media.Generator, via its
+// per-event done-map) is what decides whether a given message is worth
+// acting on, not this ingester.
+func (i *detectionEventIngester) generateThumbnail(event sdk.DetectionEvent) {
+	if i.thumbs == nil {
+		return
+	}
+	i.thumbs.GenerateAsync(event)
 }
 
 // detectionSubscriptions tracks the per-camera sdk.Disposable returned by

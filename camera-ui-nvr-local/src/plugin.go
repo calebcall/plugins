@@ -114,6 +114,7 @@ import (
 
 	sdk "github.com/cameraui/sdk/go"
 
+	"github.com/calebcall/plugins/camera-ui-nvr-local/src/media"
 	"github.com/calebcall/plugins/camera-ui-nvr-local/src/recorder"
 	"github.com/calebcall/plugins/camera-ui-nvr-local/src/store"
 )
@@ -164,6 +165,14 @@ type NVRPlugin struct {
 	// leaves getSystemEvents with today (it can only ever return an empty
 	// result until a later task wires a producer).
 	systemEvents *store.SystemEventStore
+
+	// thumbs generates and persists each detection event's primary JPEG
+	// thumbnail (Task 11, src/media/thumbs.go) — dispatched from
+	// attachDetectionIngestion via detectionEventIngester.generateThumbnail
+	// on every DetectionEvent lifecycle message. nil whenever db is nil
+	// (same guard as events/segments above), and also nil in unit tests
+	// that construct NVRPlugin directly rather than through NewPlugin.
+	thumbs *media.Generator
 
 	// detectionSubs tracks the per-camera sdk.Disposable returned by
 	// CameraDevice.OnDetectionEvent so OnCameraReleased can unsubscribe
@@ -343,6 +352,15 @@ func NewPlugin(logger *sdk.Logger, api *sdk.PluginAPI, storage *sdk.DeviceStorag
 		// simply never reached, so StartRetention below stays a no-op too
 		// (see its own doc comment).
 		p.recorder.ConfigureRetention(p.segments, p.events, p.nvrQuotaGB, db.ClipVectors, db.FaceVectors)
+
+		// Wires detectionEventIngester's thumbnail generation (Task 11,
+		// events_ingest.go's generateThumbnail): p.segments finds each
+		// event's covering recorded segment, p.events persists the
+		// generated JPEG's path back onto the event row, and
+		// recorder.ResolveFFmpeg().Path() reuses the exact same
+		// CAMERAUI_FFMPEG_PATH/PATH-fallback resolution the recorder itself
+		// uses (see ffmpeg.go) rather than duplicating it here.
+		p.thumbs = media.NewGenerator(api.StoragePath, recorder.ResolveFFmpeg().Path(), p.segments, p.events, p.Logger)
 
 		// Wires StartAll/Add/Remove (Task ORCH, recorder/manager.go) with
 		// what they need to actually build and start a live *recorder.
@@ -586,6 +604,19 @@ func (p *NVRPlugin) attachDetectionIngestion(cam *sdk.CameraDevice) {
 	if p.events == nil {
 		return
 	}
-	ingester := newDetectionEventIngester(p.events, &p.recorders, p.Logger)
+	// p.thumbs is only ever wrapped into the eventThumbnailer interface
+	// when it's actually non-nil: newDetectionEventIngester's nil-checks
+	// (i.thumbs == nil) work by comparing the *interface* to nil, which is
+	// only true when nothing was ever assigned to it — an interface
+	// holding a typed nil *media.Generator would compare != nil and then
+	// nil-pointer-panic on the first GenerateAsync call. p.thumbs is set
+	// alongside p.events in NewPlugin (both nil together whenever
+	// store.Open failed), so this guard is largely defensive, but cheap
+	// insurance against that exact Go footgun.
+	var thumbs eventThumbnailer
+	if p.thumbs != nil {
+		thumbs = p.thumbs
+	}
+	ingester := newDetectionEventIngester(p.events, &p.recorders, thumbs, p.Logger)
 	p.detectionSubs.add(cam.ID(), cam.OnDetectionEvent(ingester.handle))
 }

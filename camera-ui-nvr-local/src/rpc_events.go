@@ -1,6 +1,9 @@
 package main
 
-import "fmt"
+import (
+	"fmt"
+	"os"
+)
 
 // heatmapEventFetchLimit bounds how many events GetDetectionHeatmap asks
 // EventStore.Query for. EventStore has no dedicated "count matching rows"
@@ -96,18 +99,20 @@ func (p *NVRPlugin) GetSystemEvents(cameraIDs []string, opts GetSystemEventsOpti
 // rather than scanning every event for the camera. Registered as the RPC
 // method "getEventThumbnails".
 //
-// Thumbnail GENERATION/persistence is a later task (see events.go's Upsert
-// doc comment on thumb_ref, and sdk.DetectionEvent.Thumbnail's own doc
-// comment: "Inline only on the first message that delivers it ... the NVR
-// plugin persists it and clients fetch it on demand"). This handler serves
+// Thumbnail GENERATION/persistence for the primary event thumbnail is Task
+// 11 (see src/media/thumbs.go: media.Generator, dispatched on every
+// DetectionEvent lifecycle message from events_ingest.go's
+// detectionEventIngester). Scene/detection/attribute thumbnails remain
 // whatever happens to still be present on the stored event's raw JSON as of
-// its most recent Upsert — which, for an event whose lifecycle has moved
-// past the message that carried the thumbnail bytes inline, may be nothing
-// (Upsert replaces the whole `raw` column on every call; a later message
-// without inline thumbnail bytes overwrites earlier ones already
-// stored) — hence returning an all-empty EventThumbnails{} rather than an
-// error when none are found, matching the brief's "empty maps if none yet"
-// contract exactly.
+// its most recent Upsert (see sdk.DetectionEvent.Thumbnail's own doc
+// comment: "Inline only on the first message that delivers it ... the NVR
+// plugin persists it and clients fetch it on demand") — Upsert replaces the
+// whole `raw` column on every call, so a later message without inline
+// thumbnail bytes overwrites earlier ones already stored; generating those
+// nested thumbnails from disk too is not yet implemented (see
+// thumbnailsFromEvent's DEFERRED note). This handler returns an all-empty
+// EventThumbnails{} rather than an error when nothing is found at all,
+// matching the brief's "empty maps if none yet" contract exactly.
 func (p *NVRPlugin) GetEventThumbnails(cameraID string, startMs int64, eventID string) (EventThumbnails, error) {
 	p.logRPC("getEventThumbnails", cameraID, eventID)
 	if p.events == nil {
@@ -120,10 +125,37 @@ func (p *NVRPlugin) GetEventThumbnails(cameraID string, startMs int64, eventID s
 	}
 	for _, ev := range result.Events {
 		if ev.ID == eventID {
-			return thumbnailsFromEvent(ev), nil
+			out := thumbnailsFromEvent(ev)
+			if len(out.Event) == 0 {
+				out.Event = p.loadGeneratedThumbnail(eventID)
+			}
+			return out, nil
 		}
 	}
 	return EventThumbnails{}, nil
+}
+
+// loadGeneratedThumbnail returns the primary JPEG thumbnail
+// media.Generator generated for eventID (Task 11), read from the path
+// recorded on the event's thumb_ref column — or nil if none was ever
+// generated (no covering segment at ingestion time, generation still
+// pending/failed, or nothing has ingested this event at all). Any error
+// reading thumb_ref or the file itself (e.g. the file existed but was since
+// removed by retention) is treated identically to "none": thumbnail serving
+// is always best-effort, never a reason to fail the RPC.
+func (p *NVRPlugin) loadGeneratedThumbnail(eventID string) []byte {
+	if p.events == nil {
+		return nil
+	}
+	ref, err := p.events.GetThumbRef(eventID)
+	if err != nil || ref == "" {
+		return nil
+	}
+	data, err := os.ReadFile(ref)
+	if err != nil {
+		return nil
+	}
+	return data
 }
 
 // thumbnailsFromEvent flattens ev's inline thumbnail bytes (its own
@@ -142,6 +174,14 @@ func (p *NVRPlugin) GetEventThumbnails(cameraID string, startMs int64, eventID s
 // even a runtime error on this side — the frontend would just silently fail
 // to find/display any thumbnail, since it already only reads, never
 // validates, these maps.
+//
+// DEFERRED (Task 11 scope): Scenes/Detections/Attributes below are only
+// ever populated from bytes an sdk.DetectionEvent message happened to carry
+// inline — nothing generates per-segment/per-detection/per-attribute crops
+// from a recorded segment the way media.Generator does for the primary
+// Event thumbnail. The task brief calls per-detection crops optional
+// ("scenes/attributes can stay empty"); this plugin currently leaves all
+// three empty unless the SDK itself already inlined them.
 func thumbnailsFromEvent(ev DetectionEvent) EventThumbnails {
 	var out EventThumbnails
 

@@ -249,6 +249,68 @@ func bestBox(ev DetectionEvent) *sdk.BoundingBox {
 	return nil
 }
 
+// SetThumbRef writes eventID's thumb_ref column to thumbRef — the on-disk
+// path media.Generator (Task 11) persisted a generated primary JPEG
+// thumbnail under, once it has actually written the file. Deliberately
+// separate from Upsert (see Upsert's own doc comment: thumb_ref is owned by
+// the thumbnail-persistence path, not the event-lifecycle upsert path, so a
+// later lifecycle message for the same event never clobbers a thumb_ref set
+// in the meantime). A no-op (not an error) when eventID doesn't match any
+// row — the event may have been deleted by retention between generation
+// starting and finishing.
+func (s *EventStore) SetThumbRef(eventID, thumbRef string) error {
+	s.db.Lock()
+	defer s.db.Unlock()
+
+	stmt, _, err := s.db.Conn().Prepare(`UPDATE events SET thumb_ref = ? WHERE id = ?`)
+	if err != nil {
+		return fmt.Errorf("store: prepare set thumb_ref: %w", err)
+	}
+	defer stmt.Close()
+
+	if err := stmt.BindText(1, thumbRef); err != nil {
+		return err
+	}
+	if err := stmt.BindText(2, eventID); err != nil {
+		return err
+	}
+	if err := stmt.Exec(); err != nil {
+		return fmt.Errorf("store: set thumb_ref for event %s: %w", eventID, err)
+	}
+	return nil
+}
+
+// GetThumbRef reads eventID's thumb_ref column back, for
+// GetEventThumbnails' (rpc_events.go) fallback load of a generated
+// thumbnail file. Returns ("", nil) — not an error — both when eventID
+// doesn't exist and when it exists but thumb_ref is still NULL (no
+// thumbnail generated yet, or generation found no covering segment): either
+// way there is nothing to load, and the caller's handling is identical.
+func (s *EventStore) GetThumbRef(eventID string) (string, error) {
+	s.db.Lock()
+	defer s.db.Unlock()
+
+	stmt, _, err := s.db.Conn().Prepare(`SELECT thumb_ref FROM events WHERE id = ?`)
+	if err != nil {
+		return "", fmt.Errorf("store: prepare get thumb_ref: %w", err)
+	}
+	defer stmt.Close()
+
+	if err := stmt.BindText(1, eventID); err != nil {
+		return "", err
+	}
+
+	if !stmt.Step() {
+		if err := stmt.Err(); err != nil {
+			return "", fmt.Errorf("store: scan get thumb_ref: %w", err)
+		}
+		return "", nil
+	}
+	// ColumnText on a NULL thumb_ref returns "", matching this method's
+	// documented "" zero value for "nothing generated yet".
+	return stmt.ColumnText(0), nil
+}
+
 // DeletedEvent is one row DeleteOlderThan removed: just enough (ID, for
 // cascading to any face/clip vector rows keyed by an event's id; ThumbRef,
 // for removing its thumbnail file) for the retention task's cascade step.

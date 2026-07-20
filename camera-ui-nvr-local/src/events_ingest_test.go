@@ -32,7 +32,7 @@ func (f *fakeEventStore) Upsert(events []store.DetectionEvent) error {
 // a synthetic detection event into the store unchanged.
 func TestDetectionEventIngester_Handle_UpsertsTheEvent(t *testing.T) {
 	fake := &fakeEventStore{}
-	ingester := newDetectionEventIngester(fake, nil, nil)
+	ingester := newDetectionEventIngester(fake, nil, nil, nil)
 
 	event := sdk.DetectionEvent{
 		ID:        "evt-1",
@@ -59,7 +59,7 @@ func TestDetectionEventIngester_Handle_UpsertsTheEvent(t *testing.T) {
 // handler must not skip or coalesce them itself.
 func TestDetectionEventIngester_Handle_ReplacesOnUpdate(t *testing.T) {
 	fake := &fakeEventStore{}
-	ingester := newDetectionEventIngester(fake, nil, nil)
+	ingester := newDetectionEventIngester(fake, nil, nil, nil)
 
 	ingester.handle(sdk.DetectionEventStart, sdk.DetectionEvent{
 		ID: "evt-1", CameraID: "cam1", State: sdk.DetectionEventStateActive, StartTime: 1000,
@@ -84,7 +84,7 @@ func TestDetectionEventIngester_Handle_ReplacesOnUpdate(t *testing.T) {
 // there's nowhere to log to either).
 func TestDetectionEventIngester_Handle_LogsAndSwallowsStoreErrors(t *testing.T) {
 	fake := &fakeEventStore{err: errors.New("boom")}
-	ingester := newDetectionEventIngester(fake, nil, nil)
+	ingester := newDetectionEventIngester(fake, nil, nil, nil)
 
 	ingester.handle(sdk.DetectionEventStart, sdk.DetectionEvent{ID: "evt-1", CameraID: "cam1"})
 }
@@ -131,7 +131,7 @@ func (f *fakeRecorderLookup) RecorderFor(cameraID string) (eventRecorder, bool) 
 func TestDetectionEventIngester_Handle_CallsMarkEventOnRegisteredRecorder(t *testing.T) {
 	spy := &spyRecorder{}
 	lookup := &fakeRecorderLookup{recorders: map[string]eventRecorder{"cam1": spy}}
-	ingester := newDetectionEventIngester(&fakeEventStore{}, lookup, nil)
+	ingester := newDetectionEventIngester(&fakeEventStore{}, lookup, nil, nil)
 
 	ingester.handle(sdk.DetectionEventEnd, sdk.DetectionEvent{
 		ID: "evt-1", CameraID: "cam1", StartTime: 1000, EndTime: 6000,
@@ -157,7 +157,7 @@ func TestDetectionEventIngester_Handle_CallsMarkEventOnRegisteredRecorder(t *tes
 func TestDetectionEventIngester_Handle_StartThenEndLifecycle_CallsMarkEventForBoth(t *testing.T) {
 	spy := &spyRecorder{}
 	lookup := &fakeRecorderLookup{recorders: map[string]eventRecorder{"cam1": spy}}
-	ingester := newDetectionEventIngester(&fakeEventStore{}, lookup, nil)
+	ingester := newDetectionEventIngester(&fakeEventStore{}, lookup, nil, nil)
 
 	ingester.handle(sdk.DetectionEventStart, sdk.DetectionEvent{
 		ID: "evt-1", CameraID: "cam1", State: sdk.DetectionEventStateActive, StartTime: 1000,
@@ -183,7 +183,7 @@ func TestDetectionEventIngester_Handle_StartThenEndLifecycle_CallsMarkEventForBo
 // isn't in events mode — even though a lookup is configured.
 func TestDetectionEventIngester_Handle_SkipsMarkEventWhenNoRecorderRegistered(t *testing.T) {
 	lookup := &fakeRecorderLookup{recorders: map[string]eventRecorder{}}
-	ingester := newDetectionEventIngester(&fakeEventStore{}, lookup, nil)
+	ingester := newDetectionEventIngester(&fakeEventStore{}, lookup, nil, nil)
 
 	ingester.handle(sdk.DetectionEventStart, sdk.DetectionEvent{
 		ID: "evt-1", CameraID: "cam-unregistered", StartTime: 1000,
@@ -197,7 +197,7 @@ func TestDetectionEventIngester_Handle_SkipsMarkEventWhenNoRecorderRegistered(t 
 // doesn't care about event-mode wiring, matching newDetectionEventIngester's
 // doc comment) without panicking.
 func TestDetectionEventIngester_Handle_SkipsMarkEventWhenLookupNil(t *testing.T) {
-	ingester := newDetectionEventIngester(&fakeEventStore{}, nil, nil)
+	ingester := newDetectionEventIngester(&fakeEventStore{}, nil, nil, nil)
 	ingester.handle(sdk.DetectionEventStart, sdk.DetectionEvent{ID: "evt-1", CameraID: "cam1", StartTime: 1000})
 }
 
