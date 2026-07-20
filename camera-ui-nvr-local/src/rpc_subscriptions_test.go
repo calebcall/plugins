@@ -22,6 +22,7 @@ import (
 	"context"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/calebcall/plugins/camera-ui-nvr-local/src/recorder"
 )
@@ -134,6 +135,81 @@ func TestOnRecordingState_RecorderStartStopNotifiesSubscriber(t *testing.T) {
 	}
 	if got[2].CameraID != "cam-1" || got[2].State != "stopped" {
 		t.Fatalf("expected recorder stop to notify {cam-1 stopped}, got %+v", got[2])
+	}
+}
+
+// TestOnRecordingState_CallbackDoesNotDeadlockReenteringSameCameraLock is
+// the regression test for the lock-scope review fix: notifyState (and the
+// subscriber fan-out it triggers) must run AFTER RecorderManager releases
+// camLock(cameraID), never while still holding it. This subscribes with a
+// callback that, on seeing "recording", calls p.recorder.Remove for the
+// SAME camera ID from inside the callback — i.e. from the same goroutine
+// that is still unwinding out of RecorderManager's own start path. If
+// notifyState (or the code that calls it) were still holding
+// camLock("cam-1") at that point, Remove's own lock.Lock() call for the
+// same camera ID would self-deadlock forever, since sync.Mutex is not
+// reentrant and no other goroutine will ever unlock it. StartAll (which
+// triggers the notification synchronously) runs in its own goroutine so a
+// real deadlock hangs that goroutine instead of the test process, and a
+// timeout turns that hang into a normal test failure instead of an
+// unkillable `go test` run.
+func TestOnRecordingState_CallbackDoesNotDeadlockReenteringSameCameraLock(t *testing.T) {
+	p := newTestPlugin(t)
+	p.recorder.SetStateNotifier(p.onRecorderStateChange)
+	p.recorder.ConfigureRecording("/tmp/nvr-lockscope-test", 0, func(recorder.RecorderConfig) recorder.RecorderHandle {
+		return fakeSubscriptionHandle{}
+	})
+
+	var mu sync.Mutex
+	var removeErr error
+	var removeCalled bool
+	cleanup, err := p.OnRecordingState("cam-1", func(s RecordingState) {
+		if s.State != "recording" {
+			return
+		}
+		mu.Lock()
+		removeCalled = true
+		mu.Unlock()
+		// Re-enters RecorderManager for the SAME camera ID from inside the
+		// notification callback — the exact shape the lock-scope fix must
+		// tolerate.
+		err := p.recorder.Remove("cam-1")
+		mu.Lock()
+		removeErr = err
+		mu.Unlock()
+	})
+	if err != nil {
+		t.Fatalf("OnRecordingState: %v", err)
+	}
+	defer cleanup()
+
+	cam := newFakeManagedCamera("cam-1", "Front Door", "continuous")
+	if err := p.recorder.Add(cam); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = p.recorder.StartAll()
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("StartAll deadlocked: notifyState (or its caller) appears to still hold camLock while invoking subscriber callbacks")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !removeCalled {
+		t.Fatalf("expected the callback to observe a \"recording\" transition and call Remove")
+	}
+	if removeErr != nil {
+		t.Fatalf("Remove (called from within the notify callback): %v", removeErr)
+	}
+	if ids := p.recorder.ManagedCameraIDs(); len(ids) != 0 {
+		t.Fatalf("expected Remove (called from within the callback) to have taken effect, got %v", ids)
 	}
 }
 

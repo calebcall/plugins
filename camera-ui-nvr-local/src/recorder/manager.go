@@ -341,6 +341,11 @@ func (m *RecorderManager) Add(cam ManagedCamera) error {
 // startOrRestartRecorder does, so a Remove can never race a concurrent
 // Add/restart for the same camera into the handle-leak this file's review
 // fix closed (see camLocks's doc comment).
+//
+// notifyState (when stopRecorder reports it actually stopped something) is
+// called AFTER lock.Unlock() — same lock-scope reasoning as
+// startOrRestartRecorder: subscriber fan-out must never run while camLock is
+// held. See notifyState's doc comment.
 func (m *RecorderManager) Remove(cameraID string) error {
 	m.mu.Lock()
 	delete(m.recorders, cameraID)
@@ -348,8 +353,12 @@ func (m *RecorderManager) Remove(cameraID string) error {
 
 	lock := m.camLock(cameraID)
 	lock.Lock()
-	defer lock.Unlock()
-	m.stopRecorder(cameraID)
+	stopped := m.stopRecorder(cameraID)
+	lock.Unlock()
+
+	if stopped {
+		m.notifyState(cameraID, false)
+	}
 	return nil
 }
 
@@ -409,11 +418,23 @@ func (m *RecorderManager) SetStateNotifier(fn func(cameraID string, recording bo
 // notifyState invokes the configured stateNotify hook, if any, for
 // cameraID's start/stop transition. Deliberately reads the hook under m.mu
 // and then calls it OUTSIDE the lock: fn (production: a closure over the
-// parent plugin's subscriber registries) must never be called while m.mu is
-// held, since a subscriber callback or a concurrent RPC-goroutine
-// register/unregister could otherwise deadlock against this manager's own
-// lock — this mirrors logf/warnf's identical "copy the field under RLock,
-// call it unlocked" shape.
+// parent plugin's subscriber registries, plus a synchronous
+// SystemEventStore.Insert) must never be called while m.mu is held, since a
+// subscriber callback or a concurrent RPC-goroutine register/unregister
+// could otherwise deadlock against this manager's own lock — this mirrors
+// logf/warnf's identical "copy the field under RLock, call it unlocked"
+// shape.
+//
+// Just as importantly, EVERY caller of notifyState (startOrRestartRecorder,
+// Remove) must itself call this only AFTER releasing camLock(cameraID), not
+// while still holding it — subscriber fan-out and the DB write it can
+// trigger are unbounded work with no business running inside a lock whose
+// only job is to serialize one camera's stop→start sequence, and a
+// subscriber callback that re-enters RecorderManager for the SAME camera ID
+// (e.g. calling Remove from inside an OnRecordingState callback) would
+// self-deadlock against camLock's non-reentrant sync.Mutex if it were still
+// held here. See TestOnRecordingState_CallbackDoesNotDeadlockReenteringSameCameraLock
+// (rpc_subscriptions_test.go, package main) for the regression test.
 func (m *RecorderManager) notifyState(cameraID string, recording bool) {
 	m.mu.RLock()
 	fn := m.stateNotify
@@ -594,33 +615,59 @@ func (m *RecorderManager) syncRecording(entry RecorderEntry) error {
 // comment — so a concurrent call for a DIFFERENT camera ID, or an unrelated
 // read (ManagedCameraIDs, Camera, entriesSnapshot), is never blocked
 // waiting on this one's potentially-slow handle.Start/Stop.
+//
+// notifyState (Task SUBS's producer hook) is deliberately called AFTER
+// lock.Unlock(), not while camLock is still held — see notifyState's own
+// doc comment for why holding a per-camera lock across subscriber fan-out
+// (unbounded work, including a synchronous DB write) is a lock-scope bug
+// and a self-deadlock risk. stopRecorder/startRecorder below only report
+// WHETHER a transition happened (via their bool returns); this function is
+// solely responsible for turning those into notifyState calls, once the
+// lock is safely released.
 func (m *RecorderManager) startOrRestartRecorder(entry RecorderEntry) error {
 	lock := m.camLock(entry.CameraID)
 	lock.Lock()
-	defer lock.Unlock()
 
-	restarting := m.stopRecorder(entry.CameraID)
-	if entry.Config.Mode == RecordingModeOff {
-		return nil
+	stopped := m.stopRecorder(entry.CameraID)
+
+	var started bool
+	var err error
+	if entry.Config.Mode != RecordingModeOff {
+		if stopped {
+			m.logf("recorder: restarting camera %s (config changed)", entry.CameraID)
+		}
+		started, err = m.startRecorder(entry)
 	}
-	if restarting {
-		m.logf("recorder: restarting camera %s (config changed)", entry.CameraID)
+
+	lock.Unlock()
+
+	if stopped {
+		m.notifyState(entry.CameraID, false)
 	}
-	return m.startRecorder(entry)
+	if started {
+		m.notifyState(entry.CameraID, true)
+	}
+	return err
 }
 
 // startRecorder builds a RecorderConfig from entry (plus this manager's
 // configured dataDir/segmentSeconds), constructs a RecorderHandle via the
 // configured factory, starts it under the manager's root context, and — only
 // once Start has actually succeeded — records it in m.active so a later
-// stopRecorder/StopAll can find and stop it. A no-op, returning nil, if
-// recording hasn't been configured or the manager's root context doesn't
+// stopRecorder/StopAll can find and stop it. A no-op, returning (false, nil),
+// if recording hasn't been configured or the manager's root context doesn't
 // exist yet (StartAll hasn't run) — callers (StartAll, syncRecording, both
 // via startOrRestartRecorder) only reach this once both are true, but this
 // guard keeps startRecorder safe to call on its own too.
 //
+// Returns (started, err): started is true only when a handle was actually
+// built and Start succeeded — the caller (startOrRestartRecorder) uses this
+// to decide whether to notifyState(cameraID, true) once camLock is released,
+// rather than this method calling notifyState itself while still holding
+// it. See notifyState's doc comment for why that split matters.
+//
 // Callers must hold camLock(entry.CameraID) — see startOrRestartRecorder.
-func (m *RecorderManager) startRecorder(entry RecorderEntry) error {
+func (m *RecorderManager) startRecorder(entry RecorderEntry) (bool, error) {
 	m.mu.RLock()
 	factory := m.recorderFactory
 	dataDir := m.dataDir
@@ -628,7 +675,7 @@ func (m *RecorderManager) startRecorder(entry RecorderEntry) error {
 	ctx := m.rootCtx
 	m.mu.RUnlock()
 	if factory == nil || ctx == nil {
-		return nil
+		return false, nil
 	}
 
 	roles := resolveRoles(entry.Config.Roles, entry.SourceRoles)
@@ -647,7 +694,7 @@ func (m *RecorderManager) startRecorder(entry RecorderEntry) error {
 	handle := factory(cfg)
 	if err := handle.Start(ctx); err != nil {
 		m.warnf("recorder: camera %s: start failed: %v", entry.CameraID, err)
-		return fmt.Errorf("start recorder: %w", err)
+		return false, fmt.Errorf("start recorder: %w", err)
 	}
 
 	m.mu.Lock()
@@ -658,8 +705,7 @@ func (m *RecorderManager) startRecorder(entry RecorderEntry) error {
 	m.mu.Unlock()
 
 	m.logf("recorder: started camera %s (mode=%s roles=%v)", entry.CameraID, entry.Config.Mode, roles)
-	m.notifyState(entry.CameraID, true)
-	return nil
+	return true, nil
 }
 
 // resolveRoles narrows configured (entry.Config.Roles — the camera's
@@ -711,8 +757,22 @@ func resolveRoles(configured, available []string) []string {
 // stopRecorder stops and deregisters cameraID's currently active Recorder,
 // if any, and reports whether there was one to stop (so
 // startOrRestartRecorder can tell a genuine restart from a first start for
-// its log line). A no-op — returning false — for a camera with none (never
-// started, already stopped, or mode "off").
+// its log line, AND — since this method deliberately does NOT call
+// notifyState itself, see below — whether its caller owes a
+// notifyState(cameraID, false) once camLock is released). A no-op —
+// returning false — for a camera with none (never started, already
+// stopped, or mode "off").
+//
+// Deliberately does not call notifyState: every caller (startOrRestartRecorder,
+// Remove) holds camLock(cameraID) across this call, and notifyState fans out
+// to subscriber callbacks (plus a synchronous SystemEventStore.Insert) —
+// unbounded work that must never run while camLock is held (see notifyState's
+// doc comment for the self-deadlock risk this avoids: a callback re-entering
+// RecorderManager for the SAME camera ID, e.g. calling Remove from inside an
+// OnRecordingState subscriber, would otherwise deadlock against this
+// non-reentrant per-camera lock). Callers are responsible for calling
+// notifyState(cameraID, false) themselves, after releasing camLock, when this
+// returns true.
 //
 // Callers must hold camLock(cameraID) — see startOrRestartRecorder; Remove
 // (the other caller) takes it directly itself.
@@ -729,7 +789,6 @@ func (m *RecorderManager) stopRecorder(cameraID string) bool {
 	}
 	_ = handle.Stop()
 	m.logf("recorder: stopped camera %s", cameraID)
-	m.notifyState(cameraID, false)
 	return true
 }
 

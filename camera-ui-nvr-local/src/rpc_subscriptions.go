@@ -101,6 +101,14 @@ func (p *NVRPlugin) OnSystemEvent(cb func(SystemEvent)) (func(), error) {
 // receive or act on an error (RecorderManager.notifyState never returns
 // one), the same tolerance p.Logger's other fire-and-forget call sites in
 // this package already have.
+//
+// Called by RecorderManager AFTER it has released camLock(cameraID) — see
+// recorder.RecorderManager.notifyState's doc comment — so this method, and
+// everything it does (subscriber fan-out, the SystemEventStore.Insert
+// below), never runs while that per-camera lock is held. It is therefore
+// safe for a subscriber callback registered via OnRecordingState/
+// OnSystemEvent to call back into RecorderManager for the SAME camera ID
+// (e.g. Remove) without deadlocking.
 func (p *NVRPlugin) onRecorderStateChange(cameraID string, recording bool) {
 	state := "stopped"
 	eventType := "recorder_stopped"
@@ -120,10 +128,25 @@ func (p *NVRPlugin) onRecorderStateChange(cameraID string, recording bool) {
 		Timestamp: ts,
 		Message:   fmt.Sprintf("Recording %s for camera %s", state, cameraID),
 	}
+	// Persist first, emit live only on success. Otherwise a failed insert
+	// would still reach every live onSystemEvent subscriber while
+	// getSystemEvents' persisted backlog never gets the event at all,
+	// silently diverging the live feed from the historical record.
+	// p.systemEvents == nil (no store configured — unit tests that
+	// construct NVRPlugin directly, or a failed store.Open in NewPlugin)
+	// is deliberately NOT treated as a persistence failure: there is no
+	// backlog for the live feed to diverge from in that case, so it still
+	// emits.
+	persisted := true
 	if p.systemEvents != nil {
-		if err := p.systemEvents.Insert([]SystemEvent{ev}); err != nil && p.Logger != nil {
-			p.Logger.Warn("nvr-local: insert system event failed:", err)
+		if err := p.systemEvents.Insert([]SystemEvent{ev}); err != nil {
+			persisted = false
+			if p.Logger != nil {
+				p.Logger.Warn("nvr-local: insert system event failed:", err)
+			}
 		}
 	}
-	p.systemEventSubs.emit(ev)
+	if persisted {
+		p.systemEventSubs.emit(ev)
+	}
 }
