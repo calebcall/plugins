@@ -185,6 +185,17 @@ type NVRPlugin struct {
 	// ready to use (an always-empty registry) — see recorderRegistry's doc
 	// comment for why nothing populates it yet.
 	recorders recorderRegistry
+
+	// scrubber backs NvrScrub/NvrPreviewFrames (rpc_playback.go, Task
+	// SCRUB): extracts single Annex-B H.264 keyframes and evenly-spaced
+	// filmstrips of them from recorded segments, via a *media.Scrubber
+	// built from p.segments and the same resolved ffmpeg every recorder/
+	// the thumbnail Generator already exec (see NewPlugin). nil whenever
+	// db is nil (same guard as events/segments/thumbs above) and in unit
+	// tests that construct NVRPlugin directly rather than through
+	// NewPlugin — both handlers treat a nil scrubber as "no data" rather
+	// than panicking or erroring.
+	scrubber scrubber
 }
 
 // Compile-time assertions that NVRPlugin implements the optional SDK
@@ -212,6 +223,12 @@ func (p *NVRPlugin) RPCMethods() []string {
 		"getStorageStats",
 		"getEventThumbnails",
 		"getDetectionHeatmap",
+		// Playback frame path, phase 1 (Task SCRUB): a single scrub
+		// keyframe and a filmstrip preview — see rpc_playback.go.
+		// nvrPlayback/nvrPlaybackCmd (streaming playback) are a later
+		// task's scope and deliberately not listed here yet.
+		"nvrScrub",
+		"nvrPreviewFrames",
 	}
 }
 
@@ -381,6 +398,15 @@ func NewPlugin(logger *sdk.Logger, api *sdk.PluginAPI, storage *sdk.DeviceStorag
 		// ffmpeg binary every recorder execs — this Generator never resolves
 		// its own path (see media/thumbs.go's package doc comment).
 		p.thumbs = media.NewGenerator(api.StoragePath, ff.Path(), p.segments, p.events, p.Logger)
+
+		// Wires NvrScrub/NvrPreviewFrames (rpc_playback.go, Task SCRUB):
+		// same p.segments (via CoveringSegmentForRole) and resolved
+		// ffmpeg binary as p.thumbs above, since scrub/preview frame
+		// extraction is the same "look up the covering segment, exec
+		// ffmpeg against it" shape as thumbnail generation, just with a
+		// different ffmpeg invocation and output format (Annex-B H.264
+		// straight off stdout, not a JPEG written to disk).
+		p.scrubber = media.NewScrubber(ff.Path(), p.segments, p.Logger)
 
 		// Wires StartAll/Add/Remove (Task ORCH, recorder/manager.go) with
 		// what they need to actually build and start a live *recorder.

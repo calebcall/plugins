@@ -217,6 +217,68 @@ func (s *SegmentStore) CoveringSegment(cameraID string, atMs int64) (Segment, bo
 	return seg, true, nil
 }
 
+// CoveringSegmentForRole returns the single indexed segment for
+// cameraID/role that covers atMs (start_ms <= atMs AND end_ms >= atMs),
+// picking the most recently started one when more than one row happens to
+// match (mirrors CoveringSegment's own tie-break). Unlike CoveringSegment
+// (used by the Task-11 thumbnail generator, which doesn't care which
+// role's footage it draws from) this is scoped to exactly one role — the
+// scrub/preview-frame RPCs (src/media/scrub.go) need the specific role the
+// frontend asked for (sourceRole, defaulting to "high-resolution"), not
+// whichever role happens to rank highest. ok is false, with no error, when
+// nothing covers atMs for that role — an expected condition (before
+// recording started, or a still-open segment not yet finalized/indexed),
+// not an error.
+func (s *SegmentStore) CoveringSegmentForRole(cameraID, role string, atMs int64) (Segment, bool, error) {
+	s.db.Lock()
+	defer s.db.Unlock()
+
+	stmt, _, err := s.db.Conn().Prepare(`
+		SELECT id, camera_id, role, path, start_ms, end_ms, has_video, has_audio, codec, referenced
+		FROM segments
+		WHERE camera_id = ? AND role = ? AND start_ms <= ? AND end_ms >= ?
+		ORDER BY start_ms DESC
+		LIMIT 1`)
+	if err != nil {
+		return Segment{}, false, fmt.Errorf("store: prepare covering segment for role: %w", err)
+	}
+	defer stmt.Close()
+
+	if err := stmt.BindText(1, cameraID); err != nil {
+		return Segment{}, false, err
+	}
+	if err := stmt.BindText(2, role); err != nil {
+		return Segment{}, false, err
+	}
+	if err := stmt.BindInt64(3, atMs); err != nil {
+		return Segment{}, false, err
+	}
+	if err := stmt.BindInt64(4, atMs); err != nil {
+		return Segment{}, false, err
+	}
+
+	if !stmt.Step() {
+		if err := stmt.Err(); err != nil {
+			return Segment{}, false, fmt.Errorf("store: scan covering segment for role: %w", err)
+		}
+		return Segment{}, false, nil
+	}
+
+	seg := Segment{
+		ID:         stmt.ColumnInt64(0),
+		CameraID:   stmt.ColumnText(1),
+		Role:       stmt.ColumnText(2),
+		Path:       stmt.ColumnText(3),
+		StartMs:    stmt.ColumnInt64(4),
+		EndMs:      stmt.ColumnInt64(5),
+		HasVideo:   stmt.ColumnBool(6),
+		HasAudio:   stmt.ColumnBool(7),
+		Codec:      stmt.ColumnText(8),
+		Referenced: stmt.ColumnBool(9),
+	}
+	return seg, true, nil
+}
+
 // Days returns the distinct calendar days, as "YYYY-MM-DD" strings sorted
 // ascending, on which cameraID has at least one recorded segment starting
 // within the given year/month. Days are derived from start_ms interpreted

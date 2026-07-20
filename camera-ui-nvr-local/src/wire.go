@@ -112,3 +112,50 @@ type DetectionHeatmapResult struct {
 	Points []HeatmapPoint `msgpack:"points" json:"points"`
 	Count  int            `msgpack:"count" json:"count"`
 }
+
+// NvrScrubFrame mirrors the frontend's NvrScrubFrame: one Annex-B H.264
+// access unit plus its playback timestamp (microseconds) and whether it's a
+// keyframe. Used both as NvrScrubResult's optional multi-frame window
+// (unused in this task's v1 — see NvrScrub, rpc_playback.go) and as
+// NvrPreviewResult's filmstrip entries (always Keyframe: true — every
+// preview sample is independently extracted as a keyframe, see
+// media.Scrubber.PreviewFrames).
+type NvrScrubFrame struct {
+	Frame    []byte `msgpack:"frame" json:"frame"`
+	Ts       int64  `msgpack:"ts" json:"ts"`
+	Keyframe bool   `msgpack:"keyframe" json:"keyframe"`
+}
+
+// NvrScrubResult mirrors the frontend's NvrScrubResult: NvrScrub's
+// (rpc_playback.go) result. Frame is the single extracted Annex-B keyframe
+// (nil/omitted when NoData); Ts echoes back the requested tsUs unchanged
+// (the frontend's own request timestamp, not necessarily the exact
+// keyframe timestamp — this task's v1 doesn't re-derive it, matching the
+// brief's "returning the single primary frame is fine for v1" guidance for
+// Frames/fine). NoData is a pointer (not a bare bool) so its absence
+// (false, the common case) doesn't have to round-trip over the wire at
+// all — matching the wire contract's `noData?: boolean`.
+type NvrScrubResult struct {
+	Frame       []byte          `msgpack:"frame,omitempty" json:"frame,omitempty"`
+	Ts          int64           `msgpack:"ts" json:"ts"`
+	VideoCodec  string          `msgpack:"videoCodec" json:"videoCodec"`
+	NoData      *bool           `msgpack:"noData,omitempty" json:"noData,omitempty"`
+	CodecString string          `msgpack:"codecString,omitempty" json:"codecString,omitempty"`
+	Width       int             `msgpack:"width,omitempty" json:"width,omitempty"`
+	Height      int             `msgpack:"height,omitempty" json:"height,omitempty"`
+	Frames      []NvrScrubFrame `msgpack:"frames,omitempty" json:"frames,omitempty"`
+}
+
+// NvrPreviewResult mirrors the frontend's NvrPreviewResult:
+// NvrPreviewFrames' (rpc_playback.go) result — a filmstrip of
+// evenly-spaced keyframes across a requested range plus their shared codec
+// metadata (see media.PreviewResult's doc comment for why codecString/
+// width/height are reported once, not per-frame).
+type NvrPreviewResult struct {
+	Frames      []NvrScrubFrame `msgpack:"frames" json:"frames"`
+	VideoCodec  string          `msgpack:"videoCodec" json:"videoCodec"`
+	CodecString string          `msgpack:"codecString,omitempty" json:"codecString,omitempty"`
+	Width       int             `msgpack:"width,omitempty" json:"width,omitempty"`
+	Height      int             `msgpack:"height,omitempty" json:"height,omitempty"`
+	NoData      *bool           `msgpack:"noData,omitempty" json:"noData,omitempty"`
+}

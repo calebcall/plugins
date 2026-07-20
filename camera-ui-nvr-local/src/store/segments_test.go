@@ -136,6 +136,56 @@ func TestSegmentStore_InRange_FiltersByCameraAndRole(t *testing.T) {
 	}
 }
 
+// TestSegmentStore_CoveringSegmentForRole proves CoveringSegmentForRole
+// scopes its lookup to exactly the requested role (unlike CoveringSegment,
+// which ranks across every role) and reports ok=false, with no error, when
+// nothing covers the timestamp for that role.
+func TestSegmentStore_CoveringSegmentForRole(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	segs := NewSegmentStore(db)
+
+	for _, seg := range []Segment{
+		{CameraID: "cam1", Role: "high-resolution", Path: "/rec/high.mp4", StartMs: 1000, EndMs: 2000},
+		{CameraID: "cam1", Role: "low-resolution", Path: "/rec/low.mp4", StartMs: 1000, EndMs: 2000},
+	} {
+		if _, err := segs.Add(seg); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, ok, err := segs.CoveringSegmentForRole("cam1", "high-resolution", 1500)
+	if err != nil {
+		t.Fatalf("CoveringSegmentForRole: %v", err)
+	}
+	if !ok {
+		t.Fatalf("expected a covering high-resolution segment")
+	}
+	if got.Path != "/rec/high.mp4" {
+		t.Errorf("expected the high-resolution segment, got %+v", got)
+	}
+
+	got, ok, err = segs.CoveringSegmentForRole("cam1", "mid-resolution", 1500)
+	if err != nil {
+		t.Fatalf("CoveringSegmentForRole: %v", err)
+	}
+	if ok {
+		t.Fatalf("expected no covering mid-resolution segment, got %+v", got)
+	}
+
+	_, ok, err = segs.CoveringSegmentForRole("cam1", "high-resolution", 5000)
+	if err != nil {
+		t.Fatalf("CoveringSegmentForRole: %v", err)
+	}
+	if ok {
+		t.Fatalf("expected no covering segment for an out-of-range timestamp")
+	}
+}
+
 // dayMs returns the UTC start-of-day-ish epoch millisecond timestamp for a
 // given date, used to seed segments for TestSegmentStore_Days.
 func dayMs(year, month, day int) int64 {
