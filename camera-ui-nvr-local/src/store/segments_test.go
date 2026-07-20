@@ -263,3 +263,42 @@ func TestSegmentStore_AllByCamera(t *testing.T) {
 		t.Fatalf("expected oldest-first [a,b,c] across roles, got [%s,%s,%s]", got[0].Path, got[1].Path, got[2].Path)
 	}
 }
+
+// TestSegmentStore_DistinctCameraIDs proves DistinctCameraIDs returns every
+// camera with at least one indexed segment, deduplicated and sorted, and an
+// empty (non-nil) slice for a store with no segments at all.
+func TestSegmentStore_DistinctCameraIDs(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	segs := NewSegmentStore(db)
+
+	empty, err := segs.DistinctCameraIDs()
+	if err != nil {
+		t.Fatalf("DistinctCameraIDs (empty store): %v", err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("expected 0 camera ids on an empty store, got %v", empty)
+	}
+
+	for _, seg := range []Segment{
+		{CameraID: "cam2", Role: "main", Path: "/rec/a.mp4", StartMs: 1000, EndMs: 2000},
+		{CameraID: "cam1", Role: "main", Path: "/rec/b.mp4", StartMs: 3000, EndMs: 4000},
+		{CameraID: "cam2", Role: "sub", Path: "/rec/c.mp4", StartMs: 5000, EndMs: 6000},
+	} {
+		if _, err := segs.Add(seg); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ids, err := segs.DistinctCameraIDs()
+	if err != nil {
+		t.Fatalf("DistinctCameraIDs: %v", err)
+	}
+	if len(ids) != 2 || ids[0] != "cam1" || ids[1] != "cam2" {
+		t.Fatalf("expected deduplicated sorted [cam1, cam2], got %v", ids)
+	}
+}

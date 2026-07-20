@@ -109,6 +109,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 
 	sdk "github.com/cameraui/sdk/go"
@@ -156,6 +157,14 @@ type NVRPlugin struct {
 	// p.recorder.ConfigureRetention below). nil whenever db is nil.
 	segments *store.SegmentStore
 
+	// systemEvents is the SystemEventStore backing the getSystemEvents RPC
+	// handler (rpc_events.go). nil whenever db is nil. Nothing in this
+	// plugin currently calls SystemEventStore.Insert — see that type's doc
+	// comment (src/store/system_events.go) for the producer-side gap this
+	// leaves getSystemEvents with today (it can only ever return an empty
+	// result until a later task wires a producer).
+	systemEvents *store.SystemEventStore
+
 	// detectionSubs tracks the per-camera sdk.Disposable returned by
 	// CameraDevice.OnDetectionEvent so OnCameraReleased can unsubscribe
 	// exactly the released camera (see events_ingest.go).
@@ -178,7 +187,59 @@ var _ sdk.StorageSchemaProvider = (*NVRPlugin)(nil)
 // tasks add RPC-visible methods; every entry must be the camelCase wire name,
 // not the Go method name.
 func (p *NVRPlugin) RPCMethods() []string {
-	return []string{"getManagedCameraIds", "getInstanceId"}
+	return []string{
+		"getManagedCameraIds",
+		"getInstanceId",
+		// Read-path methods (this task): every one of these is backed by an
+		// EventStore/SegmentStore/SystemEventStore query or a disk-stats
+		// read — no writes, no subscriptions. See rpc_events.go and
+		// rpc_recording.go for each handler, and logRPC (below) for the
+		// per-call debug logging every one of them starts with.
+		"getEvents",
+		"getCameraEvents",
+		"getRecordingDays",
+		"getRecordingSegments",
+		"getSystemEvents",
+		"getStorageStats",
+		"getEventThumbnails",
+		"getDetectionHeatmap",
+	}
+}
+
+// logRPC logs one incoming child RPC call at debug level: the wire method
+// name plus a short, non-sensitive arg summary (camera ids, event ids, ...),
+// NEVER full payloads (thumbnail bytes, detection segments, event lists) —
+// so an operator can `tail -f camera.ui.log | grep nvr-local` and see which
+// RPC methods the frontend is actually calling, and with what scope,
+// without leaking payload contents into the log stream.
+//
+// This plugin's RPC methods are plain exported Go methods dispatched by
+// github.com/cameraui/rpc/go's ExtractMethods/RPCMethodAllowlist (see the
+// casing findings at the top of this file) — that package has no
+// middleware/interceptor hook a caller can install around every dispatched
+// call (confirmed by reading handler.go/service.go/client.go in
+// rpc/go@v1.0.6: dispatch goes straight from the NATS subject to
+// reflect.Value.Call with no hook point in between), so per-call logging is
+// added here instead, as a one-line call at the top of every read-path
+// handler (rpc_events.go, rpc_recording.go) — the "small helper each handler
+// calls at entry" alternative the task brief anticipated for exactly this
+// case.
+//
+// p.Logger is nil in unit tests that construct NVRPlugin directly (see
+// newTestPlugin in plugin_rpc_test.go) rather than through NewPlugin/
+// sdk.Run; this guards against that the same way every other p.Logger call
+// site in this package already does, because sdk.Logger.Debug would
+// nil-pointer-panic on a nil *Logger (it reads l.debugEnabled before
+// deciding whether to write — see logger.go).
+func (p *NVRPlugin) logRPC(method string, args ...string) {
+	if p.Logger == nil {
+		return
+	}
+	if len(args) == 0 {
+		p.Logger.Debug("nvr-local: rpc", method)
+		return
+	}
+	p.Logger.Debug("nvr-local: rpc", method, strings.Join(args, " "))
 }
 
 // nvrQuotaGBStorageKey is the plugin (instance-level, not per-camera)
@@ -270,6 +331,7 @@ func NewPlugin(logger *sdk.Logger, api *sdk.PluginAPI, storage *sdk.DeviceStorag
 		p.db = db
 		p.events = store.NewEventStore(db)
 		p.segments = store.NewSegmentStore(db)
+		p.systemEvents = store.NewSystemEventStore(db)
 		// Wires RunRetentionOnce/the background ticker (Task 9,
 		// recorder/retention.go) with the stores it needs to actually delete
 		// anything; p.nvrQuotaGB is the instance-wide disk cap getter (read

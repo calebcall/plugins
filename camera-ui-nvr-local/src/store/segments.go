@@ -457,6 +457,34 @@ func (s *SegmentStore) pathsByIDs(ids []int64) ([]string, error) {
 	return paths, nil
 }
 
+// DistinctCameraIDs returns every camera ID that has at least one indexed
+// segment row, sorted ascending. Used by the getStorageStats RPC handler
+// (rpc_recording.go) to decide which cameras to build a CameraStorageStats
+// entry for — driven by what has actually been recorded to disk, rather
+// than by which cameras are currently assigned/managed, so a camera
+// reassigned away from this Hub (or switched to recordingMode "off") still
+// gets its historical usage reported instead of silently disappearing from
+// the storage breakdown.
+func (s *SegmentStore) DistinctCameraIDs() ([]string, error) {
+	s.db.Lock()
+	defer s.db.Unlock()
+
+	stmt, _, err := s.db.Conn().Prepare(`SELECT DISTINCT camera_id FROM segments ORDER BY camera_id ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("store: prepare distinct camera ids: %w", err)
+	}
+	defer stmt.Close()
+
+	var ids []string
+	for stmt.Step() {
+		ids = append(ids, stmt.ColumnText(0))
+	}
+	if err := stmt.Err(); err != nil {
+		return nil, fmt.Errorf("store: scan distinct camera ids: %w", err)
+	}
+	return ids, nil
+}
+
 // pathsOlderThan returns the paths of the segments matching the same
 // predicate used by DeleteOlderThan's DELETE, so the two stay in sync.
 // Internal helper only called from DeleteOlderThan, which already holds
