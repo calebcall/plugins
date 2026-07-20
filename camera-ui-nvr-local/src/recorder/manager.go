@@ -259,6 +259,18 @@ type RecorderManager struct {
 	// skips every log call rather than panicking, the same nil-logger
 	// tolerance recorder.go's Recorder.logf already established.
 	log *sdk.Logger
+
+	// stateNotify, if set (via SetStateNotifier), is invoked every time a
+	// managed camera's live Recorder actually starts or stops — i.e. from
+	// the exact same two call sites as the "recorder: started/stopped
+	// camera ..." logf lines below, not from Config.Mode alone. nil (the
+	// zero value, matching every test that doesn't call SetStateNotifier)
+	// silently skips notification, the same optional-hook convention log
+	// already established. Production wiring (plugin.go's NewPlugin) sets
+	// this to a closure that fans the transition out to this plugin's
+	// OnRecordingState subscribers (and, as a minimal SystemEvent
+	// producer, its OnSystemEvent subscribers too).
+	stateNotify func(cameraID string, recording bool)
 }
 
 // NewRecorderManager returns an empty manager. Recording config lives on
@@ -383,6 +395,46 @@ func (m *RecorderManager) SetLogger(log *sdk.Logger) {
 	m.mu.Lock()
 	m.log = log
 	m.mu.Unlock()
+}
+
+// SetStateNotifier wires fn as this manager's recording-lifecycle
+// notification hook — see stateNotify's doc comment. Safe to call at any
+// time; production wiring (plugin.go) calls it once, alongside SetLogger.
+func (m *RecorderManager) SetStateNotifier(fn func(cameraID string, recording bool)) {
+	m.mu.Lock()
+	m.stateNotify = fn
+	m.mu.Unlock()
+}
+
+// notifyState invokes the configured stateNotify hook, if any, for
+// cameraID's start/stop transition. Deliberately reads the hook under m.mu
+// and then calls it OUTSIDE the lock: fn (production: a closure over the
+// parent plugin's subscriber registries) must never be called while m.mu is
+// held, since a subscriber callback or a concurrent RPC-goroutine
+// register/unregister could otherwise deadlock against this manager's own
+// lock — this mirrors logf/warnf's identical "copy the field under RLock,
+// call it unlocked" shape.
+func (m *RecorderManager) notifyState(cameraID string, recording bool) {
+	m.mu.RLock()
+	fn := m.stateNotify
+	m.mu.RUnlock()
+	if fn != nil {
+		fn(cameraID, recording)
+	}
+}
+
+// IsActive reports whether cameraID currently has a live, started
+// RecorderHandle tracked in m.active — i.e. whether it is actually
+// recording right now, as opposed to merely being configured with a
+// non-off RecordingMode (see rpc_recording.go's own IsRecording
+// approximation, which intentionally uses the cheaper Config.Mode check
+// instead — this method is for OnRecordingState's "current state on
+// subscribe" emit, which needs the real answer).
+func (m *RecorderManager) IsActive(cameraID string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	_, ok := m.active[cameraID]
+	return ok
 }
 
 func (m *RecorderManager) logf(format string, args ...any) {
@@ -606,6 +658,7 @@ func (m *RecorderManager) startRecorder(entry RecorderEntry) error {
 	m.mu.Unlock()
 
 	m.logf("recorder: started camera %s (mode=%s roles=%v)", entry.CameraID, entry.Config.Mode, roles)
+	m.notifyState(entry.CameraID, true)
 	return nil
 }
 
@@ -676,6 +729,7 @@ func (m *RecorderManager) stopRecorder(cameraID string) bool {
 	}
 	_ = handle.Stop()
 	m.logf("recorder: stopped camera %s", cameraID)
+	m.notifyState(cameraID, false)
 	return true
 }
 

@@ -113,6 +113,22 @@ type DetectionHeatmapResult struct {
 	Count  int            `msgpack:"count" json:"count"`
 }
 
+// RecordingState mirrors the frontend's RecordingState (declared
+// unexported in the .d.ts as RecordingState_2, re-exported under the
+// RecordingState name): a single recording lifecycle transition for one
+// camera. Published by OnRecordingState (rpc_subscriptions.go) to that
+// method's callback subscribers whenever RecorderManager's stateNotify
+// hook fires (see onRecorderStateChange, plugin.go, wired via
+// recorder.RecorderManager.SetStateNotifier) — and once immediately on
+// subscribe, with the camera's current state, so a client subscribing to
+// an already-running (or already-stopped) camera doesn't have to wait for
+// the next transition to initialize its UI.
+type RecordingState struct {
+	CameraID  string `msgpack:"cameraId" json:"cameraId"`
+	State     string `msgpack:"state" json:"state"`
+	Timestamp int64  `msgpack:"timestamp" json:"timestamp"`
+}
+
 // NvrScrubFrame mirrors the frontend's NvrScrubFrame: one Annex-B H.264
 // access unit plus its playback timestamp (microseconds) and whether it's a
 // keyframe. Used both as NvrScrubResult's optional multi-frame window

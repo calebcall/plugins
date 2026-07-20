@@ -196,6 +196,18 @@ type NVRPlugin struct {
 	// NewPlugin — both handlers treat a nil scrubber as "no data" rather
 	// than panicking or erroring.
 	scrubber scrubber
+
+	// recordingStateSubs and systemEventSubs back OnRecordingState/
+	// OnSystemEvent (rpc_subscriptions.go, Task SUBS): the two callback
+	// subscription RPC methods the closed frontend's CameraTimeline calls
+	// but this plugin never implemented (hence the browser-side
+	// `... is not a function` TypeErrors this task fixes). Both zero
+	// values are immediately usable — see subscriptions.go — so no
+	// construction is needed here or in NewPlugin. onRecorderStateChange
+	// (rpc_subscriptions.go), wired below via
+	// p.recorder.SetStateNotifier, is what actually calls emit on these.
+	recordingStateSubs recordingStateSubscribers
+	systemEventSubs    systemEventSubscribers
 }
 
 // Compile-time assertions that NVRPlugin implements the optional SDK
@@ -229,6 +241,14 @@ func (p *NVRPlugin) RPCMethods() []string {
 		// task's scope and deliberately not listed here yet.
 		"nvrScrub",
 		"nvrPreviewFrames",
+		// Callback subscriptions (this task): rpc/go's ExtractMethods
+		// detects these as subscriptions by their func(T) parameter, not
+		// by anything in this list — but without an entry here they are
+		// never registered on the wire at all (RPCMethodAllowlist), which
+		// is exactly why the frontend previously saw them as undefined.
+		// See rpc_subscriptions.go.
+		"onRecordingState",
+		"onSystemEvent",
 	}
 }
 
@@ -429,6 +449,12 @@ func NewPlugin(logger *sdk.Logger, api *sdk.PluginAPI, storage *sdk.DeviceStorag
 		// lifecycle events rather than recording running with no
 		// visibility at all.
 		p.recorder.SetLogger(p.Logger)
+		// Wires OnRecordingState/OnSystemEvent's producer side
+		// (rpc_subscriptions.go, Task SUBS): every recorder start/stop
+		// startRecorder/stopRecorder (manager.go) reports through
+		// notifyState now fans out to this plugin's own subscriber
+		// registries via onRecorderStateChange.
+		p.recorder.SetStateNotifier(p.onRecorderStateChange)
 	}
 
 	api.On(string(sdk.APIEventFinishLaunching), func(...any) {
