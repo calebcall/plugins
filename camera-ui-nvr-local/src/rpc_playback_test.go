@@ -220,3 +220,84 @@ func TestNvrPreviewFrames_ScrubberError_Propagates(t *testing.T) {
 		t.Fatalf("expected error to propagate, got %v", err)
 	}
 }
+
+// --- nvrPlayback / nvrPlaybackCmd -------------------------------------------
+//
+// NvrPlayback itself can't be called directly from a unit test:
+// handlePullCallbackRequestGo (github.com/cameraui/rpc/go@v1.0.6/
+// handler_pull_callback.go) requires its last parameter to be exactly
+// *rpc.CallbackInvoker by reflection (AssignableTo), and every field on
+// that type is unexported with no public constructor outside package rpc
+// itself — so no test in this package can construct one to pass in. This
+// is exactly the "live framework stream wiring can't be fully unit
+// tested" gap the task brief anticipates; playback_session_test.go covers
+// playbackSession.run (the actual session/emit logic NvrPlayback's
+// goroutine drives) against a fake playbackEmitter matching the pinned
+// mechanism instead. What IS unit-testable here, and covered below, is
+// NvrPlaybackCmd (an ordinary request/response method, no
+// *rpc.CallbackInvoker involved) and RPCMethods' allow-listing of both
+// wire names.
+
+// TestNvrPlaybackCmd_UnknownSession_IsNoOp proves a sessionID with no
+// currently-registered session (already ended, or never existed) returns
+// nil rather than an error — see playbackSessionRegistry.get's doc
+// comment on why that race is expected.
+func TestNvrPlaybackCmd_UnknownSession_IsNoOp(t *testing.T) {
+	p := newTestPlugin(t)
+
+	if err := p.NvrPlaybackCmd("no-such-session", NvrPlaybackCommand{Cmd: "pause"}); err != nil {
+		t.Fatalf("expected nil error for an unknown session, got %v", err)
+	}
+}
+
+// TestNvrPlaybackCmd_RoutesPauseResumeSpeedToTheRegisteredSession proves
+// nvrPlaybackCmd looks the session up by sessionID in p.playbackSessions
+// and calls the matching Pause/Resume/SetSpeed method on it.
+func TestNvrPlaybackCmd_RoutesPauseResumeSpeedToTheRegisteredSession(t *testing.T) {
+	p := newTestPlugin(t)
+	sess := newPlaybackSession("sess-1")
+	p.playbackSessions.add(sess)
+
+	if err := p.NvrPlaybackCmd("sess-1", NvrPlaybackCommand{Cmd: "pause"}); err != nil {
+		t.Fatalf("pause: unexpected error: %v", err)
+	}
+	if paused, _, _ := sess.snapshot(); !paused {
+		t.Fatalf("expected pause to reach the session")
+	}
+
+	if err := p.NvrPlaybackCmd("sess-1", NvrPlaybackCommand{Cmd: "resume"}); err != nil {
+		t.Fatalf("resume: unexpected error: %v", err)
+	}
+	if paused, _, _ := sess.snapshot(); paused {
+		t.Fatalf("expected resume to reach the session")
+	}
+
+	if err := p.NvrPlaybackCmd("sess-1", NvrPlaybackCommand{Cmd: "speed", Speed: 2.5}); err != nil {
+		t.Fatalf("speed: unexpected error: %v", err)
+	}
+	if _, _, speed := sess.snapshot(); speed != 2.5 {
+		t.Fatalf("expected speed=2.5 to reach the session, got %v", speed)
+	}
+}
+
+// TestNvrPlayback_RPCMethodsAllowsBothPlaybackMethods proves RPCMethods()
+// lists both nvrPlayback and nvrPlaybackCmd — without an entry here
+// neither is ever registered on the wire (RPCMethodAllowlist, see
+// plugin.go), no matter what shape rpc.ExtractMethods detects.
+func TestNvrPlayback_RPCMethodsAllowsBothPlaybackMethods(t *testing.T) {
+	p := newTestPlugin(t)
+	allowed := p.RPCMethods()
+
+	for _, want := range []string{"nvrPlayback", "nvrPlaybackCmd"} {
+		found := false
+		for _, name := range allowed {
+			if name == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected RPCMethods() to include %q, got %v", want, allowed)
+		}
+	}
+}

@@ -197,6 +197,25 @@ type NVRPlugin struct {
 	// than panicking or erroring.
 	scrubber scrubber
 
+	// player backs NvrPlayback (rpc_playback.go, Task PLAYBACK): streams
+	// Annex-B H.264 access units from an arbitrary timestamp forward,
+	// rolling segment to segment, via a *media.Player built from the same
+	// p.segments and resolved ffmpeg as p.scrubber above — streaming
+	// playback is scrub's own "look up the covering segment, exec ffmpeg
+	// against it" shape, just draining a segment's entire remainder
+	// instead of a single keyframe. nil whenever db is nil (same guard as
+	// scrubber/events/segments/thumbs above) and in unit tests that
+	// construct NVRPlugin directly rather than through NewPlugin —
+	// NvrPlayback treats a nil player as "no data" (onNoData) rather than
+	// panicking, the same contract p.scrubber == nil gets from NvrScrub.
+	player playbackSource
+
+	// playbackSessions is the sessionID -> *playbackSession registry
+	// nvrPlaybackCmd (rpc_playback.go) looks up to pause/resume/adjust the
+	// speed of a live NvrPlayback session. Zero value is immediately
+	// usable — see playback_sessions.go.
+	playbackSessions playbackSessionRegistry
+
 	// recordingStateSubs and systemEventSubs back OnRecordingState/
 	// OnSystemEvent (rpc_subscriptions.go, Task SUBS): the two callback
 	// subscription RPC methods the closed frontend's CameraTimeline calls
@@ -237,10 +256,19 @@ func (p *NVRPlugin) RPCMethods() []string {
 		"getDetectionHeatmap",
 		// Playback frame path, phase 1 (Task SCRUB): a single scrub
 		// keyframe and a filmstrip preview — see rpc_playback.go.
-		// nvrPlayback/nvrPlaybackCmd (streaming playback) are a later
-		// task's scope and deliberately not listed here yet.
 		"nvrScrub",
 		"nvrPreviewFrames",
+		// Streaming playback (Task PLAYBACK): nvrPlayback is a
+		// pull-iterator-with-callbacks method — rpc.ExtractMethods
+		// detects that shape itself (a *rpc.CallbackInvoker last
+		// parameter), same as the func(T)-parameter detection
+		// onRecordingState/onSystemEvent rely on below — but, like them,
+		// without an entry here it is never registered on the wire at
+		// all (RPCMethodAllowlist). nvrPlaybackCmd is an ordinary
+		// request/response method with no such auto-detection, so it
+		// needs the entry regardless. See rpc_playback.go.
+		"nvrPlayback",
+		"nvrPlaybackCmd",
 		// Callback subscriptions (this task): rpc/go's ExtractMethods
 		// detects these as subscriptions by their func(T) parameter, not
 		// by anything in this list — but without an entry here they are
@@ -427,6 +455,13 @@ func NewPlugin(logger *sdk.Logger, api *sdk.PluginAPI, storage *sdk.DeviceStorag
 		// different ffmpeg invocation and output format (Annex-B H.264
 		// straight off stdout, not a JPEG written to disk).
 		p.scrubber = media.NewScrubber(ff.Path(), p.segments, p.Logger)
+
+		// Wires NvrPlayback (rpc_playback.go, Task PLAYBACK): same
+		// p.segments and resolved ffmpeg as p.scrubber immediately above
+		// — see player's own doc comment for why streaming playback
+		// reuses that exact "look up the covering segment, exec ffmpeg"
+		// shape.
+		p.player = media.NewPlayer(ff.Path(), p.segments, p.Logger)
 
 		// Wires StartAll/Add/Remove (Task ORCH, recorder/manager.go) with
 		// what they need to actually build and start a live *recorder.

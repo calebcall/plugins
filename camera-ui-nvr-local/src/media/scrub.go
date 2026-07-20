@@ -107,13 +107,19 @@ type Frame struct {
 
 // ScrubResult is Scrub's return value: either a found keyframe with its
 // codec metadata, or Found=false (no error) when nothing covers the
-// requested timestamp.
+// requested timestamp. SegmentStartMs/SegmentEndMs (zero when !Found) exist
+// purely so callers can log which recorded segment (if any) actually
+// covered the request — see rpc_playback.go's NvrScrub, which logs them to
+// diagnose "scrub reports noData" reports without needing to reproduce
+// against a live SegmentStore.
 type ScrubResult struct {
-	Frame       []byte
-	CodecString string
-	Width       int
-	Height      int
-	Found       bool
+	Frame          []byte
+	CodecString    string
+	Width          int
+	Height         int
+	Found          bool
+	SegmentStartMs int64
+	SegmentEndMs   int64
 }
 
 // PreviewResult is PreviewFrames' return value: the sampled keyframes plus
@@ -233,11 +239,13 @@ func (s *Scrubber) Scrub(ctx context.Context, cameraID string, tsUs int64, sourc
 	width, height := s.probeResolution(ctx, seg.Path)
 
 	return ScrubResult{
-		Frame:       frame,
-		CodecString: codecString,
-		Width:       width,
-		Height:      height,
-		Found:       true,
+		Frame:          frame,
+		CodecString:    codecString,
+		Width:          width,
+		Height:         height,
+		Found:          true,
+		SegmentStartMs: seg.StartMs,
+		SegmentEndMs:   seg.EndMs,
 	}, nil
 }
 

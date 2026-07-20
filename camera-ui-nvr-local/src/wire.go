@@ -162,6 +162,81 @@ type NvrScrubResult struct {
 	Frames      []NvrScrubFrame `msgpack:"frames,omitempty" json:"frames,omitempty"`
 }
 
+// NvrPlaybackReady mirrors the frontend's NvrPlaybackReady: nvrPlayback's
+// (rpc_playback.go) one-time "stream is starting" callback payload, fired
+// exactly once per session via the pull-callback protocol's onReady
+// invocation (see rpc_playback.go's package doc comment for the pinned
+// wire mechanism). SessionID is the value nvrPlaybackCmd's own sessionID
+// parameter must be called back with. The Audio* fields are always left
+// zero (and so omitted on the wire) in this v1: audio streaming is
+// deferred — see playbackSession.run's doc comment (playback_session.go).
+type NvrPlaybackReady struct {
+	SessionID        string `msgpack:"sessionId" json:"sessionId"`
+	VideoCodec       string `msgpack:"videoCodec" json:"videoCodec"`
+	CodecString      string `msgpack:"codecString" json:"codecString"`
+	Width            int    `msgpack:"width" json:"width"`
+	Height           int    `msgpack:"height" json:"height"`
+	AudioCodec       string `msgpack:"audioCodec,omitempty" json:"audioCodec,omitempty"`
+	AudioCodecString string `msgpack:"audioCodecString,omitempty" json:"audioCodecString,omitempty"`
+	AudioSampleRate  int    `msgpack:"audioSampleRate,omitempty" json:"audioSampleRate,omitempty"`
+	AudioChannels    int    `msgpack:"audioChannels,omitempty" json:"audioChannels,omitempty"`
+	AudioDescription []byte `msgpack:"audioDescription,omitempty" json:"audioDescription,omitempty"`
+}
+
+// NvrPlaybackVideo mirrors the frontend's NvrPlaybackVideo: one streamed
+// Annex-B H.264 access unit, delivered via the pull-callback protocol's
+// onVideo invocation (playbackSession.run, playback_session.go). Ts is a
+// synthesized microsecond playback timestamp (see
+// media.SegmentFrames.Timestamps' doc comment for why this stream carries
+// no timestamps of its own to just forward).
+type NvrPlaybackVideo struct {
+	Frame    []byte `msgpack:"frame" json:"frame"`
+	Ts       int64  `msgpack:"ts" json:"ts"`
+	Keyframe bool   `msgpack:"keyframe,omitempty" json:"keyframe,omitempty"`
+}
+
+// NvrPlaybackAudio mirrors the frontend's NvrPlaybackAudio: onAudio's
+// payload shape. Declared for wire-contract completeness; nothing in this
+// v1 invokes onAudio (see playbackSession.run's doc comment — audio
+// streaming is deferred).
+type NvrPlaybackAudio struct {
+	Frame []byte `msgpack:"frame" json:"frame"`
+	Ts    int64  `msgpack:"ts" json:"ts"`
+}
+
+// NvrPlaybackBatchItem/NvrPlaybackBatch mirror the frontend's types of the
+// same names: onBatch's payload shape, an alternative to per-frame onVideo
+// delivery for bundling several frames into one callback invocation.
+// Declared for wire-contract completeness; nothing in this v1 invokes
+// onBatch — see playbackSession.run's doc comment on why per-frame onVideo
+// (itself already the pull-callback protocol's own per-frame backpressure
+// unit) was chosen instead for this first streaming implementation.
+type NvrPlaybackBatchItem struct {
+	Frame []byte `msgpack:"frame" json:"frame"`
+	Ts    int64  `msgpack:"ts" json:"ts"`
+	Audio bool   `msgpack:"audio,omitempty" json:"audio,omitempty"`
+}
+
+type NvrPlaybackBatch struct {
+	Items []NvrPlaybackBatchItem `msgpack:"items" json:"items"`
+}
+
+// NvrPlaybackNoData mirrors the frontend's NvrPlaybackNoData: onNoData's
+// payload, fired when nvrPlayback finds no covering segment at the
+// requested Ts at all, or hits a real recording gap partway through a
+// session (no next segment to roll into) — see playbackSession.run.
+type NvrPlaybackNoData struct {
+	Ts int64 `msgpack:"ts" json:"ts"`
+}
+
+// NvrPlaybackCommand mirrors the frontend's NvrPlaybackCommand:
+// nvrPlaybackCmd's (rpc_playback.go) request payload. Speed is only
+// meaningful (and only sent by the frontend) when Cmd == "speed".
+type NvrPlaybackCommand struct {
+	Cmd   string  `msgpack:"cmd" json:"cmd"`
+	Speed float64 `msgpack:"speed,omitempty" json:"speed,omitempty"`
+}
+
 // NvrPreviewResult mirrors the frontend's NvrPreviewResult:
 // NvrPreviewFrames' (rpc_playback.go) result — a filmstrip of
 // evenly-spaced keyframes across a requested range plus their shared codec
