@@ -42,6 +42,27 @@ type accumulatedEvent struct {
 	// clobbering class of bug this whole accumulator exists to fix for
 	// Segments.
 	thumbnail []byte
+	// segmentThumbnail is the most recently observed non-empty
+	// EventSegment.Thumbnail (the per-segment "scene" JPEG) across this
+	// event's messages — present on 'segment-start'/'segment-end' and the
+	// first 'segment-update' with a candidate (see EventSegment.Thumbnail's
+	// doc comment), and just as absent from the sparse terminal 'end'/plain
+	// 'update' snapshots as Detections is. rpc_events.go's
+	// thumbnailsFromEvent reads exactly this field (via ev.Segments[0]) to
+	// populate EventThumbnails.Scenes, so losing it here silently empties
+	// Scenes for every event that goes through this accumulator — the same
+	// no-clobber rule as the event-level thumbnail above applies.
+	segmentThumbnail []byte
+	// zones is the union of every EventSegment.Zones name seen (deduplicated
+	// the same way a single segment message already deduplicates its own).
+	zones map[string]struct{}
+	// description is the most recently observed non-nil
+	// EventSegment.Description across this event's messages — an
+	// AI-generated description is expected to arrive on at most one message
+	// (if at all), so "most recent non-nil" is also "the only one", but
+	// applying the same no-clobber rule keeps this consistent with
+	// thumbnail/segmentThumbnail above rather than a special case.
+	description *sdk.EventDescription
 }
 
 // detectionAccumulator merges each sdk.DetectionEvent lifecycle message
@@ -112,6 +133,15 @@ func (a *detectionAccumulator) merge(event sdk.DetectionEvent) sdk.DetectionEven
 				entry.attributes[key] = attr
 			}
 		}
+		if len(seg.Thumbnail) > 0 {
+			entry.segmentThumbnail = seg.Thumbnail
+		}
+		for _, zone := range seg.Zones {
+			entry.zones[zone] = struct{}{}
+		}
+		if seg.Description != nil {
+			entry.description = seg.Description
+		}
 	}
 	for _, t := range event.Types {
 		entry.types[t] = struct{}{}
@@ -158,6 +188,7 @@ func (a *detectionAccumulator) getOrCreateLocked(id string) *accumulatedEvent {
 		detections: make(map[string]sdk.EventDetection),
 		attributes: make(map[attributeKey]sdk.EventAttribute),
 		types:      make(map[string]struct{}),
+		zones:      make(map[string]struct{}),
 	}
 	a.entries[id] = entry
 	a.order = append(a.order, id)
@@ -204,18 +235,18 @@ func sortedTypeUnion(types map[string]struct{}) []string {
 }
 
 // synthesizeSegments rebuilds event.Segments as a single segment spanning
-// entry's full accumulated union of detections/attributes, so downstream
-// code that scans ev.Segments[].Detections/Attributes (bestConfidence,
-// primaryLabel, GetDetectionHeatmap, thumbnailsFromEvent, ...) sees
-// everything observed across the event's lifecycle rather than only
-// whichever single segment-* message happened to produce this one. Returns
-// nil (not an empty non-nil slice) when nothing has been accumulated yet —
-// e.g. a motion-only event that never carries a segment at all — matching
-// the zero-value Segments a plain start/end message already carries, so a
-// motion event's stored shape is unchanged from before this accumulator
-// existed.
+// entry's full accumulated union of detections/attributes/scene
+// thumbnail/zones/description, so downstream code that scans ev.Segments
+// (bestConfidence, primaryLabel, GetDetectionHeatmap, thumbnailsFromEvent's
+// Scenes map, ...) sees everything observed across the event's lifecycle
+// rather than only whichever single segment-* message happened to produce
+// this one. Returns nil (not an empty non-nil slice) when nothing at all
+// has been accumulated yet — e.g. a motion-only event that never carries a
+// segment — matching the zero-value Segments a plain start/end message
+// already carries, so a motion event's stored shape is unchanged from
+// before this accumulator existed.
 func synthesizeSegments(entry *accumulatedEvent, event sdk.DetectionEvent) []sdk.EventSegment {
-	if len(entry.detections) == 0 && len(entry.attributes) == 0 {
+	if len(entry.detections) == 0 && len(entry.attributes) == 0 && len(entry.segmentThumbnail) == 0 && len(entry.zones) == 0 && entry.description == nil {
 		return nil
 	}
 
@@ -244,10 +275,22 @@ func synthesizeSegments(entry *accumulatedEvent, event sdk.DetectionEvent) []sdk
 		attributes = append(attributes, entry.attributes[key])
 	}
 
+	var zones []string
+	if len(entry.zones) > 0 {
+		zones = make([]string, 0, len(entry.zones))
+		for z := range entry.zones {
+			zones = append(zones, z)
+		}
+		sort.Strings(zones)
+	}
+
 	return []sdk.EventSegment{{
-		FirstSeen:  event.StartTime,
-		LastSeen:   event.LastUpdate,
-		Detections: detections,
-		Attributes: attributes,
+		FirstSeen:   event.StartTime,
+		LastSeen:    event.LastUpdate,
+		Thumbnail:   entry.segmentThumbnail,
+		Detections:  detections,
+		Attributes:  attributes,
+		Zones:       zones,
+		Description: entry.description,
 	}}
 }

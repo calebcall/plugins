@@ -142,6 +142,95 @@ func TestDetectionAccumulator_Merge_UnionsAttributesByTypeAndLabel(t *testing.T)
 	}
 }
 
+// TestDetectionEventIngester_Handle_PreservesSegmentThumbnailAcrossLifecycle
+// is a regression test for a review finding: synthesizeSegments originally
+// rebuilt the accumulated segment from only Detections/Attributes, dropping
+// EventSegment.Thumbnail (the per-segment "scene" JPEG) entirely.
+// rpc_events.go's thumbnailsFromEvent reads exactly that field (via
+// ev.Segments[N].Thumbnail) to populate EventThumbnails.Scenes, so every
+// event that went through the accumulator ended up with an always-empty
+// Scenes map — a regression versus pre-accumulator behavior, where a
+// client polling mid-lifecycle could still see a scene thumbnail from
+// whichever raw message last carried one.
+//
+// Reproduces the same shape of bug Bug 1 itself fixed, one field over: a
+// segment-start message carries a non-empty EventSegment.Thumbnail, but the
+// terminal 'end' message (like every terminal/plain-update message) arrives
+// with Segments:[] — an empty later message must not erase the segment
+// thumbnail an earlier one already reported. Asserts the FINAL upserted
+// event's synthesized segment still carries it.
+func TestDetectionEventIngester_Handle_PreservesSegmentThumbnailAcrossLifecycle(t *testing.T) {
+	fake := &fakeEventStore{}
+	ingester := newDetectionEventIngester(fake, nil, nil, nil, nil)
+
+	scene := []byte{0xFF, 0xD8, 0xFF, 0xD9} // stand-in JPEG bytes
+
+	ingester.handle(sdk.DetectionEventStart, sdk.DetectionEvent{
+		ID: "evt-1", CameraID: "cam1", State: sdk.DetectionEventStateActive, StartTime: 1000,
+	})
+	ingester.handle(sdk.DetectionEventSegmentStart, sdk.DetectionEvent{
+		ID: "evt-1", CameraID: "cam1", State: sdk.DetectionEventStateActive, StartTime: 1000, LastUpdate: 1500,
+		Types: []string{"person"},
+		Segments: []sdk.EventSegment{{
+			FirstSeen:  1000,
+			LastSeen:   1500,
+			Thumbnail:  scene,
+			Detections: []sdk.EventDetection{{Label: "person", Score: 0.72}},
+		}},
+	})
+	// Terminal 'end' message: sparse, Segments:[], exactly like the
+	// observed live-log sequence — must not erase the scene thumbnail
+	// segment-start already reported.
+	ingester.handle(sdk.DetectionEventEnd, sdk.DetectionEvent{
+		ID: "evt-1", CameraID: "cam1", State: sdk.DetectionEventStateEnded, StartTime: 1000, EndTime: 3000, LastUpdate: 3000,
+	})
+
+	if len(fake.upserted) != 3 {
+		t.Fatalf("expected 3 upserts (one per lifecycle message), got %d", len(fake.upserted))
+	}
+
+	final := fake.upserted[len(fake.upserted)-1]
+	if len(final.Segments) != 1 {
+		t.Fatalf("expected the final upserted event to retain exactly 1 synthesized segment, got %+v", final.Segments)
+	}
+	if got := final.Segments[0].Thumbnail; len(got) == 0 {
+		t.Fatalf("expected the final upserted event's synthesized segment to retain the scene thumbnail from segment-start, got empty (Scenes would be empty in thumbnailsFromEvent)")
+	} else if string(got) != string(scene) {
+		t.Fatalf("expected the retained scene thumbnail to match segment-start's, got %v want %v", got, scene)
+	}
+}
+
+// TestDetectionAccumulator_Merge_PreservesZonesAndDescription proves Zones
+// (unioned, deduplicated) and Description (latest non-nil) survive the same
+// no-clobber treatment as the scene thumbnail above, across a later message
+// whose Segments is empty.
+func TestDetectionAccumulator_Merge_PreservesZonesAndDescription(t *testing.T) {
+	acc := &detectionAccumulator{}
+
+	desc := &sdk.EventDescription{Title: "Person at front door"}
+	acc.merge(sdk.DetectionEvent{
+		ID: "evt-1", CameraID: "cam1", StartTime: 1000,
+		Segments: []sdk.EventSegment{{
+			Detections:  []sdk.EventDetection{{Label: "person", Score: 0.72}},
+			Zones:       []string{"driveway"},
+			Description: desc,
+		}},
+	})
+	merged := acc.merge(sdk.DetectionEvent{
+		ID: "evt-1", CameraID: "cam1", StartTime: 1000, State: sdk.DetectionEventStateEnded, EndTime: 5000,
+	})
+
+	if len(merged.Segments) != 1 {
+		t.Fatalf("expected exactly 1 synthesized segment, got %+v", merged.Segments)
+	}
+	if got := merged.Segments[0].Zones; len(got) != 1 || got[0] != "driveway" {
+		t.Fatalf("expected the empty terminal message to leave Zones=[driveway] unchanged, got %v", got)
+	}
+	if got := merged.Segments[0].Description; got == nil || got.Title != desc.Title {
+		t.Fatalf("expected the empty terminal message to leave Description unchanged, got %+v", got)
+	}
+}
+
 // TestDetectionAccumulator_Merge_EvictsOnTerminalMessage proves the
 // accumulator forgets an event once its terminal message (State ==
 // DetectionEventStateEnded, or a nonzero EndTime) has been merged, so it
