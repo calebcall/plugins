@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"sync"
 	"testing"
 
 	sdk "github.com/cameraui/sdk/go"
@@ -13,13 +14,21 @@ import (
 // every Upsert call so detectionEventIngester.handle can be tested without a
 // real SQLite-backed EventStore or a live sdk.CameraDevice (which can't be
 // constructed outside package sdk — see attachDetectionIngestion's DEFERRED
-// note in plugin.go).
+// note in plugin.go). Guarded by mu because handle (the method under test)
+// is documented as callable from concurrent host-driven goroutines with no
+// single-goroutine guarantee — the real *store.EventStore.Upsert already
+// locks internally (see store/events.go), so this fake must too, or a
+// concurrent-handle-calls test (-race) flags the fake itself rather than
+// anything production code does.
 type fakeEventStore struct {
+	mu       sync.Mutex
 	upserted []store.DetectionEvent
 	err      error
 }
 
 func (f *fakeEventStore) Upsert(events []store.DetectionEvent) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.err != nil {
 		return f.err
 	}
@@ -343,6 +352,49 @@ func TestDetectionEventIngester_Handle_CoverageErrorLeavesHasRecordingUnchanged(
 
 	if len(fake.upserted) != 1 || !fake.upserted[0].HasRecording {
 		t.Fatalf("expected a CoversRange error to leave HasRecording=true unchanged, got %+v", fake.upserted)
+	}
+}
+
+// TestDetectionEventIngester_Handle_ActiveRecordingSetsHasRecordingWithoutCoverage
+// proves the finalize-lag fix: a camera this plugin is actively recording
+// (a registered eventRecorder — see recorderRegistry.RecorderFor, only
+// registered while a *recorder.Recorder is running for a non-"off"
+// RecordingMode camera) gets HasRecording=true even when no segment has
+// been indexed yet to cover the event's window — the real-world case where
+// the covering segment isn't finalized/indexed until the next ~60s segment
+// roll, well after the event itself has already ended.
+func TestDetectionEventIngester_Handle_ActiveRecordingSetsHasRecordingWithoutCoverage(t *testing.T) {
+	fake := &fakeEventStore{}
+	coverage := &fakeCoverageChecker{covered: false}
+	lookup := &fakeRecorderLookup{recorders: map[string]eventRecorder{"cam1": &spyRecorder{}}}
+	ingester := newDetectionEventIngester(fake, lookup, nil, coverage, nil)
+
+	ingester.handle(sdk.DetectionEventEnd, sdk.DetectionEvent{
+		ID: "evt-1", CameraID: "cam1", State: sdk.DetectionEventStateEnded, StartTime: 1000, EndTime: 5000,
+	})
+
+	if len(fake.upserted) != 1 || !fake.upserted[0].HasRecording {
+		t.Fatalf("expected an actively-recorded camera to persist has_recording=true despite no coverage, got %+v", fake.upserted)
+	}
+}
+
+// TestDetectionEventIngester_Handle_NoActiveRecordingFallsBackToCoverage
+// proves a camera with recordingMode=off (no registered eventRecorder) gets
+// no free pass from the active-recording check: with no coverage either,
+// has_recording stays false — the active-recording check is additive, not
+// a replacement for CoversRange.
+func TestDetectionEventIngester_Handle_NoActiveRecordingFallsBackToCoverage(t *testing.T) {
+	fake := &fakeEventStore{}
+	coverage := &fakeCoverageChecker{covered: false}
+	lookup := &fakeRecorderLookup{recorders: map[string]eventRecorder{}}
+	ingester := newDetectionEventIngester(fake, lookup, nil, coverage, nil)
+
+	ingester.handle(sdk.DetectionEventStart, sdk.DetectionEvent{
+		ID: "evt-1", CameraID: "cam1", StartTime: 1000,
+	})
+
+	if len(fake.upserted) != 1 || fake.upserted[0].HasRecording {
+		t.Fatalf("expected has_recording=false for an unrecorded camera with no coverage, got %+v", fake.upserted)
 	}
 }
 

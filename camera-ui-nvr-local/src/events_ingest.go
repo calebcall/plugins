@@ -73,6 +73,17 @@ type detectionEventIngester struct {
 	thumbs    eventThumbnailer
 	coverage  recordingCoverageChecker
 	logger    *sdk.Logger
+
+	// acc accumulates each event's detections/attributes/types across its
+	// lifecycle messages (see events_ingest_merge.go) so a sparse terminal
+	// 'end' or plain 'update' message — observed to arrive with
+	// Segments:[] and no score, even for events whose segment-* messages
+	// carried real detections — never clobbers what an earlier message in
+	// the same lifecycle already reported. Always non-nil (initialized by
+	// newDetectionEventIngester); not a constructor parameter because it is
+	// purely internal bookkeeping, not a dependency any caller/test needs
+	// to substitute.
+	acc *detectionAccumulator
 }
 
 // newDetectionEventIngester returns a detectionEventIngester that upserts
@@ -90,7 +101,7 @@ type detectionEventIngester struct {
 // OnDetectionEvent's callback signature (see camera_device.go) has no error
 // return for a failed handler to report through.
 func newDetectionEventIngester(store eventUpserter, recorders eventRecorderLookup, thumbs eventThumbnailer, coverage recordingCoverageChecker, logger *sdk.Logger) *detectionEventIngester {
-	return &detectionEventIngester{store: store, recorders: recorders, thumbs: thumbs, coverage: coverage, logger: logger}
+	return &detectionEventIngester{store: store, recorders: recorders, thumbs: thumbs, coverage: coverage, logger: logger, acc: &detectionAccumulator{}}
 }
 
 // handle is the exact callback shape sdk.CameraDevice.OnDetectionEvent
@@ -133,13 +144,22 @@ func (i *detectionEventIngester) handle(eventType sdk.DetectionEventType, event 
 		i.logger.Debug(fmt.Sprintf("nvr-local: ingest type=%s id=%s state=%s types=%v segs=%d dets=%s trigs=%s", eventType, event.ID, event.State, event.Types, len(event.Segments), dets, trigs))
 	}
 
-	event.HasRecording = i.resolveHasRecording(event)
+	// merged carries this message's own StartTime/EndTime/State/etc.
+	// unchanged, but its Types/Segments/Thumbnail are the accumulated
+	// union across every lifecycle message seen for this event so far
+	// (see events_ingest_merge.go's doc comment for why: a later sparse
+	// message must not erase detections an earlier one already reported).
+	// It — not the raw event above — is what gets stored, has_recording-
+	// resolved, MarkEvent'd, and thumbnail-generated from.
+	merged := i.acc.merge(event)
 
-	if err := i.store.Upsert([]store.DetectionEvent{event}); err != nil && i.logger != nil {
+	merged.HasRecording = i.resolveHasRecording(merged)
+
+	if err := i.store.Upsert([]store.DetectionEvent{merged}); err != nil && i.logger != nil {
 		i.logger.Error("nvr-local: upsert detection event failed:", err)
 	}
-	i.markEvent(event)
-	i.generateThumbnail(event)
+	i.markEvent(merged)
+	i.generateThumbnail(merged)
 }
 
 // resolveHasRecording recomputes event.HasRecording from the recorded
@@ -172,7 +192,29 @@ func (i *detectionEventIngester) handle(eventType sdk.DetectionEventType, event 
 // every other optional dependency on detectionEventIngester) or a failed
 // query leaves event.HasRecording exactly as the producer sent it, rather
 // than forcing it false.
+//
+// Before any of that, resolveHasRecording also checks whether the event's
+// camera is actively being recorded at all right now (i.recorders,
+// RecorderFor's ok=false/true — see recorderRegistry.RecorderFor:
+// registered exactly while a *recorder.Recorder is running for a camera
+// whose configured RecordingMode isn't "off"). If it is, has_recording is
+// true unconditionally: continuous/events-mode recording means footage
+// exists (or is actively being written) for this window even when the
+// specific segment covering the event's exact timestamps hasn't been
+// finalized/indexed into SegmentStore yet — the observed real-world case
+// (~half of events) where CoversRange alone finds nothing at end-time
+// because the segment rolls over on its own ~60s cadence, independent of
+// any individual event's lifecycle. This is checked in addition to, not
+// instead of, the CoversRange path below, so an event on a camera this
+// plugin isn't actively recording still gets credited for a segment that
+// happens to cover it (e.g. one recorded by a different process/session).
 func (i *detectionEventIngester) resolveHasRecording(event sdk.DetectionEvent) bool {
+	if i.recorders != nil {
+		if _, ok := i.recorders.RecorderFor(event.CameraID); ok {
+			return true
+		}
+	}
+
 	if i.coverage == nil {
 		return event.HasRecording
 	}
