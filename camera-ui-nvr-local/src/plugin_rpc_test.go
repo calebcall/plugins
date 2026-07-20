@@ -305,3 +305,38 @@ func TestStorageSchema_DeclaresInstanceIDKeyAsStored(t *testing.T) {
 		t.Fatalf("expected StorageSchema() to declare a schema entry for %q", instanceIDStorageKey)
 	}
 }
+
+// TestStorageSchema_DeclaresRecordingPathKeyAsStored proves NVRPlugin's
+// StorageSchema also declares recordingPathStorageKey (Feature #1:
+// configurable recording storage path) as a stored string field — what
+// makes it both persist across restarts and actually render on the
+// /settings/recordings page (SettingsRecordings.vue renders this plugin's
+// whole StorageSchema via usePluginStorage), and proves declaring it didn't
+// come at the cost of dropping instanceIDStorageKey (load-bearing for
+// GetInstanceId's persistence, see the tests above) from the same list.
+func TestStorageSchema_DeclaresRecordingPathKeyAsStored(t *testing.T) {
+	p := &NVRPlugin{}
+	schemas := p.StorageSchema()
+
+	var foundRecordingPath, foundInstanceID bool
+	for _, schema := range schemas {
+		switch schema.Key {
+		case recordingPathStorageKey:
+			foundRecordingPath = true
+			if schema.Type != sdk.JsonSchemaTypeString {
+				t.Fatalf("expected %q to be a string schema, got %v", recordingPathStorageKey, schema.Type)
+			}
+			if schema.Store == nil || !*schema.Store {
+				t.Fatalf("expected schema for %q to have Store: true, got %v", recordingPathStorageKey, schema.Store)
+			}
+		case instanceIDStorageKey:
+			foundInstanceID = true
+		}
+	}
+	if !foundRecordingPath {
+		t.Fatalf("expected StorageSchema() to declare a schema entry for %q", recordingPathStorageKey)
+	}
+	if !foundInstanceID {
+		t.Fatalf("expected StorageSchema() to still declare %q alongside the new field", instanceIDStorageKey)
+	}
+}

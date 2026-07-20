@@ -32,7 +32,7 @@ func (f *fakeEventStore) Upsert(events []store.DetectionEvent) error {
 // a synthetic detection event into the store unchanged.
 func TestDetectionEventIngester_Handle_UpsertsTheEvent(t *testing.T) {
 	fake := &fakeEventStore{}
-	ingester := newDetectionEventIngester(fake, nil, nil, nil)
+	ingester := newDetectionEventIngester(fake, nil, nil, nil, nil)
 
 	event := sdk.DetectionEvent{
 		ID:        "evt-1",
@@ -59,7 +59,7 @@ func TestDetectionEventIngester_Handle_UpsertsTheEvent(t *testing.T) {
 // handler must not skip or coalesce them itself.
 func TestDetectionEventIngester_Handle_ReplacesOnUpdate(t *testing.T) {
 	fake := &fakeEventStore{}
-	ingester := newDetectionEventIngester(fake, nil, nil, nil)
+	ingester := newDetectionEventIngester(fake, nil, nil, nil, nil)
 
 	ingester.handle(sdk.DetectionEventStart, sdk.DetectionEvent{
 		ID: "evt-1", CameraID: "cam1", State: sdk.DetectionEventStateActive, StartTime: 1000,
@@ -84,7 +84,7 @@ func TestDetectionEventIngester_Handle_ReplacesOnUpdate(t *testing.T) {
 // there's nowhere to log to either).
 func TestDetectionEventIngester_Handle_LogsAndSwallowsStoreErrors(t *testing.T) {
 	fake := &fakeEventStore{err: errors.New("boom")}
-	ingester := newDetectionEventIngester(fake, nil, nil, nil)
+	ingester := newDetectionEventIngester(fake, nil, nil, nil, nil)
 
 	ingester.handle(sdk.DetectionEventStart, sdk.DetectionEvent{ID: "evt-1", CameraID: "cam1"})
 }
@@ -131,7 +131,7 @@ func (f *fakeRecorderLookup) RecorderFor(cameraID string) (eventRecorder, bool) 
 func TestDetectionEventIngester_Handle_CallsMarkEventOnRegisteredRecorder(t *testing.T) {
 	spy := &spyRecorder{}
 	lookup := &fakeRecorderLookup{recorders: map[string]eventRecorder{"cam1": spy}}
-	ingester := newDetectionEventIngester(&fakeEventStore{}, lookup, nil, nil)
+	ingester := newDetectionEventIngester(&fakeEventStore{}, lookup, nil, nil, nil)
 
 	ingester.handle(sdk.DetectionEventEnd, sdk.DetectionEvent{
 		ID: "evt-1", CameraID: "cam1", StartTime: 1000, EndTime: 6000,
@@ -157,7 +157,7 @@ func TestDetectionEventIngester_Handle_CallsMarkEventOnRegisteredRecorder(t *tes
 func TestDetectionEventIngester_Handle_StartThenEndLifecycle_CallsMarkEventForBoth(t *testing.T) {
 	spy := &spyRecorder{}
 	lookup := &fakeRecorderLookup{recorders: map[string]eventRecorder{"cam1": spy}}
-	ingester := newDetectionEventIngester(&fakeEventStore{}, lookup, nil, nil)
+	ingester := newDetectionEventIngester(&fakeEventStore{}, lookup, nil, nil, nil)
 
 	ingester.handle(sdk.DetectionEventStart, sdk.DetectionEvent{
 		ID: "evt-1", CameraID: "cam1", State: sdk.DetectionEventStateActive, StartTime: 1000,
@@ -183,7 +183,7 @@ func TestDetectionEventIngester_Handle_StartThenEndLifecycle_CallsMarkEventForBo
 // isn't in events mode — even though a lookup is configured.
 func TestDetectionEventIngester_Handle_SkipsMarkEventWhenNoRecorderRegistered(t *testing.T) {
 	lookup := &fakeRecorderLookup{recorders: map[string]eventRecorder{}}
-	ingester := newDetectionEventIngester(&fakeEventStore{}, lookup, nil, nil)
+	ingester := newDetectionEventIngester(&fakeEventStore{}, lookup, nil, nil, nil)
 
 	ingester.handle(sdk.DetectionEventStart, sdk.DetectionEvent{
 		ID: "evt-1", CameraID: "cam-unregistered", StartTime: 1000,
@@ -197,8 +197,233 @@ func TestDetectionEventIngester_Handle_SkipsMarkEventWhenNoRecorderRegistered(t 
 // doesn't care about event-mode wiring, matching newDetectionEventIngester's
 // doc comment) without panicking.
 func TestDetectionEventIngester_Handle_SkipsMarkEventWhenLookupNil(t *testing.T) {
-	ingester := newDetectionEventIngester(&fakeEventStore{}, nil, nil, nil)
+	ingester := newDetectionEventIngester(&fakeEventStore{}, nil, nil, nil, nil)
 	ingester.handle(sdk.DetectionEventStart, sdk.DetectionEvent{ID: "evt-1", CameraID: "cam1", StartTime: 1000})
+}
+
+// ---------------------------------------------------------------------------
+// has_recording linkage: handle -> recordingCoverageChecker.CoversRange
+// ---------------------------------------------------------------------------
+
+// fakeCoverageChecker is a recordingCoverageChecker test double: covered
+// reports the fixed answer every CoversRange call should return (or
+// coverageErr, if set, to exercise the error-swallowing path), and calls
+// records every (cameraID, startMs, endMs) triple it was invoked with so
+// tests can assert exactly which window handle checked.
+type fakeCoverageChecker struct {
+	covered     bool
+	coverageErr error
+	calls       []struct {
+		cameraID string
+		startMs  int64
+		endMs    int64
+	}
+}
+
+func (f *fakeCoverageChecker) CoversRange(cameraID string, startMs, endMs int64) (bool, error) {
+	f.calls = append(f.calls, struct {
+		cameraID string
+		startMs  int64
+		endMs    int64
+	}{cameraID, startMs, endMs})
+	if f.coverageErr != nil {
+		return false, f.coverageErr
+	}
+	return f.covered, nil
+}
+
+// TestDetectionEventIngester_Handle_SetsHasRecordingWhenCovered proves a
+// 'start' message (EndTime == 0) whose StartTime is covered by an indexed
+// segment is upserted with HasRecording=true, and that the coverage check
+// ran as a point-in-time query (startMs == endMs == event.StartTime).
+func TestDetectionEventIngester_Handle_SetsHasRecordingWhenCovered(t *testing.T) {
+	fake := &fakeEventStore{}
+	coverage := &fakeCoverageChecker{covered: true}
+	ingester := newDetectionEventIngester(fake, nil, nil, coverage, nil)
+
+	ingester.handle(sdk.DetectionEventStart, sdk.DetectionEvent{
+		ID: "evt-1", CameraID: "cam1", StartTime: 1000,
+	})
+
+	if len(fake.upserted) != 1 || !fake.upserted[0].HasRecording {
+		t.Fatalf("expected the upserted event to have HasRecording=true, got %+v", fake.upserted)
+	}
+	if len(coverage.calls) != 1 || coverage.calls[0].cameraID != "cam1" || coverage.calls[0].startMs != 1000 || coverage.calls[0].endMs != 1000 {
+		t.Fatalf("expected a point-in-time CoversRange(cam1, 1000, 1000) call, got %+v", coverage.calls)
+	}
+}
+
+// TestDetectionEventIngester_Handle_LeavesHasRecordingFalseWhenNotCovered
+// proves an event with no covering segment is upserted with
+// HasRecording=false.
+func TestDetectionEventIngester_Handle_LeavesHasRecordingFalseWhenNotCovered(t *testing.T) {
+	fake := &fakeEventStore{}
+	coverage := &fakeCoverageChecker{covered: false}
+	ingester := newDetectionEventIngester(fake, nil, nil, coverage, nil)
+
+	ingester.handle(sdk.DetectionEventStart, sdk.DetectionEvent{
+		ID: "evt-1", CameraID: "cam1", StartTime: 1000,
+	})
+
+	if len(fake.upserted) != 1 || fake.upserted[0].HasRecording {
+		t.Fatalf("expected the upserted event to have HasRecording=false, got %+v", fake.upserted)
+	}
+}
+
+// TestDetectionEventIngester_Handle_RecomputesHasRecordingOnEndMessage
+// proves the terminal 'end' message re-evaluates has_recording over the
+// event's FULL [start,end] window (not just its start instant): the 'start'
+// message finds no coverage yet (segment not finalized/indexed), but by the
+// time the 'end' message arrives coverage exists, so the final row is
+// HasRecording=true — and the second CoversRange call is over
+// [1000, 5000], not a repeat of the first [1000, 1000] point check.
+func TestDetectionEventIngester_Handle_RecomputesHasRecordingOnEndMessage(t *testing.T) {
+	fake := &fakeEventStore{}
+	coverage := &fakeCoverageChecker{covered: false}
+	ingester := newDetectionEventIngester(fake, nil, nil, coverage, nil)
+
+	ingester.handle(sdk.DetectionEventStart, sdk.DetectionEvent{
+		ID: "evt-1", CameraID: "cam1", StartTime: 1000,
+	})
+
+	// Recording catches up between the start and end messages.
+	coverage.covered = true
+
+	ingester.handle(sdk.DetectionEventEnd, sdk.DetectionEvent{
+		ID: "evt-1", CameraID: "cam1", StartTime: 1000, EndTime: 5000,
+	})
+
+	if len(fake.upserted) != 2 {
+		t.Fatalf("expected 2 upserts (one per lifecycle message), got %d", len(fake.upserted))
+	}
+	if fake.upserted[0].HasRecording {
+		t.Fatalf("expected the start message's row to have HasRecording=false, got true")
+	}
+	if !fake.upserted[1].HasRecording {
+		t.Fatalf("expected the end message's row to have HasRecording=true, got false")
+	}
+
+	if len(coverage.calls) != 2 {
+		t.Fatalf("expected 2 CoversRange calls, got %d", len(coverage.calls))
+	}
+	if coverage.calls[1].startMs != 1000 || coverage.calls[1].endMs != 5000 {
+		t.Fatalf("expected the end message's coverage check to span [1000, 5000], got [%d, %d]", coverage.calls[1].startMs, coverage.calls[1].endMs)
+	}
+}
+
+// TestDetectionEventIngester_Handle_NilCoverageLeavesHasRecordingUnchanged
+// proves a nil coverage checker (the default for callers that don't wire
+// this up, matching every other optional dependency) leaves the event's own
+// HasRecording value untouched rather than forcing it to false.
+func TestDetectionEventIngester_Handle_NilCoverageLeavesHasRecordingUnchanged(t *testing.T) {
+	fake := &fakeEventStore{}
+	ingester := newDetectionEventIngester(fake, nil, nil, nil, nil)
+
+	ingester.handle(sdk.DetectionEventStart, sdk.DetectionEvent{
+		ID: "evt-1", CameraID: "cam1", StartTime: 1000, HasRecording: true,
+	})
+
+	if len(fake.upserted) != 1 || !fake.upserted[0].HasRecording {
+		t.Fatalf("expected a nil coverage checker to leave HasRecording=true unchanged, got %+v", fake.upserted)
+	}
+}
+
+// TestDetectionEventIngester_Handle_CoverageErrorLeavesHasRecordingUnchanged
+// proves a failing CoversRange call is swallowed (logged, not propagated —
+// same contract as a failing Upsert) and leaves HasRecording at whatever the
+// producer sent, rather than panicking or forcing false.
+func TestDetectionEventIngester_Handle_CoverageErrorLeavesHasRecordingUnchanged(t *testing.T) {
+	fake := &fakeEventStore{}
+	coverage := &fakeCoverageChecker{coverageErr: errors.New("boom")}
+	ingester := newDetectionEventIngester(fake, nil, nil, coverage, nil)
+
+	ingester.handle(sdk.DetectionEventStart, sdk.DetectionEvent{
+		ID: "evt-1", CameraID: "cam1", StartTime: 1000, HasRecording: true,
+	})
+
+	if len(fake.upserted) != 1 || !fake.upserted[0].HasRecording {
+		t.Fatalf("expected a CoversRange error to leave HasRecording=true unchanged, got %+v", fake.upserted)
+	}
+}
+
+// TestDetectionEventIngester_Handle_RealSegmentStore_LinksHasRecordingEndToEnd
+// is the end-to-end proof, against a real SQLite-backed SegmentStore/
+// EventStore (newTestPluginWithDB, the same wiring NewPlugin uses in
+// production), that ingesting a detection event whose time is covered by an
+// indexed segment persists has_recording=true, an event with no covering
+// segment persists has_recording=false, and the terminal 'end' message's
+// full-window recompute promotes a previously-uncovered event to true once
+// its post-roll segment has since been indexed — the exact finalization-lag
+// scenario resolveHasRecording's doc comment describes.
+func TestDetectionEventIngester_Handle_RealSegmentStore_LinksHasRecordingEndToEnd(t *testing.T) {
+	p := newTestPluginWithDB(t)
+
+	// cam1 has a segment covering [10_000, 20_000).
+	if _, err := p.segments.Add(store.Segment{
+		CameraID: "cam1", Role: "high-resolution", Path: "/rec/cam1.mp4",
+		StartMs: 10_000, EndMs: 20_000, HasVideo: true,
+	}); err != nil {
+		t.Fatalf("segments.Add: %v", err)
+	}
+
+	ingester := newDetectionEventIngester(p.events, nil, nil, p.segments, nil)
+
+	// Covered: cam1's start time (12_000) falls inside the indexed segment.
+	ingester.handle(sdk.DetectionEventStart, sdk.DetectionEvent{
+		ID: "evt-covered", CameraID: "cam1", StartTime: 12_000,
+	})
+	covered, err := p.events.Query([]string{"cam1"}, store.GetEventsOptions{})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(covered.Events) != 1 || !covered.Events[0].HasRecording {
+		t.Fatalf("expected evt-covered to persist has_recording=true, got %+v", covered.Events)
+	}
+
+	// Not covered: cam2 has no indexed segments at all.
+	ingester.handle(sdk.DetectionEventStart, sdk.DetectionEvent{
+		ID: "evt-uncovered", CameraID: "cam2", StartTime: 12_000,
+	})
+	uncovered, err := p.events.Query([]string{"cam2"}, store.GetEventsOptions{})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(uncovered.Events) != 1 || uncovered.Events[0].HasRecording {
+		t.Fatalf("expected evt-uncovered to persist has_recording=false, got %+v", uncovered.Events)
+	}
+
+	// End-message recompute: cam3's 'start' message finds nothing yet (its
+	// post-roll segment isn't indexed until after the event ends), but by
+	// the 'end' message the segment covering its full [start,end] window
+	// has been indexed, so the recompute over the FULL window promotes it.
+	ingester.handle(sdk.DetectionEventStart, sdk.DetectionEvent{
+		ID: "evt-lag", CameraID: "cam3", StartTime: 30_000,
+	})
+	afterStart, err := p.events.Query([]string{"cam3"}, store.GetEventsOptions{})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(afterStart.Events) != 1 || afterStart.Events[0].HasRecording {
+		t.Fatalf("expected evt-lag's start message to persist has_recording=false (not yet indexed), got %+v", afterStart.Events)
+	}
+
+	if _, err := p.segments.Add(store.Segment{
+		CameraID: "cam3", Role: "high-resolution", Path: "/rec/cam3.mp4",
+		StartMs: 30_000, EndMs: 40_000, HasVideo: true,
+	}); err != nil {
+		t.Fatalf("segments.Add: %v", err)
+	}
+
+	ingester.handle(sdk.DetectionEventEnd, sdk.DetectionEvent{
+		ID: "evt-lag", CameraID: "cam3", StartTime: 30_000, EndTime: 35_000,
+	})
+	afterEnd, err := p.events.Query([]string{"cam3"}, store.GetEventsOptions{})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(afterEnd.Events) != 1 || !afterEnd.Events[0].HasRecording {
+		t.Fatalf("expected evt-lag's end message to promote has_recording to true once its segment was indexed, got %+v", afterEnd.Events)
+	}
 }
 
 // TestDetectionSubscriptions_AddThenRemove proves the add/remove bookkeeping

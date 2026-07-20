@@ -65,7 +65,7 @@ func TestIngestion_GeneratesThumbnail_AndGetEventThumbnailsServesIt(t *testing.T
 	gen := media.NewGenerator(t.TempDir(), resolvedFFmpegPathForThumbs(), p.segments, p.events, nil)
 	p.thumbs = gen
 
-	ingester := newDetectionEventIngester(p.events, nil, gen, nil)
+	ingester := newDetectionEventIngester(p.events, nil, gen, nil, nil)
 	ingester.handle(sdk.DetectionEventEnd, sdk.DetectionEvent{
 		ID:        "evt-thumb-1",
 		CameraID:  "cam1",
@@ -111,7 +111,7 @@ func TestIngestion_NoCoveringSegment_StoresEventWithNoThumbnail(t *testing.T) {
 	gen := media.NewGenerator(t.TempDir(), "ffmpeg", p.segments, p.events, nil)
 	p.thumbs = gen
 
-	ingester := newDetectionEventIngester(p.events, nil, gen, nil)
+	ingester := newDetectionEventIngester(p.events, nil, gen, nil, nil)
 	ingester.handle(sdk.DetectionEventEnd, sdk.DetectionEvent{
 		ID:        "evt-thumb-2",
 		CameraID:  "cam1",

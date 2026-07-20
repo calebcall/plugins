@@ -201,19 +201,36 @@ const smallVolumeThresholdGB = 32
 // enforcement.
 const diskCriticalFreePercent = 2
 
-// GetStorageStats reports disk-level stats for this plugin's data
+// GetStorageStats reports disk-level stats for this plugin's recordings
 // directory (via diskStats — syscall.Statfs on linux/darwin,
 // GetDiskFreeSpaceEx on windows, see diskstats_unix.go/
 // diskstats_windows.go) plus this NVR instance's own recorded-usage
 // breakdown, instance-wide and per camera. Registered as the RPC method
 // "getStorageStats".
+//
+// Reports against p.recordingsDir (Feature #1's resolved recordingPath
+// override, or api.StoragePath unchanged when unset) rather than
+// api.StoragePath directly: once recordings are configured to live
+// somewhere else (e.g. a larger external drive), THAT filesystem's
+// free/used space is what actually matters to the operator here — reporting
+// api.StoragePath's own (likely small, e.g. an internal boot volume) disk
+// stats instead would defeat the point of moving recordings off it in the
+// first place. p.recordingsDir is empty in unit tests that construct
+// NVRPlugin directly rather than through NewPlugin, in which case this
+// falls back to p.API.StoragePath, preserving this method's pre-existing
+// behavior for those tests.
 func (p *NVRPlugin) GetStorageStats() (StorageStats, error) {
 	p.logRPC("getStorageStats")
 
 	stats := StorageStats{Cameras: map[string]CameraStorageStats{}, NvrQuotaGB: p.nvrQuotaGB()}
 
-	if p.API != nil && p.API.StoragePath != "" {
-		total, free, err := diskStats(p.API.StoragePath)
+	statsDir := p.recordingsDir
+	if statsDir == "" && p.API != nil {
+		statsDir = p.API.StoragePath
+	}
+
+	if statsDir != "" {
+		total, free, err := diskStats(statsDir)
 		if err != nil {
 			if p.Logger != nil {
 				p.Logger.Warn("nvr-local: getStorageStats: disk stats failed:", err)

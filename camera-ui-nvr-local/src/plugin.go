@@ -186,6 +186,19 @@ type NVRPlugin struct {
 	// comment for why nothing populates it yet.
 	recorders recorderRegistry
 
+	// recordingsDir is the resolved base directory NEW recordings
+	// (RecorderConfig.DataDir) and the thumbnail Generator are rooted
+	// under — resolveRecordingsBaseDir(api.StoragePath, the recordingPath
+	// storage value, ...) in NewPlugin (see recording_path.go): the
+	// configured recordingPath when non-empty and usable, else
+	// api.StoragePath unchanged (the pre-existing default). Also fed to
+	// GetStorageStats' diskStats call (rpc_recording.go), since once
+	// recordings move here, THIS is the disk whose free/used space
+	// actually matters to report — not necessarily api.StoragePath's own
+	// filesystem. Empty in unit tests that construct NVRPlugin directly
+	// rather than through NewPlugin.
+	recordingsDir string
+
 	// scrubber backs NvrScrub/NvrPreviewFrames (rpc_playback.go, Task
 	// SCRUB): extracts single Annex-B H.264 keyframes and evenly-spaced
 	// filmstrips of them from recorded segments, via a *media.Scrubber
@@ -277,6 +290,16 @@ func (p *NVRPlugin) RPCMethods() []string {
 		// See rpc_subscriptions.go.
 		"onRecordingState",
 		"onSystemEvent",
+		// sdk.OAuthCapable (Feature #2, oauth.go): rpc/go's ExtractMethods
+		// has no OAuthCapable-specific auto-registration at all — see
+		// oauth.go's package doc comment for the confirmed evidence from
+		// rpc/go@v1.0.6's handler.go — so, like every method above, these
+		// three are simply never subscribed on the wire without an entry
+		// here, regardless of contract.ts declaring
+		// PluginInterface.OAuthCapable.
+		"getOAuthMetadata",
+		"getOAuthState",
+		"disconnect",
 	}
 }
 
@@ -341,6 +364,17 @@ const nvrQuotaGBStorageKey = "nvrQuotaGB"
 // real setting, not hidden) and stored so it survives restarts and can be
 // edited like any other plugin setting; 0 (the default) means uncapped —
 // retention only prunes by each camera's own retentionDays.
+//
+// recordingPathStorageKey (Feature #1: configurable recording storage path)
+// is also user-facing and stored: the settings page
+// (/settings/recordings, SettingsRecordings.vue) renders this plugin's
+// whole StorageSchema as a config form via usePluginStorage, so this is
+// literally what makes the field appear there at all. Its DefaultValue is
+// deliberately omitted (an empty string default already falls out of
+// DeviceStorage's own zero value for an unset string key) — empty is a
+// meaningful value here ("use this plugin's default storage location", see
+// resolveRecordingsBaseDir in recording_path.go), not a placeholder for
+// something else.
 func (p *NVRPlugin) StorageSchema() []sdk.JsonSchema {
 	storeTrue := true
 	return []sdk.JsonSchema{
@@ -359,6 +393,13 @@ func (p *NVRPlugin) StorageSchema() []sdk.JsonSchema {
 			DefaultValue: float64(0),
 			Minimum:      sdk.Float64(0),
 			Store:        &storeTrue,
+		},
+		{
+			Type:        sdk.JsonSchemaTypeString,
+			Key:         recordingPathStorageKey,
+			Title:       "Recording Storage Path",
+			Description: "Optional custom directory where new recordings (and their thumbnails) are written, e.g. an external drive or network share mounted on this host. Leave empty to use this plugin's default storage location. Changing this only affects NEW recordings — existing recordings stay where they are and remain playable.",
+			Store:       &storeTrue,
 		},
 	}
 }
@@ -389,6 +430,21 @@ func (p *NVRPlugin) nvrQuotaGB() float64 {
 
 func NewPlugin(logger *sdk.Logger, api *sdk.PluginAPI, storage *sdk.DeviceStorage) sdk.Plugin {
 	p := &NVRPlugin{BasePlugin: sdk.NewBasePlugin(logger, api, storage), recorder: recorder.NewRecorderManager(), store: storage}
+
+	// recordingsDir (Feature #1) resolves once, here, before anything below
+	// that needs a base directory for recordings/thumbnails is constructed.
+	// storage.GetValue works correctly even though sdk.Run defines this
+	// plugin's storage schema (DefineSchemas) only AFTER this constructor
+	// returns (see the "Correction" note atop this file): DeviceStorage's
+	// Values map is already populated from whatever was persisted to disk
+	// at newDeviceStorage time, well before schemas ever enter into it —
+	// GetValue's schema lookup only matters for its OnGet/DefaultValue
+	// fallback, neither of which this read depends on for an
+	// already-persisted value. A first-ever run (nothing persisted yet)
+	// correctly reads back "" here, which resolveRecordingsBaseDir treats
+	// as "use the default", exactly the desired unconfigured behavior.
+	configuredRecordingPath, _ := storage.GetValue(recordingPathStorageKey, "").(string)
+	p.recordingsDir = resolveRecordingsBaseDir(api.StoragePath, configuredRecordingPath, logger)
 
 	// ff resolves the ffmpeg binary every recorder and the thumbnail
 	// Generator below exec: primarily via the SDK's CoreManager.GetFFmpegPath
@@ -445,7 +501,10 @@ func NewPlugin(logger *sdk.Logger, api *sdk.PluginAPI, storage *sdk.DeviceStorag
 		// (resolved above, once, via the SDK when available) is the same
 		// ffmpeg binary every recorder execs — this Generator never resolves
 		// its own path (see media/thumbs.go's package doc comment).
-		p.thumbs = media.NewGenerator(api.StoragePath, ff.Path(), p.segments, p.events, p.Logger)
+		// p.recordingsDir (Feature #1), not api.StoragePath directly, so
+		// notification-thumbs/ lands alongside recordings/ under whichever
+		// base dir is actually configured.
+		p.thumbs = media.NewGenerator(p.recordingsDir, ff.Path(), p.segments, p.events, p.Logger)
 
 		// Wires NvrScrub/NvrPreviewFrames (rpc_playback.go, Task SCRUB):
 		// same p.segments (via CoveringSegmentForRole) and resolved
@@ -465,8 +524,10 @@ func NewPlugin(logger *sdk.Logger, api *sdk.PluginAPI, storage *sdk.DeviceStorag
 
 		// Wires StartAll/Add/Remove (Task ORCH, recorder/manager.go) with
 		// what they need to actually build and start a live *recorder.
-		// Recorder per managed camera: api.StoragePath (the same directory
-		// store.Open just opened the SQLite database against — see
+		// Recorder per managed camera: p.recordingsDir (Feature #1 —
+		// api.StoragePath unless a usable recordingPath override was
+		// configured; NOT the same directory store.Open opened the SQLite
+		// database against, which always stays at api.StoragePath — see
 		// recorder.go's outDir, "<DataDir>/recordings/..."), 0 (meaning "use
 		// RecorderManager's own default", currently 60s — see
 		// defaultSegmentSeconds), and newRecorderFactory's closure, which
@@ -476,7 +537,7 @@ func NewPlugin(logger *sdk.Logger, api *sdk.PluginAPI, storage *sdk.DeviceStorag
 		// ConfigureRetention is: only reached when db opened successfully,
 		// since a real Recorder would otherwise index segments into a nil
 		// p.segments.
-		p.recorder.ConfigureRecording(api.StoragePath, 0, p.newRecorderFactory(ff))
+		p.recorder.ConfigureRecording(p.recordingsDir, 0, p.newRecorderFactory(ff))
 		// Wires RecorderManager's own lifecycle logging (recorder
 		// started/stopped/restarted, StartAll summaries, start failures —
 		// see RecorderManager.SetLogger's doc comment) through this
@@ -744,6 +805,12 @@ func (p *NVRPlugin) attachDetectionIngestion(cam *sdk.CameraDevice) {
 	if p.thumbs != nil {
 		thumbs = p.thumbs
 	}
-	ingester := newDetectionEventIngester(p.events, &p.recorders, thumbs, p.Logger)
+	// p.segments satisfies recordingCoverageChecker directly (CoversRange).
+	// Like thumbs above, it's only nil when store.Open failed in NewPlugin —
+	// attachDetectionIngestion already returned before this point in that
+	// case (the p.events nil guard above), so p.segments is always non-nil
+	// here; passed as-is (no interface-nil footgun like thumbs's typed-nil
+	// case, since *store.SegmentStore's methods are safe to reach here).
+	ingester := newDetectionEventIngester(p.events, &p.recorders, thumbs, p.segments, p.Logger)
 	p.detectionSubs.add(cam.ID(), cam.OnDetectionEvent(ingester.handle))
 }

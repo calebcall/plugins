@@ -106,6 +106,68 @@ func TestSegmentStore_InRange_BoundaryStraddle(t *testing.T) {
 	}
 }
 
+// TestSegmentStore_CoversRange proves CoversRange reports true exactly when
+// some segment for cameraID (regardless of role) overlaps the requested
+// window, and false both when the camera has no segments at all and when
+// its segments exist but don't overlap the window.
+func TestSegmentStore_CoversRange(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	segs := NewSegmentStore(db)
+
+	if _, err := segs.Add(Segment{CameraID: "cam1", Role: "high-resolution", Path: "/rec/a.mp4", StartMs: 1000, EndMs: 2000, HasVideo: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	covered, err := segs.CoversRange("cam1", 1500, 1600)
+	if err != nil {
+		t.Fatalf("CoversRange: %v", err)
+	}
+	if !covered {
+		t.Fatalf("expected a window fully inside the segment to be covered")
+	}
+
+	// A point-in-time check (startMs == endMs) inside the segment.
+	covered, err = segs.CoversRange("cam1", 1500, 1500)
+	if err != nil {
+		t.Fatalf("CoversRange: %v", err)
+	}
+	if !covered {
+		t.Fatalf("expected a point-in-time check inside the segment to be covered")
+	}
+
+	// A window that only partially overlaps still counts.
+	covered, err = segs.CoversRange("cam1", 1900, 2500)
+	if err != nil {
+		t.Fatalf("CoversRange: %v", err)
+	}
+	if !covered {
+		t.Fatalf("expected a partially overlapping window to be covered")
+	}
+
+	// A window strictly after the segment ends is not covered.
+	covered, err = segs.CoversRange("cam1", 3000, 4000)
+	if err != nil {
+		t.Fatalf("CoversRange: %v", err)
+	}
+	if covered {
+		t.Fatalf("expected a window strictly after the segment to be uncovered")
+	}
+
+	// A camera with no segments at all is not covered.
+	covered, err = segs.CoversRange("cam-unknown", 1000, 2000)
+	if err != nil {
+		t.Fatalf("CoversRange: %v", err)
+	}
+	if covered {
+		t.Fatalf("expected an unknown camera to be uncovered")
+	}
+}
+
 // TestSegmentStore_InRange_FiltersByCameraAndRole proves InRange scopes its
 // query to the requested camera and role, not just the time window.
 func TestSegmentStore_InRange_FiltersByCameraAndRole(t *testing.T) {

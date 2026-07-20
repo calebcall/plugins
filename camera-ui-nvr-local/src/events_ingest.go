@@ -49,6 +49,16 @@ type eventThumbnailer interface {
 	GenerateAsync(event store.DetectionEvent)
 }
 
+// recordingCoverageChecker is the minimal interface detectionEventIngester
+// needs to compute a DetectionEvent's has_recording flag (see
+// resolveHasRecording): does any indexed recorded segment for the event's
+// camera overlap [startMs, endMs]? *store.SegmentStore satisfies this
+// directly via CoversRange. Tests substitute a fake so this can be
+// exercised without a real SQLite-backed SegmentStore.
+type recordingCoverageChecker interface {
+	CoversRange(cameraID string, startMs, endMs int64) (bool, error)
+}
+
 // detectionEventIngester adapts sdk.CameraDevice.OnDetectionEvent's callback
 // shape into an EventStore.Upsert call, plus (Task 8) a MarkEvent call on
 // the event's camera's recorder, if one is registered. One instance is
@@ -60,21 +70,26 @@ type detectionEventIngester struct {
 	store     eventUpserter
 	recorders eventRecorderLookup
 	thumbs    eventThumbnailer
+	coverage  recordingCoverageChecker
 	logger    *sdk.Logger
 }
 
 // newDetectionEventIngester returns a detectionEventIngester that upserts
 // into store, for a camera with a registered recorder calls MarkEvent via
-// recorders, and (Task 11) dispatches thumbnail generation via thumbs.
-// logger may be nil (as in unit tests); recorders and thumbs may also be
-// nil — handle treats a nil recorders identically to RecorderFor returning
-// ok=false (skips MarkEvent), and a nil thumbs skips thumbnail generation
-// entirely — so existing callers/tests that don't care about that wiring
-// don't need to supply one. Errors are only logged, never surfaced, because
+// recorders, (Task 11) dispatches thumbnail generation via thumbs, and
+// (has_recording linkage) recomputes each event's HasRecording flag via
+// coverage before upserting — see resolveHasRecording. logger may be nil (as
+// in unit tests); recorders, thumbs, and coverage may also be nil — handle
+// treats a nil recorders identically to RecorderFor returning ok=false
+// (skips MarkEvent), a nil thumbs skips thumbnail generation entirely, and a
+// nil coverage skips the has_recording recompute (the event's own
+// HasRecording value, whatever the producer sent, is upserted unchanged) —
+// so existing callers/tests that don't care about that wiring don't need to
+// supply one. Errors are only logged, never surfaced, because
 // OnDetectionEvent's callback signature (see camera_device.go) has no error
 // return for a failed handler to report through.
-func newDetectionEventIngester(store eventUpserter, recorders eventRecorderLookup, thumbs eventThumbnailer, logger *sdk.Logger) *detectionEventIngester {
-	return &detectionEventIngester{store: store, recorders: recorders, thumbs: thumbs, logger: logger}
+func newDetectionEventIngester(store eventUpserter, recorders eventRecorderLookup, thumbs eventThumbnailer, coverage recordingCoverageChecker, logger *sdk.Logger) *detectionEventIngester {
+	return &detectionEventIngester{store: store, recorders: recorders, thumbs: thumbs, coverage: coverage, logger: logger}
 }
 
 // handle is the exact callback shape sdk.CameraDevice.OnDetectionEvent
@@ -100,11 +115,63 @@ func newDetectionEventIngester(store eventUpserter, recorders eventRecorderLooku
 // package doc for why calling MarkEvent only once, on the terminal message,
 // is exactly the bug this now avoids).
 func (i *detectionEventIngester) handle(eventType sdk.DetectionEventType, event sdk.DetectionEvent) {
+	event.HasRecording = i.resolveHasRecording(event)
+
 	if err := i.store.Upsert([]store.DetectionEvent{event}); err != nil && i.logger != nil {
 		i.logger.Error("nvr-local: upsert detection event failed:", err)
 	}
 	i.markEvent(event)
 	i.generateThumbnail(event)
+}
+
+// resolveHasRecording recomputes event.HasRecording from the recorded
+// segment index rather than trusting whatever value the detection-event
+// producer set on the wire — every event otherwise persists with
+// has_recording=0 regardless of whether footage actually exists behind it
+// (the bug this fixes: events never linked to their playable clips).
+//
+// The window checked is [event.StartTime, endMs], where endMs is
+// event.EndTime once the event has ended (EndTime > 0 — its terminal 'end'
+// lifecycle message) or event.StartTime itself for every earlier message
+// (start/update/segment-*), so:
+//
+//   - an event's very first ('start') message already reports
+//     has_recording=true when continuous recording already covers its
+//     start time (the common case) — this is CoversRange with startMs ==
+//     endMs, a point-in-time check equivalent to CoveringSegment.
+//   - the terminal ('end') message re-evaluates over the event's FULL
+//     [start,end] window, which is what actually matters for "is there a
+//     playable clip behind this event" once its real duration is known —
+//     this is also what recovers an event whose covering segment wasn't
+//     finalized/indexed yet at the moment of an earlier message
+//     (finalization lag; see recorder.go's postRollWindowMs for the same
+//     class of lag elsewhere in this plugin). Every intermediate 'update'
+//     message recomputes the same way as 'start', so a change in coverage
+//     (recording starting mid-event) is picked up before the event ends
+//     too, not just at the two lifecycle extremes.
+//
+// A nil i.coverage (callers that don't care about this wiring, matching
+// every other optional dependency on detectionEventIngester) or a failed
+// query leaves event.HasRecording exactly as the producer sent it, rather
+// than forcing it false.
+func (i *detectionEventIngester) resolveHasRecording(event sdk.DetectionEvent) bool {
+	if i.coverage == nil {
+		return event.HasRecording
+	}
+
+	endMs := event.EndTime
+	if endMs <= 0 {
+		endMs = event.StartTime
+	}
+
+	covered, err := i.coverage.CoversRange(event.CameraID, event.StartTime, endMs)
+	if err != nil {
+		if i.logger != nil {
+			i.logger.Error("nvr-local: has_recording coverage check failed:", err)
+		}
+		return event.HasRecording
+	}
+	return covered
 }
 
 // markEvent calls MarkEvent(event.ID, event.StartTime, event.EndTime) on the

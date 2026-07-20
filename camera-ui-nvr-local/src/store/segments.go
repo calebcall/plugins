@@ -279,6 +279,55 @@ func (s *SegmentStore) CoveringSegmentForRole(cameraID, role string, atMs int64)
 	return seg, true, nil
 }
 
+// CoversRange reports whether at least one indexed segment for cameraID —
+// across every recorded role, not just one — overlaps [startMs, endMs]
+// (inclusive on both ends, the same overlap test InRange/CoveringSegment
+// use: end_ms >= startMs AND start_ms <= endMs). startMs == endMs is a
+// valid, useful call (a point-in-time check, equivalent to CoveringSegment
+// but without CoveringSegment's role-priority tie-break, which doesn't
+// matter here since only existence is reported).
+//
+// This backs event ingestion's has_recording computation
+// (events_ingest.go): CoveringSegment/CoveringSegmentForRole answer "what
+// footage covers this instant/role", the question thumbnail generation and
+// scrub/playback need; this answers the coarser "was ANY of this event's
+// [start,end] window actually recorded at all", which is what
+// has_recording is for. ok is always nil-error, true/false — no coverage
+// is an expected, common outcome (recording not yet started, mode "off",
+// or an events-mode spool segment not yet promoted), never treated as a
+// failure.
+func (s *SegmentStore) CoversRange(cameraID string, startMs, endMs int64) (bool, error) {
+	s.db.Lock()
+	defer s.db.Unlock()
+
+	stmt, _, err := s.db.Conn().Prepare(`
+		SELECT 1 FROM segments
+		WHERE camera_id = ? AND end_ms >= ? AND start_ms <= ?
+		LIMIT 1`)
+	if err != nil {
+		return false, fmt.Errorf("store: prepare covers range: %w", err)
+	}
+	defer stmt.Close()
+
+	if err := stmt.BindText(1, cameraID); err != nil {
+		return false, err
+	}
+	if err := stmt.BindInt64(2, startMs); err != nil {
+		return false, err
+	}
+	if err := stmt.BindInt64(3, endMs); err != nil {
+		return false, err
+	}
+
+	if !stmt.Step() {
+		if err := stmt.Err(); err != nil {
+			return false, fmt.Errorf("store: scan covers range: %w", err)
+		}
+		return false, nil
+	}
+	return true, nil
+}
+
 // Days returns the distinct calendar days, as "YYYY-MM-DD" strings sorted
 // ascending, on which cameraID has at least one recorded segment starting
 // within the given year/month. Days are derived from start_ms interpreted
