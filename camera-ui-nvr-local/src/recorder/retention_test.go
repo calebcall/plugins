@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -546,4 +547,231 @@ func TestStopRetention_CancelsCleanlyWithoutLeaking(t *testing.T) {
 
 	m2 := NewRecorderManager()
 	m2.StopRetention()
+}
+
+// ---------------------------------------------------------------------------
+// Production bug fix: immediate startup run, shorter default interval,
+// eviction logging (see retention.go's defaultRetentionInterval,
+// StartRetention, and retentionGC.logf/warnf doc comments).
+// ---------------------------------------------------------------------------
+
+// TestDefaultRetentionInterval_Is10Minutes proves the ticker period was
+// tightened from an hour to 10 minutes — production bug fix: at sustained
+// high-ingest rates (~1.5GB/min observed), an hourly pass let disk usage
+// overshoot a configured nvrQuotaGB cap by up to ~90GB before the next pass
+// clawed it back. 10 minutes bounds the same overshoot to ~15GB.
+func TestDefaultRetentionInterval_Is10Minutes(t *testing.T) {
+	if defaultRetentionInterval != 10*time.Minute {
+		t.Fatalf("expected defaultRetentionInterval == 10m, got %v", defaultRetentionInterval)
+	}
+}
+
+// TestStartRetention_RunsImmediatelyAtStartup proves StartRetention's
+// background loop runs one RunRetentionOnce pass immediately at startup,
+// before ever waiting on a tick — production bug fix: previously GC only
+// ran on each hourly tick, so a restart anywhere in that hour reset the
+// timer and could leave the quota unenforced indefinitely under frequent
+// restarts. The fake ticker's channel is never sent to, so this only passes
+// if the immediate pass (not a tick) removed the segment.
+func TestStartRetention_RunsImmediatelyAtStartup(t *testing.T) {
+	dir := t.TempDir()
+	_, segStore, eventStore := openRetentionStores(t)
+
+	now := time.Date(2024, 6, 15, 0, 0, 0, 0, time.UTC).UnixMilli()
+	cutoff := now - 1*msPerDay
+
+	m := NewRecorderManager()
+	if err := m.Configure([]ManagedCamera{newRetentionCamera("cam1", 1)}); err != nil {
+		t.Fatal(err)
+	}
+	m.ConfigureRetention(segStore, eventStore, nil)
+
+	seg := addRetentionSegment(t, segStore, dir, "cam1", "main", cutoff-5000, cutoff-1000, 100)
+
+	ft := newFakeTicker()
+	immediateDone := make(chan struct{})
+	m.gc.newTicker = func(time.Duration) ticker { return ft }
+	m.gc.afterImmediate = func() { close(immediateDone) }
+
+	if err := m.StartRetention(time.Hour, func() int64 { return now }); err != nil {
+		t.Fatalf("StartRetention: %v", err)
+	}
+	defer m.StopRetention()
+
+	select {
+	case <-immediateDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the immediate startup gc pass to complete (zero ticks delivered)")
+	}
+
+	if _, err := os.Stat(seg.Path); !os.IsNotExist(err) {
+		t.Errorf("expected the immediate startup gc pass to have removed the expired segment file, stat err=%v", err)
+	}
+}
+
+// TestStartRetention_StopImmediatelyAfterStartDoesNotHangOrPanic proves
+// calling StopRetention right after StartRetention — racing the immediate
+// startup gc pass — neither hangs nor panics, and leaves no goroutine
+// running (StopRetention blocks on the ticker goroutine's done channel).
+// Run with -race to confirm no data race on the immediate-run guard.
+func TestStartRetention_StopImmediatelyAfterStartDoesNotHangOrPanic(t *testing.T) {
+	_, segStore, eventStore := openRetentionStores(t)
+	m := NewRecorderManager()
+	m.ConfigureRetention(segStore, eventStore, nil)
+
+	ft := newFakeTicker()
+	m.gc.newTicker = func(time.Duration) ticker { return ft }
+
+	if err := m.StartRetention(time.Hour, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		m.StopRetention()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("StopRetention did not return promptly after racing the immediate startup gc pass")
+	}
+}
+
+// TestRunRetentionOnce_AgeGC_LogsEvictionSummary proves an age-GC pass that
+// actually evicts something reports one low-noise summary line via gc.logf
+// (segment count + GB freed) — production bug fix: retention previously had
+// no logger at all, so evictions were invisible to operators.
+func TestRunRetentionOnce_AgeGC_LogsEvictionSummary(t *testing.T) {
+	dir := t.TempDir()
+	_, segStore, eventStore := openRetentionStores(t)
+
+	now := time.Date(2024, 6, 15, 0, 0, 0, 0, time.UTC).UnixMilli()
+	cutoff := now - 1*msPerDay
+
+	m := NewRecorderManager()
+	if err := m.Configure([]ManagedCamera{newRetentionCamera("cam1", 1)}); err != nil {
+		t.Fatal(err)
+	}
+	m.ConfigureRetention(segStore, eventStore, nil)
+
+	var logs []string
+	m.gc.logf = func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) }
+
+	addRetentionSegment(t, segStore, dir, "cam1", "main", cutoff-5000, cutoff-1000, 100)
+
+	if err := m.RunRetentionOnce(now); err != nil {
+		t.Fatalf("RunRetentionOnce: %v", err)
+	}
+
+	if len(logs) == 0 {
+		t.Fatal("expected at least one summary log line for an age-gc pass that evicted a segment")
+	}
+	found := false
+	for _, l := range logs {
+		if strings.Contains(l, "age gc") && strings.Contains(l, "1") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected a log line mentioning the age-gc eviction count, got %v", logs)
+	}
+}
+
+// TestRunRetentionOnce_DiskCapGC_LogsUsageAndEvictionSummary proves a
+// disk-cap pass reports a per-pass usage-vs-quota summary line, and — when
+// over cap — a separate eviction-batch summary line (segments + GB freed),
+// via gc.logf.
+func TestRunRetentionOnce_DiskCapGC_LogsUsageAndEvictionSummary(t *testing.T) {
+	dir := t.TempDir()
+	db, segStore, eventStore := openRetentionStores(t)
+
+	m := NewRecorderManager()
+	if err := m.Configure([]ManagedCamera{newRetentionCamera("cam1", 365)}); err != nil {
+		t.Fatal(err)
+	}
+	quotaGB := 1500.0 / bytesPerGB
+	m.ConfigureRetention(segStore, eventStore, fixedQuota(quotaGB), db.ClipVectors, db.FaceVectors)
+
+	var logs []string
+	m.gc.logf = func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) }
+
+	now := time.Date(2024, 6, 15, 0, 0, 0, 0, time.UTC).UnixMilli()
+	addRetentionSegment(t, segStore, dir, "cam1", "main", now-60000, now-59995, 1000)
+	addRetentionSegment(t, segStore, dir, "cam1", "main", now-20000, now-19995, 1000)
+
+	if err := m.RunRetentionOnce(now); err != nil {
+		t.Fatalf("RunRetentionOnce: %v", err)
+	}
+
+	var sawUsage, sawEviction bool
+	for _, l := range logs {
+		if strings.Contains(l, "quota") {
+			sawUsage = true
+		}
+		if strings.Contains(l, "disk-cap") && strings.Contains(l, "evicted") {
+			sawEviction = true
+		}
+	}
+	if !sawUsage {
+		t.Errorf("expected a usage-vs-quota summary log line, got %v", logs)
+	}
+	if !sawEviction {
+		t.Errorf("expected a disk-cap eviction-batch summary log line, got %v", logs)
+	}
+}
+
+// TestStartRetention_WarnsWhenScheduledPassErrors proves StartRetention's
+// background loop reports (via gc.warnf) an error returned from
+// RunRetentionOnce instead of silently discarding it (production bug fix:
+// the ticker loop previously did `_ = m.RunRetentionOnce(...)`, discarding
+// any error outright).
+func TestStartRetention_WarnsWhenScheduledPassErrors(t *testing.T) {
+	dir := t.TempDir()
+	_, segStore, eventStore := openRetentionStores(t)
+
+	now := time.Date(2024, 6, 15, 0, 0, 0, 0, time.UTC).UnixMilli()
+	cutoff := now - 1*msPerDay
+
+	m := NewRecorderManager()
+	if err := m.Configure([]ManagedCamera{newRetentionCamera("cam1", 1)}); err != nil {
+		t.Fatal(err)
+	}
+	m.ConfigureRetention(segStore, eventStore, nil)
+
+	// Force RunRetentionOnce's age gc to fail on a file-removal error
+	// (rather than an already-missing file, which is tolerated): the
+	// segment's containing directory is made unwritable, so os.Remove on
+	// the still-present file fails with a permission error. Restored so
+	// t.TempDir()'s own cleanup can still remove it.
+	addRetentionSegment(t, segStore, dir, "cam1", "main", cutoff-5000, cutoff-1000, 100)
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatalf("chmod dir read-only: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+
+	var warnings []string
+	warnDone := make(chan struct{})
+	m.gc.warnf = func(format string, args ...any) {
+		warnings = append(warnings, fmt.Sprintf(format, args...))
+		close(warnDone)
+	}
+	ft := newFakeTicker()
+	m.gc.newTicker = func(time.Duration) ticker { return ft }
+
+	if err := m.StartRetention(time.Hour, nil); err != nil {
+		t.Fatalf("StartRetention: %v", err)
+	}
+	defer m.StopRetention()
+
+	select {
+	case <-warnDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for StartRetention to warn about the immediate pass's error")
+	}
+
+	if len(warnings) == 0 {
+		t.Fatal("expected at least one warning to be logged")
+	}
 }

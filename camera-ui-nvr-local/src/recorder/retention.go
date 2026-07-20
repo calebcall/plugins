@@ -81,11 +81,19 @@ const msPerDay = 24 * 60 * 60 * 1000
 const bytesPerGB = 1_000_000_000
 
 // defaultRetentionInterval is the ticker period StartRetention uses when
-// called with interval <= 0. An hour is frequent enough that a camera's
-// disk usage or age-eligible footage never drifts far past its configured
-// limit, without re-scanning every camera's full segment/event set needlessly
-// often.
-const defaultRetentionInterval = time.Hour
+// called with interval <= 0.
+//
+// Was time.Hour; changed to 10 minutes (production bug fix — see below).
+// At sustained high-ingest rates (observed ~1.5GB/min across a multi-camera
+// instance), an hourly pass lets disk usage overshoot a configured
+// nvrQuotaGB cap by up to ~90GB before the next pass claws it back — and if
+// the process restarts anywhere in that hour (StartRetention previously had
+// no immediate run either — see StartRetention's own doc comment), the
+// window resets and GC can go long stretches without ever firing. 10
+// minutes bounds the same overshoot to ~1.5GB/min * 10min ≈ 15GB, a much
+// tighter tolerance around the cap, without re-scanning every camera's full
+// segment/event set often enough to matter for cost.
+const defaultRetentionInterval = 10 * time.Minute
 
 // ticker abstracts the periodic tick source StartRetention's background loop
 // waits on. Production uses realTicker (wrapping time.Ticker); tests inject
@@ -141,6 +149,32 @@ type retentionGC struct {
 	// gotten far enough. See TestStartRetention_TickTriggersRunRetentionOnce.
 	afterTick func()
 
+	// afterImmediate, if set, is called once, right after StartRetention's
+	// immediate startup RunRetentionOnce call returns (before the ticker
+	// loop is ever entered) — the same test-only synchronization purpose as
+	// afterTick, kept as a separate hook so a test can wait specifically for
+	// the startup pass without it being confused for (or racing) a
+	// tick-driven one. nil in production. See
+	// TestStartRetention_RunsImmediatelyAtStartup.
+	afterImmediate func()
+
+	// logf/warnf report retention GC activity: one summary line per
+	// RunRetentionOnce pass (usage vs quota, over/under cap) plus one line
+	// per eviction batch (segments/bytes removed, age-retention or
+	// disk-cap), and a warning when a scheduled pass returns an error.
+	// ConfigureRetention defaults both to the owning RecorderManager's own
+	// logf/warnf (manager.go) — method values that re-read m.log fresh on
+	// every call, so logging works correctly even though production wiring
+	// calls SetLogger *after* ConfigureRetention (see plugin.go). nil (the
+	// zero value) silently drops the log line, the same tolerance
+	// RecorderManager.logf/warnf already have for a manager with no logger
+	// set. Tests in this package override these fields directly — the same
+	// white-box pattern already used for newTicker/afterTick — to capture
+	// calls instead of writing through a real *sdk.Logger (which has no
+	// injectable writer to intercept).
+	logf  func(format string, args ...any)
+	warnf func(format string, args ...any)
+
 	mu      sync.Mutex
 	cancel  func()
 	done    chan struct{}
@@ -174,6 +208,25 @@ func (m *RecorderManager) ConfigureRetention(segStore *store.SegmentStore, event
 		quotaGB:    quotaGB,
 		vectors:    vectors,
 		newTicker:  newRealTicker,
+		logf:       m.logf,
+		warnf:      m.warnf,
+	}
+}
+
+// logPass reports one retention log line via gc.logf, if set — a thin
+// nil-guard so every call site below doesn't have to repeat it. See
+// retentionGC.logf's doc comment.
+func (gc *retentionGC) logPass(format string, args ...any) {
+	if gc.logf != nil {
+		gc.logf(format, args...)
+	}
+}
+
+// warnPass reports one retention warning via gc.warnf, if set — the warning
+// counterpart to logPass. See retentionGC.warnf's doc comment.
+func (gc *retentionGC) warnPass(format string, args ...any) {
+	if gc.warnf != nil {
+		gc.warnf(format, args...)
 	}
 }
 
@@ -211,15 +264,23 @@ func (m *RecorderManager) RunRetentionOnce(nowMs int64) error {
 
 	var errs []error
 	cameraIDs := make([]string, 0, len(entries))
+	var ageRemovedSegs int
+	var ageRemovedBytes int64
 	for _, entry := range entries {
 		cameraIDs = append(cameraIDs, entry.CameraID)
 
 		if entry.Config.RetentionDays > 0 {
 			cutoffMs := nowMs - int64(entry.Config.RetentionDays)*msPerDay
-			if err := gc.deleteSegmentsAndCascadeOlderThan(entry.CameraID, cutoffMs); err != nil {
+			n, b, err := gc.deleteSegmentsAndCascadeOlderThan(entry.CameraID, cutoffMs)
+			ageRemovedSegs += n
+			ageRemovedBytes += b
+			if err != nil {
 				errs = append(errs, fmt.Errorf("retention: camera %s: age gc: %w", entry.CameraID, err))
 			}
 		}
+	}
+	if ageRemovedSegs > 0 {
+		gc.logPass("retention: age gc evicted %d segment(s) (%.2f GB) past their camera's retention window", ageRemovedSegs, float64(ageRemovedBytes)/bytesPerGB)
 	}
 
 	if gc.quotaGB != nil {
@@ -236,6 +297,18 @@ func (m *RecorderManager) RunRetentionOnce(nowMs int64) error {
 // StartRetention begins a background ticker that calls RunRetentionOnce
 // every interval (defaultRetentionInterval if interval <= 0), sourcing each
 // call's nowMs from clockNow (time.Now().UnixMilli if clockNow is nil).
+//
+// Production bug fix: before ever waiting on the first tick, the background
+// goroutine now runs one RunRetentionOnce pass immediately. Previously GC
+// only ran on a tick, so quota enforcement lagged a full interval behind
+// every launch/restart — and under frequent restarts (each one resetting
+// the timer) could go long stretches without running at all, letting a
+// configured nvrQuotaGB cap drift far over. The immediate pass still
+// respects a Stop() that races it: it's guarded by the same stop-channel
+// check the tick loop uses, so a Stop() called right after Start either
+// skips it entirely or lets it run to completion and then exits cleanly —
+// never blocking StopRetention indefinitely either way.
+//
 // Returns immediately; the ticker runs in its own goroutine until
 // StopRetention is called. A no-op (nil error, nothing started) when
 // retention hasn't been configured (ConfigureRetention) or a ticker is
@@ -274,14 +347,34 @@ func (m *RecorderManager) StartRetention(interval time.Duration, clockNow func()
 
 	go func() {
 		defer close(done)
+
+		// t is created (and its Stop deferred) before the immediate pass
+		// below, unconditionally — so StopRetention's expectation that the
+		// ticker is always Stop()ped before the goroutine exits holds
+		// regardless of whether the immediate pass below actually ran.
 		t := newTicker(interval)
 		defer t.Stop()
+
+		select {
+		case <-stop:
+			return
+		default:
+			if err := m.RunRetentionOnce(clockNow()); err != nil {
+				gc.warnPass("retention: immediate startup gc pass failed: %v", err)
+			}
+			if gc.afterImmediate != nil {
+				gc.afterImmediate()
+			}
+		}
+
 		for {
 			select {
 			case <-stop:
 				return
 			case <-t.C():
-				_ = m.RunRetentionOnce(clockNow())
+				if err := m.RunRetentionOnce(clockNow()); err != nil {
+					gc.warnPass("retention: scheduled gc pass failed: %v", err)
+				}
 				if gc.afterTick != nil {
 					gc.afterTick()
 				}
@@ -337,28 +430,37 @@ func (m *RecorderManager) StopRetention() {
 // returned error) but never rolls back the already-committed row deletion,
 // so a stubborn file (e.g. a permission error) doesn't leave a
 // still-referenced-by-nothing row stuck in the store forever.
-func (gc *retentionGC) deleteSegmentsAndCascadeOlderThan(cameraID string, cutoffMs int64) error {
+//
+// Returns the number of segments removed and their total on-disk size in
+// bytes (measured before removal), so callers (RunRetentionOnce's age loop,
+// enforceInstanceQuota) can report one eviction-batch summary line instead
+// of logging per file.
+func (gc *retentionGC) deleteSegmentsAndCascadeOlderThan(cameraID string, cutoffMs int64) (removedSegments int, removedBytes int64, err error) {
 	var errs []error
 
 	if gc.segStore != nil {
-		paths, err := gc.segStore.DeleteOlderThan(cameraID, cutoffMs)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("delete segments: %w", err))
+		paths, dErr := gc.segStore.DeleteOlderThan(cameraID, cutoffMs)
+		if dErr != nil {
+			errs = append(errs, fmt.Errorf("delete segments: %w", dErr))
 		} else {
+			removedSegments = len(paths)
+			for _, p := range paths {
+				removedBytes += fileSize(p)
+			}
 			errs = append(errs, removeFiles(paths)...)
 		}
 	}
 
 	if gc.eventStore != nil {
-		deleted, err := gc.eventStore.DeleteOlderThan(cameraID, cutoffMs)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("delete events: %w", err))
+		deleted, dErr := gc.eventStore.DeleteOlderThan(cameraID, cutoffMs)
+		if dErr != nil {
+			errs = append(errs, fmt.Errorf("delete events: %w", dErr))
 		} else {
 			errs = append(errs, gc.cascadeDeletedEvents(deleted)...)
 		}
 	}
 
-	return errors.Join(errs...)
+	return removedSegments, removedBytes, errors.Join(errs...)
 }
 
 // cascadeDeletedEvents removes each deleted event's thumbnail file (if any —
@@ -441,9 +543,12 @@ func (gc *retentionGC) enforceInstanceQuota(cameraIDs []string, quotaGB float64)
 		sizes[i] = fileSize(cs.seg.Path)
 		total += sizes[i]
 	}
+	usageGB := float64(total) / bytesPerGB
 	if total <= quotaBytes {
+		gc.logPass("retention: disk-cap gc pass: usage %.2f GB / quota %.2f GB (under cap)", usageGB, quotaGB)
 		return nil
 	}
+	gc.logPass("retention: disk-cap gc pass: usage %.2f GB / quota %.2f GB (OVER cap, evicting oldest segments)", usageGB, quotaGB)
 
 	cutoffs := make(map[string]int64)
 	for i, cs := range all {
@@ -457,10 +562,18 @@ func (gc *retentionGC) enforceInstanceQuota(cameraIDs []string, quotaGB float64)
 	}
 
 	var errs []error
+	var evictedSegs int
+	var evictedBytes int64
 	for camID, cutoffMs := range cutoffs {
-		if err := gc.deleteSegmentsAndCascadeOlderThan(camID, cutoffMs+1); err != nil {
+		n, b, err := gc.deleteSegmentsAndCascadeOlderThan(camID, cutoffMs+1)
+		evictedSegs += n
+		evictedBytes += b
+		if err != nil {
 			errs = append(errs, fmt.Errorf("camera %s: %w", camID, err))
 		}
+	}
+	if evictedSegs > 0 {
+		gc.logPass("retention: disk-cap gc evicted %d segment(s) (%.2f GB) across %d camera(s) to reclaim quota", evictedSegs, float64(evictedBytes)/bytesPerGB, len(cutoffs))
 	}
 	return errors.Join(errs...)
 }
