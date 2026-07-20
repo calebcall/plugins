@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"sync"
 
 	sdk "github.com/cameraui/sdk/go"
@@ -115,6 +116,23 @@ func newDetectionEventIngester(store eventUpserter, recorders eventRecorderLooku
 // package doc for why calling MarkEvent only once, on the terminal message,
 // is exactly the bug this now avoids).
 func (i *detectionEventIngester) handle(eventType sdk.DetectionEventType, event sdk.DetectionEvent) {
+	if i.logger != nil {
+		dets := ""
+		for _, s := range event.Segments {
+			for _, d := range s.Detections {
+				dets += fmt.Sprintf("[%s=%.2f]", d.Label, d.Score)
+			}
+			for _, a := range s.Attributes {
+				dets += fmt.Sprintf("{%s:%s=%.2f}", a.Type, a.Label, a.Confidence)
+			}
+		}
+		trigs := ""
+		for _, t := range event.Triggers {
+			trigs += fmt.Sprintf("(%s=%.2f)", t.Type, t.Score)
+		}
+		i.logger.Debug(fmt.Sprintf("nvr-local: ingest type=%s id=%s state=%s types=%v segs=%d dets=%s trigs=%s", eventType, event.ID, event.State, event.Types, len(event.Segments), dets, trigs))
+	}
+
 	event.HasRecording = i.resolveHasRecording(event)
 
 	if err := i.store.Upsert([]store.DetectionEvent{event}); err != nil && i.logger != nil {
