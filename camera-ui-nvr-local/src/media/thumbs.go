@@ -5,10 +5,13 @@
 // records its path on the event's row so getEventThumbnails
 // (rpc_events.go, camera-ui-nvr-local's main package) can serve it later.
 //
-// Nothing here duplicates ffmpeg/ffprobe binary path resolution — callers
-// pass in the already-resolved path (see recorder.ResolveFFmpeg, reused as
-// the single source of truth for CAMERAUI_FFMPEG_PATH/PATH-fallback
-// resolution; see that package's ffmpeg.go for why).
+// Nothing here duplicates ffmpeg binary path resolution — callers pass in
+// the already-resolved path (see recorder.ResolveFFmpegSDK/ResolveFFmpeg,
+// the single source of truth for resolving ffmpeg via the SDK's
+// CoreManager.GetFFmpegPath RPC with an env/PATH fallback; see that
+// package's ffmpeg.go for why). This package never uses ffprobe either —
+// node-av (the core's bundled media toolchain) ships no ffprobe binary at
+// all, and frame extraction only ever needs ffmpeg's own -ss/-frames:v.
 package media
 
 import (

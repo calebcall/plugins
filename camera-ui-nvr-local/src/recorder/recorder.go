@@ -197,7 +197,7 @@ type Recorder struct {
 }
 
 // NewRecorder returns a Recorder for cfg, ready to Start. segStore is where
-// finished segments are indexed; ff resolves the ffmpeg/ffprobe binaries;
+// finished segments are indexed; ff resolves the ffmpeg binary;
 // log may be nil (as in unit tests) — every log call below guards for that,
 // matching the pattern established by detectionEventIngester
 // (events_ingest.go) since neither has anywhere else to report an error
@@ -467,9 +467,13 @@ func (r *Recorder) watchSegments(ctx context.Context, outDir, role string) {
 // *processedUpTo (already indexed by an earlier tick — sort.SearchStrings
 // finds that boundary in the already-sorted list without rescanning it), and
 // indexes the rest, skipping the newest file unless final is true (see
-// watchSegments). *processedUpTo only advances past a file once it has been
-// successfully indexed; on the first failure in a tick (e.g. ffprobe
-// transiently unable to read a file mid-write) the sweep stops rather than
+// watchSegments). Each indexed segment's end time is derived from the
+// immediately following file's own filename-encoded start time
+// (parseEpochStartMs), not ffprobe — see finalizeSegment/segmentTimeRange;
+// this is exactly why the newest file is left alone until a further-newer
+// one appears (or the run ends): only then is its end time actually known.
+// *processedUpTo only advances past a file once it has been successfully
+// indexed; on the first failure in a tick the sweep stops rather than
 // skipping ahead, so a failed file and everything after it are retried
 // together, in order, on the next tick instead of ever being silently
 // dropped.
@@ -492,7 +496,15 @@ func (r *Recorder) sweepSegments(outDir, role string, processedUpTo *string, fin
 
 	for i := start; i < limit; i++ {
 		path := files[i]
-		seg, err := finalizeSegment(r.ff, r.segStore, r.cfg.CameraID, role, path, r.initiallyReferenced())
+
+		var nextStartMs *int64
+		if i+1 < len(files) {
+			if ms, ok := parseEpochStartMs(files[i+1]); ok {
+				nextStartMs = &ms
+			}
+		}
+
+		seg, err := finalizeSegment(r.ff, r.segStore, r.cfg.CameraID, role, path, r.initiallyReferenced(), nextStartMs, r.cfg.SegmentSeconds)
 		if err != nil {
 			r.logf("recorder: %s/%s: index segment %s: %v", r.cfg.CameraID, role, path, err)
 			return
@@ -558,28 +570,26 @@ func (r *Recorder) logf(format string, args ...any) {
 	r.log.Log(fmt.Sprintf(format, args...))
 }
 
-// finalizeSegment probes path (a segment file ffmpeg has finished writing)
-// via ff, derives its start/end/codec info, and indexes it into segStore as
-// a store.Segment for cameraID/role, with Referenced set to referenced (see
+// finalizeSegment derives path's (a segment file ffmpeg has finished
+// writing) start/end window (segmentTimeRange) and best-effort audio/codec
+// info (FFmpeg.probeCodecInfo), and indexes it into segStore as a
+// store.Segment for cameraID/role, with Referenced set to referenced (see
 // initiallyReferenced: false for an events-mode spool segment, true
 // otherwise). Returns the indexed segment (with its assigned ID) on success.
-func finalizeSegment(ff *FFmpeg, segStore *store.SegmentStore, cameraID, role, path string, referenced bool) (store.Segment, error) {
-	res, err := ff.probe(path)
+//
+// Deliberately ffprobe-free (see ffmpeg.go's FFmpeg doc comment for why:
+// node-av, the core's bundled toolchain, ships no ffprobe binary at all).
+// HasVideo is always true — every segment comes from stream-copying a
+// camera's video RTSP role — and HasAudio/Codec come from
+// probeCodecInfo's best-effort parse of `ffmpeg -i path`'s stderr, which
+// never blocks indexing on a parse miss (see that method's doc comment).
+func finalizeSegment(ff *FFmpeg, segStore *store.SegmentStore, cameraID, role, path string, referenced bool, nextStartMs *int64, segmentSeconds int) (store.Segment, error) {
+	startMs, endMs, err := segmentTimeRange(path, nextStartMs, segmentSeconds)
 	if err != nil {
 		return store.Segment{}, err
 	}
 
-	durationMs, ok := res.durationMs()
-	if !ok {
-		return store.Segment{}, fmt.Errorf("recorder: finalize %s: no parseable duration in ffprobe output", path)
-	}
-
-	startMs, endMs, err := segmentTimeRange(path, durationMs)
-	if err != nil {
-		return store.Segment{}, err
-	}
-
-	hasVideo, hasAudio, codec := res.videoAudio()
+	hasAudio, codec := ff.probeCodecInfo(path)
 
 	seg := store.Segment{
 		CameraID:   cameraID,
@@ -587,7 +597,7 @@ func finalizeSegment(ff *FFmpeg, segStore *store.SegmentStore, cameraID, role, p
 		Path:       path,
 		StartMs:    startMs,
 		EndMs:      endMs,
-		HasVideo:   hasVideo,
+		HasVideo:   true,
 		HasAudio:   hasAudio,
 		Codec:      codec,
 		Referenced: referenced,
@@ -601,20 +611,46 @@ func finalizeSegment(ff *FFmpeg, segStore *store.SegmentStore, cameraID, role, p
 	return seg, nil
 }
 
-// segmentTimeRange derives a segment file's [startMs, endMs) window given
-// its known duration. ffmpeg's segment muxer (see FFmpeg.segmentArgs's
-// -strftime 1 pattern) names each file after the Unix epoch second it was
-// opened at, so the primary path parses path's basename as that integer and
-// uses it directly as the (exact) start time. Any file whose basename isn't
-// a plain integer (e.g. a hand-picked fixture file in a test, or a segment
-// produced by some other naming scheme) falls back to the file's mtime as
-// an estimate of when it finished writing, and derives the start time by
-// subtracting the known duration from that.
-func segmentTimeRange(path string, durationMs int64) (startMs, endMs int64, err error) {
+// parseEpochStartMs parses path's basename as the plain-integer Unix epoch
+// second ffmpeg's -strftime 1 "%s.mp4" segment naming produces (see
+// FFmpeg.segmentArgs), returning it in milliseconds. ok is false for any
+// basename that isn't a positive plain integer (e.g. a hand-picked fixture
+// filename in a test).
+func parseEpochStartMs(path string) (ms int64, ok bool) {
 	base := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
-	if epochSeconds, convErr := strconv.ParseInt(base, 10, 64); convErr == nil && epochSeconds > 0 {
-		startMs = epochSeconds * 1000
-		return startMs, startMs + durationMs, nil
+	epochSeconds, err := strconv.ParseInt(base, 10, 64)
+	if err != nil || epochSeconds <= 0 {
+		return 0, false
+	}
+	return epochSeconds * 1000, true
+}
+
+// segmentTimeRange derives a segment file's [startMs, endMs) window without
+// ffprobe. ffmpeg's segment muxer names each file after the Unix epoch
+// second it was opened at (parseEpochStartMs), so the primary path reads
+// that directly as the exact start time. endMs is the immediately following
+// segment's own start time when the caller has one (nextStartMs —
+// sweepSegments always supplies this once a segment is superseded by a
+// newer one, since the two are sequential: the moment ffmpeg stopped
+// writing this file is exactly the moment it started the next one);
+// otherwise (the last segment seen so far, still possibly being written, or
+// the very last file in a final sweep) it's estimated as
+// startMs + segmentSeconds.
+//
+// Any file whose basename isn't a plain integer (e.g. a hand-picked fixture
+// file in a test, or a segment produced by some other naming scheme) falls
+// back to the same nextStartMs-or-estimate logic for endMs, using the
+// file's mtime as the estimate's basis instead of a parsed start, and
+// derives startMs as endMs minus the segmentSeconds estimate.
+func segmentTimeRange(path string, nextStartMs *int64, segmentSeconds int) (startMs, endMs int64, err error) {
+	estimatedDurationMs := int64(segmentSeconds) * 1000
+
+	if ms, ok := parseEpochStartMs(path); ok {
+		startMs = ms
+		if nextStartMs != nil {
+			return startMs, *nextStartMs, nil
+		}
+		return startMs, startMs + estimatedDurationMs, nil
 	}
 
 	info, statErr := os.Stat(path)
@@ -622,6 +658,9 @@ func segmentTimeRange(path string, durationMs int64) (startMs, endMs int64, err 
 		return 0, 0, fmt.Errorf("recorder: stat %s: %w", path, statErr)
 	}
 	endMs = info.ModTime().UnixMilli()
-	startMs = endMs - durationMs
+	if nextStartMs != nil {
+		endMs = *nextStartMs
+	}
+	startMs = endMs - estimatedDurationMs
 	return startMs, endMs, nil
 }

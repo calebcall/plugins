@@ -16,17 +16,16 @@ import (
 	"github.com/calebcall/plugins/camera-ui-nvr-local/src/store"
 )
 
-// requireFFmpeg skips the calling test if the local ffmpeg/ffprobe binaries
-// aren't available (both are present in this dev environment, but tests
-// that shell out to them should degrade gracefully rather than failing hard
-// on a machine that lacks them).
+// requireFFmpeg skips the calling test if the local ffmpeg binary isn't
+// available (it is present in this dev environment, but tests that shell out
+// to it should degrade gracefully rather than failing hard on a machine that
+// lacks it). This package never requires ffprobe — see ffmpeg.go's FFmpeg
+// doc comment for why (node-av, the core's bundled toolchain, ships no
+// ffprobe binary at all).
 func requireFFmpeg(t *testing.T) {
 	t.Helper()
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
 		t.Skip("ffmpeg not found on PATH")
-	}
-	if _, err := exec.LookPath("ffprobe"); err != nil {
-		t.Skip("ffprobe not found on PATH")
 	}
 }
 
@@ -46,18 +45,24 @@ func newTestSegmentStore(t *testing.T) *store.SegmentStore {
 // segmentTimeRange
 // ---------------------------------------------------------------------------
 
-// TestSegmentTimeRange_ParsesEpochFilename proves the primary path: a
-// filename that's a plain integer (as ffmpeg's -strftime 1 "%s.mp4" pattern
-// always produces) is read directly as the segment's start time, in whole
-// seconds since the epoch.
-func TestSegmentTimeRange_ParsesEpochFilename(t *testing.T) {
+// TestSegmentTimeRange_ParsesEpochFilename_UsesNextSegmentStartAsEnd proves
+// the primary, ffprobe-free path: a filename that's a plain integer (as
+// ffmpeg's -strftime 1 "%s.mp4" pattern always produces) is read directly as
+// the segment's start time, and when the caller supplies the immediately
+// following segment's own start time (nextStartMs — the incremental
+// watcher, sweepSegments, always has this once a segment is superseded by a
+// newer one), that becomes the exact end time: the two segments are
+// sequential, so the moment ffmpeg stopped writing this one is exactly the
+// moment it started the next one.
+func TestSegmentTimeRange_ParsesEpochFilename_UsesNextSegmentStartAsEnd(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "1700000000.mp4")
 	if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	startMs, endMs, err := segmentTimeRange(path, 5000)
+	next := int64(1700000005000)
+	startMs, endMs, err := segmentTimeRange(path, &next, 60)
 	if err != nil {
 		t.Fatalf("segmentTimeRange: %v", err)
 	}
@@ -65,15 +70,39 @@ func TestSegmentTimeRange_ParsesEpochFilename(t *testing.T) {
 		t.Errorf("startMs = %d, want 1700000000000", startMs)
 	}
 	if endMs != 1700000005000 {
-		t.Errorf("endMs = %d, want 1700000005000", endMs)
+		t.Errorf("endMs = %d, want 1700000005000 (the next segment's start)", endMs)
+	}
+}
+
+// TestSegmentTimeRange_ParsesEpochFilename_EstimatesEndWhenNoNextSegment
+// proves the fallback used when there is no next segment yet (the final
+// sweep's last file, or a recorder that stopped mid-segment): endMs is
+// estimated as startMs + segmentSeconds.
+func TestSegmentTimeRange_ParsesEpochFilename_EstimatesEndWhenNoNextSegment(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "1700000000.mp4")
+	if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	startMs, endMs, err := segmentTimeRange(path, nil, 5)
+	if err != nil {
+		t.Fatalf("segmentTimeRange: %v", err)
+	}
+	if startMs != 1700000000000 {
+		t.Errorf("startMs = %d, want 1700000000000", startMs)
+	}
+	if endMs != 1700000005000 {
+		t.Errorf("endMs = %d, want 1700000005000 (start + 5s estimate)", endMs)
 	}
 }
 
 // TestSegmentTimeRange_FallsBackToMtimeForNonEpochFilename proves the
 // fallback path used when a file's basename isn't a plain integer (e.g. a
 // fixture file with a human-chosen name, as the brief's own real-media
-// example uses ("out.mp4")): start/end are derived from the file's mtime
-// (treated as the moment it finished writing) minus the known duration.
+// example uses ("out.mp4")): with no next-segment start available, end is
+// derived from the file's mtime (treated as the moment it finished writing)
+// and start is estimated as end minus segmentSeconds.
 func TestSegmentTimeRange_FallsBackToMtimeForNonEpochFilename(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "out.mp4")
@@ -81,12 +110,12 @@ func TestSegmentTimeRange_FallsBackToMtimeForNonEpochFilename(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	startMs, endMs, err := segmentTimeRange(path, 2000)
+	startMs, endMs, err := segmentTimeRange(path, nil, 2)
 	if err != nil {
 		t.Fatalf("segmentTimeRange: %v", err)
 	}
 	if endMs-startMs != 2000 {
-		t.Errorf("expected exactly the given duration apart, got start=%d end=%d", startMs, endMs)
+		t.Errorf("expected exactly the segmentSeconds estimate apart, got start=%d end=%d", startMs, endMs)
 	}
 
 	info, statErr := os.Stat(path)
@@ -95,6 +124,29 @@ func TestSegmentTimeRange_FallsBackToMtimeForNonEpochFilename(t *testing.T) {
 	}
 	if endMs != info.ModTime().UnixMilli() {
 		t.Errorf("expected endMs to equal the file's mtime, got endMs=%d mtime=%d", endMs, info.ModTime().UnixMilli())
+	}
+}
+
+// TestSegmentTimeRange_FallsBackToMtimeForNonEpochFilename_UsesNextSegmentStart
+// proves the non-epoch-filename path also prefers nextStartMs over mtime for
+// the end time when one is available.
+func TestSegmentTimeRange_FallsBackToMtimeForNonEpochFilename_UsesNextSegmentStart(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "out.mp4")
+	if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	next := int64(1700000005000)
+	startMs, endMs, err := segmentTimeRange(path, &next, 2)
+	if err != nil {
+		t.Fatalf("segmentTimeRange: %v", err)
+	}
+	if endMs != 1700000005000 {
+		t.Errorf("endMs = %d, want 1700000005000 (the next segment's start)", endMs)
+	}
+	if startMs != 1700000003000 {
+		t.Errorf("startMs = %d, want 1700000003000 (end - 2s estimate)", startMs)
 	}
 }
 
@@ -107,9 +159,12 @@ func TestSegmentTimeRange_FallsBackToMtimeForNonEpochFilename(t *testing.T) {
 // binary (the exact fixture command the brief names —
 // "testsrc=duration=2:size=320x240:rate=10" — under a plain, non-epoch
 // filename to exercise the mtime-fallback branch of segmentTimeRange too),
-// feeds it through finalizeSegment, and asserts the resulting store.Segment
-// row has a correct duration (EndMs-StartMs), HasVideo, and Codec, all
-// derived from real ffprobe output rather than a fake.
+// feeds it through finalizeSegment (with no next-segment start, so end is
+// estimated from segmentSeconds — see segmentTimeRange), and asserts the
+// resulting store.Segment row has a correct duration (EndMs-StartMs),
+// HasVideo, and Codec — all without ever execing ffprobe (removed entirely;
+// see ffmpeg.go's FFmpeg doc comment). Codec/HasAudio come from
+// FFmpeg.probeCodecInfo's best-effort `ffmpeg -i` stderr parsing.
 func TestFinalizeSegment_IndexesRealFMP4File(t *testing.T) {
 	requireFFmpeg(t)
 
@@ -126,7 +181,8 @@ func TestFinalizeSegment_IndexesRealFMP4File(t *testing.T) {
 	segStore := newTestSegmentStore(t)
 	ff := ResolveFFmpeg()
 
-	seg, err := finalizeSegment(ff, segStore, "cam1", "high", path, true)
+	const segmentSeconds = 2 // matches the fixture's testsrc=duration=2
+	seg, err := finalizeSegment(ff, segStore, "cam1", "high", path, true, nil, segmentSeconds)
 	if err != nil {
 		t.Fatalf("finalizeSegment: %v", err)
 	}
@@ -148,8 +204,8 @@ func TestFinalizeSegment_IndexesRealFMP4File(t *testing.T) {
 	}
 
 	durationMs := seg.EndMs - seg.StartMs
-	if durationMs < 1500 || durationMs > 2500 {
-		t.Errorf("expected duration ~2000ms (source was testsrc=duration=2), got %dms (start=%d end=%d)", durationMs, seg.StartMs, seg.EndMs)
+	if durationMs != 2000 {
+		t.Errorf("expected duration exactly 2000ms (segmentSeconds estimate), got %dms (start=%d end=%d)", durationMs, seg.StartMs, seg.EndMs)
 	}
 
 	got, err := segStore.InRange("cam1", "high", seg.StartMs, seg.EndMs)
@@ -158,6 +214,54 @@ func TestFinalizeSegment_IndexesRealFMP4File(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].Path != path {
 		t.Fatalf("expected the finalized segment to be queryable via InRange, got %+v", got)
+	}
+}
+
+// TestFinalizeSegment_NeverExecsFfprobe is the task's required RED/GREEN
+// proof that finalization never shells out to ffprobe: it restricts PATH to
+// a directory containing only a wrapper "ffmpeg" script (which forwards to
+// the real, pre-resolved system ffmpeg) and deliberately no "ffprobe" at
+// all. Against the pre-fix code (which called FFmpeg.probe, execing
+// f.ffprobePath == "ffprobe") this fails with "executable file not found in
+// $PATH"; against the fixed code it passes, since finalizeSegment/
+// probeCodecInfo only ever exec f.ffmpegPath.
+func TestFinalizeSegment_NeverExecsFfprobe(t *testing.T) {
+	requireFFmpeg(t)
+
+	realFFmpeg, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		t.Fatalf("LookPath ffmpeg: %v", err)
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "out.mp4")
+	genCmd := exec.Command(realFFmpeg, "-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "testsrc=duration=1:size=320x240:rate=5",
+		"-c:v", "libx264", "-movflags", "+frag_keyframe+empty_moov", path)
+	if out, err := genCmd.CombinedOutput(); err != nil {
+		t.Fatalf("generate fixture fMP4: %v\n%s", err, out)
+	}
+
+	binDir := t.TempDir()
+	wrapper := filepath.Join(binDir, "ffmpeg")
+	script := "#!/bin/sh\nexec " + realFFmpeg + " \"$@\"\n"
+	if err := os.WriteFile(wrapper, []byte(script), 0o755); err != nil {
+		t.Fatalf("write ffmpeg wrapper: %v", err)
+	}
+	// binDir intentionally contains no "ffprobe" — restricting PATH to just
+	// this directory means any attempt to exec ffprobe fails immediately
+	// with "not found", proving finalization never tries to.
+	t.Setenv("PATH", binDir)
+
+	segStore := newTestSegmentStore(t)
+	ff := &FFmpeg{ffmpegPath: "ffmpeg"} // resolved against the restricted PATH
+
+	seg, err := finalizeSegment(ff, segStore, "cam1", "high", path, true, nil, 1)
+	if err != nil {
+		t.Fatalf("finalizeSegment: %v (should never need ffprobe)", err)
+	}
+	if !seg.HasVideo {
+		t.Errorf("expected HasVideo=true")
 	}
 }
 
@@ -200,7 +304,7 @@ func (f *fakeRunner) callCount() int {
 // process or wall-clock timing.
 func TestRecorder_SupervisionRestartsWithBackoffAndStopsCleanly(t *testing.T) {
 	segStore := newTestSegmentStore(t)
-	ff := &FFmpeg{ffmpegPath: "ffmpeg", ffprobePath: "ffprobe"}
+	ff := &FFmpeg{ffmpegPath: "ffmpeg"}
 
 	cfg := RecorderConfig{
 		CameraID:       "cam1",
@@ -395,7 +499,7 @@ func TestTailBuffer_BoundedToMaxSize(t *testing.T) {
 // ...) must be visible in the logged error, not just a bare exit status.
 func TestRunOnce_CapturesFfmpegStderrTailOnFailure(t *testing.T) {
 	segStore := newTestSegmentStore(t)
-	ff := &FFmpeg{ffmpegPath: "ffmpeg", ffprobePath: "ffprobe"}
+	ff := &FFmpeg{ffmpegPath: "ffmpeg"}
 
 	cfg := RecorderConfig{
 		CameraID:       "cam1",
@@ -456,7 +560,7 @@ func TestRunOnce_CapturesFfmpegStderrTailOnFailure(t *testing.T) {
 // "sync: WaitGroup misuse" panic.
 func TestRecorder_ConcurrentStartStop_NoRaceAndCleanStop(t *testing.T) {
 	segStore := newTestSegmentStore(t)
-	ff := &FFmpeg{ffmpegPath: "ffmpeg", ffprobePath: "ffprobe"}
+	ff := &FFmpeg{ffmpegPath: "ffmpeg"}
 
 	cfg := RecorderConfig{
 		CameraID:       "cam1",

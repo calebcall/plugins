@@ -325,6 +325,26 @@ func (p *NVRPlugin) nvrQuotaGB() float64 {
 func NewPlugin(logger *sdk.Logger, api *sdk.PluginAPI, storage *sdk.DeviceStorage) sdk.Plugin {
 	p := &NVRPlugin{BasePlugin: sdk.NewBasePlugin(logger, api, storage), recorder: recorder.NewRecorderManager(), store: storage}
 
+	// ff resolves the ffmpeg binary every recorder and the thumbnail
+	// Generator below exec: primarily via the SDK's CoreManager.GetFFmpegPath
+	// RPC (recorder.ResolveFFmpegSDK — see that function's doc comment for
+	// the confirmed production bug this fixes: the core's master-mode
+	// runtime hands plugins an explicit env allow-list with neither PATH nor
+	// CAMERAUI_FFMPEG_PATH set, so the plain env/PATH resolution this used to
+	// call directly never found ffmpeg there at all), falling back to
+	// recorder.ResolveFFmpeg's env/PATH-only resolution when api.CoreManager
+	// itself is unavailable (nil — never happens via sdk.Run, only a
+	// defensive guard for e.g. a future test harness) since
+	// ResolveFFmpegSDK's own fallback already covers every other failure
+	// (RPC error, empty result).
+	var ff *recorder.FFmpeg
+	if api.CoreManager != nil {
+		ff = recorder.ResolveFFmpegSDK(api.CoreManager, logger)
+	} else {
+		logger.Warn("nvr-local: no CoreManager available; falling back to env/PATH ffmpeg resolution")
+		ff = recorder.ResolveFFmpeg()
+	}
+
 	// Open the embedded SQLite database against the host-provided storage
 	// directory (api.StoragePath — see plugin_api.go: "absolute path to the
 	// plugin's writable storage directory"). A failure here is logged, not
@@ -356,11 +376,11 @@ func NewPlugin(logger *sdk.Logger, api *sdk.PluginAPI, storage *sdk.DeviceStorag
 		// Wires detectionEventIngester's thumbnail generation (Task 11,
 		// events_ingest.go's generateThumbnail): p.segments finds each
 		// event's covering recorded segment, p.events persists the
-		// generated JPEG's path back onto the event row, and
-		// recorder.ResolveFFmpeg().Path() reuses the exact same
-		// CAMERAUI_FFMPEG_PATH/PATH-fallback resolution the recorder itself
-		// uses (see ffmpeg.go) rather than duplicating it here.
-		p.thumbs = media.NewGenerator(api.StoragePath, recorder.ResolveFFmpeg().Path(), p.segments, p.events, p.Logger)
+		// generated JPEG's path back onto the event row, and ff.Path()
+		// (resolved above, once, via the SDK when available) is the same
+		// ffmpeg binary every recorder execs — this Generator never resolves
+		// its own path (see media/thumbs.go's package doc comment).
+		p.thumbs = media.NewGenerator(api.StoragePath, ff.Path(), p.segments, p.events, p.Logger)
 
 		// Wires StartAll/Add/Remove (Task ORCH, recorder/manager.go) with
 		// what they need to actually build and start a live *recorder.
@@ -375,7 +395,6 @@ func NewPlugin(logger *sdk.Logger, api *sdk.PluginAPI, storage *sdk.DeviceStorag
 		// ConfigureRetention is: only reached when db opened successfully,
 		// since a real Recorder would otherwise index segments into a nil
 		// p.segments.
-		ff := recorder.ResolveFFmpeg()
 		p.recorder.ConfigureRecording(api.StoragePath, 0, p.newRecorderFactory(ff))
 		// Wires RecorderManager's own lifecycle logging (recorder
 		// started/stopped/restarted, StartAll summaries, start failures —
