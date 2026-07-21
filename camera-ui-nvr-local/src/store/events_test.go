@@ -59,13 +59,52 @@ func TestEventStore_Query_HasDetectionsIsTypeBased(t *testing.T) {
 		t.Fatalf("hasDetections=true expected only person1 (object type, empty Segments), got %d events", len(got.Events))
 	}
 
+	// hasDetections=false is the frontend's "detections-only toggle OFF"
+	// signal, i.e. NO constraint — not "only trigger-only events". It must
+	// return every event (object AND motion/audio). The recordings label
+	// filter relies on this: it sends hasDetections:false alongside an
+	// explicit types:[...] (see TestEventStore_Query_LabelFilterWithHasDetectionsFalse).
 	no := false
-	trigOnly, err := events.Query(nil, GetEventsOptions{HasDetections: &no})
+	all, err := events.Query(nil, GetEventsOptions{HasDetections: &no})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(trigOnly.Events) != 2 {
-		t.Fatalf("hasDetections=false expected 2 trigger-only events (motion, audio), got %d", len(trigOnly.Events))
+	if len(all.Events) != 3 {
+		t.Fatalf("hasDetections=false is a no-op constraint; expected all 3 events, got %d", len(all.Events))
+	}
+}
+
+// TestEventStore_Query_LabelFilterWithHasDetectionsFalse reproduces the exact
+// shape the frontend Recordings page sends when a user picks a label chip
+// (observed live: {"types":["person"],"hasDetections":false,"minConfidence":
+// 0.5,"hasRecording":true,"state":"ended"}). The person event, which HAS
+// detections, must be returned: hasDetections:false there means "don't also
+// require the generic detections flag", not "exclude events with detections".
+// Before the fix, our filter read false as a strict equality and dropped
+// every person/vehicle/animal event whenever a label chip was selected.
+func TestEventStore_Query_LabelFilterWithHasDetectionsFalse(t *testing.T) {
+	events := openTestEventStore(t)
+	if err := events.Upsert([]DetectionEvent{
+		newTestEvent("motion1", "cam", 1000, 0.9, "ended", "motion"),
+		newTestEvent("person1", "cam", 2000, 0.9, "ended", "person"),
+		newTestEvent("vehicle1", "cam", 3000, 0.9, "ended", "vehicle"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	no := false
+	minConf := 0.5
+	got, err := events.Query(nil, GetEventsOptions{
+		Types:         []string{"person"},
+		HasDetections: &no,
+		MinConfidence: &minConf,
+		State:         "ended",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Events) != 1 || got.Events[0].ID != "person1" {
+		t.Fatalf("label filter types=[person] hasDetections=false expected only person1, got %d events", len(got.Events))
 	}
 }
 

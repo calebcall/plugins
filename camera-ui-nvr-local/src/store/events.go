@@ -679,7 +679,17 @@ func matchesFilters(ev DetectionEvent, opts GetEventsOptions) bool {
 			return false
 		}
 	}
-	if opts.HasDetections != nil && EventHasDetections(ev) != *opts.HasDetections {
+	// hasDetections is a two-state control from the frontend, NOT a strict
+	// tri-state equality:
+	//   true  -> restrict to object-detection events (person/vehicle/…);
+	//   false -> the "detections-only" toggle is OFF, i.e. NO constraint.
+	// The recordings label filter pairs hasDetections:false with an explicit
+	// types:[...] (e.g. {"types":["person"],"hasDetections":false,...}) —
+	// there "false" means "don't also require the generic detections flag",
+	// not "exclude events that have detections". Interpreting false as an
+	// equality wrongly dropped every person/vehicle/animal event the moment a
+	// user picked a type chip, so only filter when hasDetections is true.
+	if opts.HasDetections != nil && *opts.HasDetections && !EventHasDetections(ev) {
 		return false
 	}
 	if opts.Search != "" && !matchesSearch(ev, opts.Search) {
