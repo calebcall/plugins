@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="./logo.png" alt="NVR (Local)" width="120" />
-</p>
-
 <h1 align="center">NVR (Local)</h1>
 
 <p align="center">
