@@ -177,6 +177,18 @@ type RecorderHandle interface {
 // asserted on directly.
 type RecorderFactory func(RecorderConfig) RecorderHandle
 
+// activeOutputDirsProvider is an optional capability a RecorderHandle may
+// implement (checked via a type assertion in RecorderManager.
+// ActiveOutputDirs, below, so a RecorderHandle that doesn't — e.g. every
+// fake used by this package's own orchestration tests — simply contributes
+// nothing, rather than being required to implement a method it has no
+// meaningful answer for). The real *Recorder satisfies it directly
+// (recorder.go's ActiveOutputDirs); production's recorderHandleWithRegistry
+// wrapper (plugin.go) forwards to it.
+type activeOutputDirsProvider interface {
+	ActiveOutputDirs() []string
+}
+
 // defaultSegmentSeconds is the ffmpeg segment duration (RecorderConfig.
 // SegmentSeconds) ConfigureRecording applies when its caller doesn't specify
 // one (segmentSeconds <= 0). A minute is short enough that a given segment's
@@ -456,6 +468,31 @@ func (m *RecorderManager) IsActive(cameraID string) bool {
 	defer m.mu.RUnlock()
 	_, ok := m.active[cameraID]
 	return ok
+}
+
+// ActiveOutputDirs returns the union of every currently-active
+// RecorderHandle's own ActiveOutputDirs() (handles that don't implement
+// activeOutputDirsProvider — every fake in this package's own tests, plus
+// any future RecorderHandle that never wires it up — simply contribute
+// nothing, not an error). Called fresh by RunRetentionOnce on every
+// retention pass (never cached), so it always reflects whichever
+// directories are being written to RIGHT NOW: retention's orphan sweep
+// (recorder/retention.go, sweepOrphanFiles) excludes every one of them
+// entirely, regardless of a file's mtime — the defense against a
+// stalled-but-still-open segment (e.g. an RTSP source hang while ffmpeg
+// still holds the file open) being misclassified as orphaned by the
+// mtime>grace heuristic alone. Always non-nil.
+func (m *RecorderManager) ActiveOutputDirs() []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	dirs := make([]string, 0, len(m.active))
+	for _, handle := range m.active {
+		if provider, ok := handle.(activeOutputDirsProvider); ok {
+			dirs = append(dirs, provider.ActiveOutputDirs()...)
+		}
+	}
+	return dirs
 }
 
 func (m *RecorderManager) logf(format string, args ...any) {

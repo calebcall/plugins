@@ -631,6 +631,16 @@ func (h recorderHandleWithRegistry) Stop() error {
 	return h.rec.Stop()
 }
 
+// ActiveOutputDirs forwards to h.rec's own ActiveOutputDirs — satisfying
+// recorder.RecorderManager's (unexported) activeOutputDirsProvider
+// capability so RunRetentionOnce's orphan sweep (recorder/retention.go)
+// learns which directories this camera's real *recorder.Recorder is
+// currently writing segments into, the same as if RecorderManager held
+// *recorder.Recorder directly instead of this wrapper.
+func (h recorderHandleWithRegistry) ActiveOutputDirs() []string {
+	return h.rec.ActiveOutputDirs()
+}
+
 // ConfigureCameras, OnCameraAdded and OnCameraReleased satisfy sdk.Plugin.
 // This is a Hub-role plugin (PluginRoleHub, contract.ts) that "attaches to
 // cameras owned by other plugins" — cameras are handed to it here via the

@@ -436,6 +436,77 @@ func TestSegmentStore_AllPaths_EmptyStoreReturnsNoError(t *testing.T) {
 	}
 }
 
+// TestSegmentStore_HasPath proves HasPath reports true for exactly the
+// path(s) with a row in the segments table, false for anything else — the
+// fresh, un-cached, point-in-time check retention's orphan sweep
+// (recorder/retention.go, sweepOrphanFiles) relies on to close its TOCTOU
+// window (see HasPath's own doc comment).
+func TestSegmentStore_HasPath(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	segs := NewSegmentStore(db)
+
+	if _, err := segs.Add(Segment{CameraID: "cam1", Role: "main", Path: "/rec/cam1/a.mp4", StartMs: 1000, EndMs: 2000}); err != nil {
+		t.Fatal(err)
+	}
+
+	has, err := segs.HasPath("/rec/cam1/a.mp4")
+	if err != nil {
+		t.Fatalf("HasPath: %v", err)
+	}
+	if !has {
+		t.Errorf("expected HasPath to report true for an indexed path")
+	}
+
+	has, err = segs.HasPath("/rec/cam1/never-indexed.mp4")
+	if err != nil {
+		t.Fatalf("HasPath: %v", err)
+	}
+	if has {
+		t.Errorf("expected HasPath to report false for a path with no row")
+	}
+}
+
+// TestSegmentStore_HasPath_ReflectsRowsAddedAfterAnEarlierListing proves
+// HasPath is a fresh, un-cached check: a path added AFTER an earlier
+// AllPaths() call already ran is reported as present by a subsequent
+// HasPath call — the exact freshness property retention's orphan sweep
+// depends on to avoid deleting a segment finalized/indexed after its own
+// AllPaths() snapshot was taken.
+func TestSegmentStore_HasPath_ReflectsRowsAddedAfterAnEarlierListing(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	segs := NewSegmentStore(db)
+
+	before, err := segs.AllPaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(before) != 0 {
+		t.Fatalf("expected an empty initial listing, got %v", before)
+	}
+
+	if _, err := segs.Add(Segment{CameraID: "cam1", Role: "main", Path: "/rec/cam1/late.mp4", StartMs: 1000, EndMs: 2000}); err != nil {
+		t.Fatal(err)
+	}
+
+	has, err := segs.HasPath("/rec/cam1/late.mp4")
+	if err != nil {
+		t.Fatalf("HasPath: %v", err)
+	}
+	if !has {
+		t.Errorf("expected HasPath to see a row added after the earlier AllPaths() snapshot")
+	}
+}
+
 // TestSegmentStore_DistinctCameraIDs proves DistinctCameraIDs returns every
 // camera with at least one indexed segment, deduplicated and sorted, and an
 // empty (non-nil) slice for a store with no segments at all.

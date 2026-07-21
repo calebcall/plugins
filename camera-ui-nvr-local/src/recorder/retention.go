@@ -189,6 +189,17 @@ type retentionGC struct {
 	// TestStartRetention_RunsImmediatelyAtStartup.
 	afterImmediate func()
 
+	// afterOrphanSnapshot, if set, is called once per sweepOrphanFiles call,
+	// right after its knownPaths snapshot (segStore.AllPaths()) is taken but
+	// before the recordings-tree walk begins — a test-only synchronization
+	// hook (nil in production, same convention as afterTick/afterImmediate
+	// above) that lets a test deterministically simulate the exact TOCTOU
+	// race sweepOrphanFiles' fresh HasPath recheck exists to close: insert a
+	// segment row for a candidate file's path from here, after it's already
+	// missing from the snapshot, and prove the recheck still protects it.
+	// See TestRunRetentionOnce_OrphanSweep_TOCTOU_FreshlyIndexedFileSurvives.
+	afterOrphanSnapshot func()
+
 	// logf/warnf report retention GC activity: one summary line per
 	// RunRetentionOnce pass (usage vs quota, over/under cap) plus one line
 	// per eviction batch (segments/bytes removed, age-retention or
@@ -332,7 +343,7 @@ func (m *RecorderManager) RunRetentionOnce(nowMs int64) error {
 	// one, so freeing it first, not after, is what makes the quota's own
 	// pass see accurate usage. See sweepOrphanFiles' doc comment for what
 	// counts as an orphan and why the grace period exists.
-	orphanFiles, orphanBytes, orphanErr := gc.sweepOrphanFiles(nowMs)
+	orphanFiles, orphanBytes, orphanErr := gc.sweepOrphanFiles(nowMs, m.ActiveOutputDirs())
 	if orphanErr != nil {
 		errs = append(errs, fmt.Errorf("retention: orphan sweep: %w", orphanErr))
 	}
@@ -638,7 +649,35 @@ func (gc *retentionGC) enforceInstanceQuota(cameraIDs []string, quotaGB float64)
 // sweepOrphanFiles walks "<recordingsDir>/recordings" (recordingsDir being
 // gc.recordingsDir — see its doc comment) and deletes every *.mp4 file
 // under it that has NO row at all in gc.segStore's segments table AND whose
-// mtime is older than orphanGrace relative to nowMs.
+// mtime is older than orphanGrace relative to nowMs — with two additional
+// safety checks (both added after a review caught this method's first cut
+// as an unsafe, real-data-loss race) before any actual deletion:
+//
+//   - activeOutputDirs (RunRetentionOnce passes RecorderManager.
+//     ActiveOutputDirs(), computed fresh on every call) lists every directory
+//     a currently-running Recorder is writing segments into RIGHT NOW. A
+//     candidate file inside one of these is skipped unconditionally,
+//     regardless of mtime: this is what protects a stalled-but-still-open
+//     segment (e.g. an RTSP source hang lasting longer than orphanGrace,
+//     while ffmpeg still holds the file's fd open and simply isn't writing
+//     new bytes to it) from being misclassified as orphaned by the
+//     mtime>grace heuristic alone.
+//   - gc.segStore.HasPath is re-queried, fresh, IMMEDIATELY before deleting
+//     any file that survives every check above — never decided from the
+//     knownPaths snapshot taken at the top of this method. This closes a
+//     TOCTOU window a review found in this method's first cut: knownPaths is
+//     a point-in-time snapshot, but the walk that follows it can take long
+//     enough (a large recordings tree) that a segment can be finalized and
+//     indexed — by a recorder that crashed and was then restarted, the exact
+//     scenario this sweep exists to clean up after — AFTER the snapshot was
+//     taken but BEFORE the walk visits its file, while that file's mtime is
+//     already old enough to clear orphanGrace (it was written before the
+//     crash). Without this recheck, such a file would be deleted despite
+//     having a perfectly valid segment row by the time this method actually
+//     unlinks it — real, indexed footage lost. knownPaths remains a cheap
+//     first filter (skips the common case — most files ARE indexed — without
+//     a DB round-trip per file), but it is never, by itself, what decides a
+//     file is safe to delete.
 //
 // This is the Task 9 review bug fix: enforceInstanceQuota (and the age GC
 // above) only ever counts/evicts segments that ARE indexed — a recorder
@@ -655,18 +694,21 @@ func (gc *retentionGC) enforceInstanceQuota(cameraIDs []string, quotaGB float64)
 // recorder.go's watchSegments "skip the newest file" doc comment for the
 // same class of lag elsewhere in this plugin), is never deleted out from
 // under the recorder still writing it or about to index it. Only a file
-// both unindexed AND older than the grace window is treated as a genuine
-// orphan.
+// unindexed at the fresh recheck, older than the grace window, AND outside
+// every currently-active output directory is treated as a genuine orphan.
 //
 // Returns the count and total pre-removal size (bytes) of files actually
 // removed, for RunRetentionOnce's summary log line. A missing/unreadable
 // recordings directory, or gc.recordingsDir/gc.segStore left unset (""/nil
 // — see their own doc comments), is not an error: there is simply nothing
-// to sweep. Every other per-file error (a failed stat, a failed removal)
-// is collected and returned via errors.Join rather than aborting the walk,
-// so one stubborn file doesn't stop every other orphan in the same pass
-// from being reclaimed.
-func (gc *retentionGC) sweepOrphanFiles(nowMs int64) (removedFiles int, removedBytes int64, err error) {
+// to sweep. Every other per-file error (a failed stat, a failed HasPath
+// recheck, a failed removal) is collected and returned via errors.Join
+// rather than aborting the walk, so one stubborn file doesn't stop every
+// other orphan in the same pass from being reclaimed — but, critically, any
+// such error skips (never deletes) the file it occurred on: an error from
+// the fresh HasPath recheck must never be treated as "so assume it's still
+// an orphan".
+func (gc *retentionGC) sweepOrphanFiles(nowMs int64, activeOutputDirs []string) (removedFiles int, removedBytes int64, err error) {
 	if gc.recordingsDir == "" || gc.segStore == nil {
 		return 0, 0, nil
 	}
@@ -683,6 +725,22 @@ func (gc *retentionGC) sweepOrphanFiles(nowMs int64) (removedFiles int, removedB
 	known := make(map[string]struct{}, len(knownPaths))
 	for _, p := range knownPaths {
 		known[normalizeSegmentPath(p)] = struct{}{}
+	}
+
+	// afterOrphanSnapshot, if set (test-only, nil in production — the same
+	// synchronization-hook convention as afterTick/afterImmediate above), is
+	// called once here, right after the knownPaths snapshot above but before
+	// the walk begins — letting a test deterministically simulate the exact
+	// TOCTOU race this method's fresh HasPath recheck (below) closes: insert
+	// a segment row for a candidate file's path AFTER it's already missing
+	// from knownPaths, and prove the recheck still catches it.
+	if gc.afterOrphanSnapshot != nil {
+		gc.afterOrphanSnapshot()
+	}
+
+	activeDirs := make(map[string]struct{}, len(activeOutputDirs))
+	for _, d := range activeOutputDirs {
+		activeDirs[normalizeSegmentPath(d)] = struct{}{}
 	}
 
 	cutoff := time.UnixMilli(nowMs).Add(-orphanGrace)
@@ -705,6 +763,13 @@ func (gc *retentionGC) sweepOrphanFiles(nowMs int64) (removedFiles int, removedB
 		if _, ok := known[normalizeSegmentPath(path)]; ok {
 			return nil
 		}
+		if _, ok := activeDirs[normalizeSegmentPath(filepath.Dir(path))]; ok {
+			// A currently-running recorder owns this directory right now —
+			// never touch anything in it, regardless of mtime (see this
+			// method's own doc comment on the stalled-open-segment case this
+			// protects against).
+			return nil
+		}
 
 		info, infoErr := d.Info()
 		if infoErr != nil {
@@ -715,6 +780,21 @@ func (gc *retentionGC) sweepOrphanFiles(nowMs int64) (removedFiles int, removedB
 			// Too recent to be confidently orphaned — may still be being
 			// written, or finished but not yet finalized/indexed. Leave it
 			// for a later pass.
+			return nil
+		}
+
+		// Fresh, point-in-time recheck — the TOCTOU fix. Never decide from
+		// the knownPaths snapshot above; a segment can have been finalized
+		// and indexed after that snapshot was taken but before the walk
+		// reached this file. An error here means "unknown whether it's still
+		// indexed" and must be treated exactly like "yes, it's indexed" —
+		// skip, don't delete.
+		indexed, hpErr := gc.segStore.HasPath(path)
+		if hpErr != nil {
+			errs = append(errs, fmt.Errorf("recheck segment path %s: %w", path, hpErr))
+			return nil
+		}
+		if indexed {
 			return nil
 		}
 

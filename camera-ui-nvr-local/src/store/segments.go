@@ -691,6 +691,45 @@ func (s *SegmentStore) AllPaths() ([]string, error) {
 	return paths, nil
 }
 
+// HasPath reports whether path has at least one row in the segments table
+// right now — a fresh, freshly-locked (s.db.Lock/Unlock), point-in-time
+// check, deliberately NOT served from any cached/snapshotted listing.
+//
+// This exists for retention's orphan sweep (recorder/retention.go,
+// sweepOrphanFiles) to call IMMEDIATELY before deleting a file its
+// AllPaths() snapshot classified as unindexed: that snapshot is taken once,
+// before a (potentially long, for a large recordings tree) filesystem walk,
+// so a segment can be finalized and indexed — by a recorder that crashed
+// and was then restarted, the exact case the sweep exists to clean up
+// after — AFTER the snapshot but BEFORE the walk reaches its file. Deciding
+// "still an orphan" from the stale snapshot alone in that window would
+// delete a file that, by the time it's actually removed, has a perfectly
+// valid segment row — real, indexed footage lost. HasPath closes that
+// window: the sweep must re-ask the store, not its earlier snapshot, right
+// before it acts.
+func (s *SegmentStore) HasPath(path string) (bool, error) {
+	s.db.Lock()
+	defer s.db.Unlock()
+
+	stmt, _, err := s.db.Conn().Prepare(`SELECT 1 FROM segments WHERE path = ? LIMIT 1`)
+	if err != nil {
+		return false, fmt.Errorf("store: prepare has path: %w", err)
+	}
+	defer stmt.Close()
+
+	if err := stmt.BindText(1, path); err != nil {
+		return false, err
+	}
+
+	if !stmt.Step() {
+		if err := stmt.Err(); err != nil {
+			return false, fmt.Errorf("store: scan has path: %w", err)
+		}
+		return false, nil
+	}
+	return true, nil
+}
+
 // pathsOlderThan returns the paths of the segments matching the same
 // predicate used by DeleteOlderThan's DELETE, so the two stay in sync.
 // Internal helper only called from DeleteOlderThan, which already holds

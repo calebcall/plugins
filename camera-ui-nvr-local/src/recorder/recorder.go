@@ -189,6 +189,24 @@ type Recorder struct {
 	events      eventWindowSet
 	retentionMu sync.Mutex
 
+	// activeDirsMu/activeDirs track the on-disk directory (or directories,
+	// one per currently-running role) THIS Recorder's ffmpeg process(es) are
+	// writing segments into right now — runOnce registers its role's outDir
+	// before starting ffmpeg and deregisters it once ffmpeg exits (whether
+	// cleanly or not; see the defer in runOnce). ActiveOutputDirs exposes a
+	// snapshot of this set so retention's orphan sweep
+	// (recorder/retention.go, sweepOrphanFiles) can exclude it entirely: a
+	// file in an active output directory is either mid-write or, in the
+	// stalled-RTSP-source case that motivated this, sitting with a stale
+	// mtime while ffmpeg still holds its fd open — the mtime>grace heuristic
+	// alone can't tell that apart from a genuine orphan, but "is this
+	// directory something a live recorder still owns" can. A separate small
+	// mutex (not r.mu) since this is read far more often (every retention
+	// pass) than r.mu's own state, and updated from runOnce's own goroutine,
+	// not Start/Stop's.
+	activeDirsMu sync.Mutex
+	activeDirs   map[string]int
+
 	mu      sync.Mutex
 	cancel  context.CancelFunc
 	running bool
@@ -381,6 +399,14 @@ func (r *Recorder) runOnce(ctx context.Context, role string) error {
 		return fmt.Errorf("create output dir %s: %w", outDir, err)
 	}
 
+	// Registered for the entire lifetime of this ffmpeg run (deregistered
+	// via the deferred call below once it exits, however it exits) — see
+	// activeDirs' own doc comment on why retention's orphan sweep needs to
+	// know this directory is currently owned by a live recorder, not just
+	// that it was recently written to.
+	r.registerActiveDir(outDir)
+	defer r.deregisterActiveDir(outDir)
+
 	args := r.ff.segmentArgs(url, outDir, r.cfg.SegmentSeconds, role)
 
 	// The watcher gets its own context, independent of ctx: it must still
@@ -421,6 +447,55 @@ func (r *Recorder) runOnce(ctx context.Context, role string) error {
 func (r *Recorder) outDir(role string, at time.Time) string {
 	at = at.UTC()
 	return filepath.Join(r.cfg.DataDir, "recordings", r.cfg.CameraID, at.Format("2006-01-02"), at.Format("15"), role)
+}
+
+// registerActiveDir/deregisterActiveDir mark dir as currently owned by a
+// live ffmpeg run (registerActiveDir, called once per runOnce before
+// starting ffmpeg) or no longer so (deregisterActiveDir, deferred in
+// runOnce so it always runs once that ffmpeg process exits, regardless of
+// why). A plain refcount (rather than a bool/set membership) so two
+// concurrent runs that happen to resolve to the same directory — not
+// expected given role is part of outDir's path, but cheap to make safe
+// anyway — never have the first one's deregister prematurely evict a
+// directory the second is still actively using.
+func (r *Recorder) registerActiveDir(dir string) {
+	r.activeDirsMu.Lock()
+	defer r.activeDirsMu.Unlock()
+	if r.activeDirs == nil {
+		r.activeDirs = make(map[string]int)
+	}
+	r.activeDirs[dir]++
+}
+
+func (r *Recorder) deregisterActiveDir(dir string) {
+	r.activeDirsMu.Lock()
+	defer r.activeDirsMu.Unlock()
+	if r.activeDirs[dir] <= 1 {
+		delete(r.activeDirs, dir)
+		return
+	}
+	r.activeDirs[dir]--
+}
+
+// ActiveOutputDirs returns a snapshot of every directory this Recorder is
+// currently writing segments into — one per role with a live ffmpeg run in
+// progress right now, empty when none are (not yet started, stopped, or
+// between a crashed run and its backoff-delayed restart). Satisfies
+// RecorderManager's (unexported) activeOutputDirsProvider interface
+// (manager.go), which RunRetentionOnce uses to build the exclusion set
+// retention's orphan sweep (recorder/retention.go, sweepOrphanFiles) never
+// deletes from, regardless of a file's mtime.
+func (r *Recorder) ActiveOutputDirs() []string {
+	r.activeDirsMu.Lock()
+	defer r.activeDirsMu.Unlock()
+	if len(r.activeDirs) == 0 {
+		return nil
+	}
+	dirs := make([]string, 0, len(r.activeDirs))
+	for dir := range r.activeDirs {
+		dirs = append(dirs, dir)
+	}
+	return dirs
 }
 
 // watchSegments polls outDir every r.pollInterval, indexing every *.mp4 file

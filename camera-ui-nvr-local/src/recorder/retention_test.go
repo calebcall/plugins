@@ -1,6 +1,7 @@
 package recorder
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -432,6 +433,105 @@ func TestRunRetentionOnce_OrphanSweep_NoOpWhenRecordingsDirUnset(t *testing.T) {
 		t.Fatalf("expected nil error with recordingsDir unset, got %v", err)
 	}
 }
+
+// TestRunRetentionOnce_OrphanSweep_TOCTOU_FreshlyIndexedFileSurvives is the
+// CRITICAL data-loss regression test a review caught in this sweep's first
+// cut: knownPaths (segStore.AllPaths()) is a point-in-time snapshot taken
+// once, before the filesystem walk — a segment can be finalized and indexed
+// (the crash-then-restart-then-reindex case the grace period exists to
+// protect) AFTER that snapshot but BEFORE the walk visits its file, while
+// its mtime is already old enough to clear orphanGrace (it was written
+// before the crash). Using gc.afterOrphanSnapshot (a test-only hook, see its
+// doc comment) to insert the segment row for candidate.mp4's path exactly
+// in that window — after the snapshot, before the walk — simulates this
+// race deterministically. The fix (a fresh, unconditional
+// segStore.HasPath(path) recheck immediately before the delete decision,
+// never trusting the stale snapshot) must see the row and leave the file
+// alone.
+func TestRunRetentionOnce_OrphanSweep_TOCTOU_FreshlyIndexedFileSurvives(t *testing.T) {
+	recordingsDir := t.TempDir()
+	_, segStore, eventStore := openRetentionStores(t)
+
+	now := time.Date(2024, 6, 15, 0, 0, 0, 0, time.UTC).UnixMilli()
+
+	m := NewRecorderManager()
+	if err := m.Configure([]ManagedCamera{newRetentionCamera("cam1", 365)}); err != nil {
+		t.Fatal(err)
+	}
+	m.ConfigureRetention(segStore, eventStore, recordingsDir, nil)
+
+	// Absent from the AllPaths() snapshot at the moment it's taken (no
+	// segment row exists yet) — mtime is old enough to clear orphanGrace, the
+	// exact shape of a segment written before a crash and only indexed once
+	// the recorder restarts and catches up.
+	candidate := writeOrphanFile(t, recordingsDir, "cam1", "candidate.mp4", now-int64(30*time.Minute/time.Millisecond))
+
+	m.gc.afterOrphanSnapshot = func() {
+		if _, err := segStore.Add(store.Segment{
+			CameraID: "cam1", Role: "main", Path: candidate,
+			StartMs: now - 40000, EndMs: now - 30000, HasVideo: true, Codec: "h264",
+		}); err != nil {
+			t.Fatalf("simulate concurrent index of candidate.mp4: %v", err)
+		}
+	}
+
+	if err := m.RunRetentionOnce(now); err != nil {
+		t.Fatalf("RunRetentionOnce: %v", err)
+	}
+
+	if _, err := os.Stat(candidate); err != nil {
+		t.Errorf("expected the freshly-indexed file to survive (TOCTOU fix), stat err=%v", err)
+	}
+}
+
+// TestRunRetentionOnce_OrphanSweep_SkipsFilesUnderActiveRecorderOutputDir
+// proves a file under a directory RecorderManager.ActiveOutputDirs()
+// reports as currently owned by a live recorder is never swept, even when
+// its mtime is old enough to otherwise clear orphanGrace — the defense
+// against a stalled-but-still-open segment (e.g. an RTSP source hang lasting
+// longer than the grace period while ffmpeg still holds the file's fd open)
+// being misclassified as an orphan by the mtime heuristic alone.
+func TestRunRetentionOnce_OrphanSweep_SkipsFilesUnderActiveRecorderOutputDir(t *testing.T) {
+	recordingsDir := t.TempDir()
+	_, segStore, eventStore := openRetentionStores(t)
+
+	now := time.Date(2024, 6, 15, 0, 0, 0, 0, time.UTC).UnixMilli()
+
+	m := NewRecorderManager()
+	if err := m.Configure([]ManagedCamera{newRetentionCamera("cam1", 365)}); err != nil {
+		t.Fatal(err)
+	}
+	m.ConfigureRetention(segStore, eventStore, recordingsDir, nil)
+
+	activeDir := filepath.Join(recordingsDir, "recordings", "cam1")
+	m.ConfigureRecording(recordingsDir, 0, func(cfg RecorderConfig) RecorderHandle {
+		return fakeActiveDirHandle{dirs: []string{activeDir}}
+	})
+	if err := m.StartAll(); err != nil {
+		t.Fatalf("StartAll: %v", err)
+	}
+	defer m.StopAll()
+
+	stalled := writeOrphanFile(t, recordingsDir, "cam1", "stalled.mp4", now-int64(30*time.Minute/time.Millisecond))
+
+	if err := m.RunRetentionOnce(now); err != nil {
+		t.Fatalf("RunRetentionOnce: %v", err)
+	}
+
+	if _, err := os.Stat(stalled); err != nil {
+		t.Errorf("expected the file under the active recorder output dir to survive despite being past grace, stat err=%v", err)
+	}
+}
+
+// fakeActiveDirHandle is a RecorderHandle that also reports a fixed set of
+// "currently active" output directories, simulating a live *recorder.
+// Recorder for TestRunRetentionOnce_OrphanSweep_SkipsFilesUnderActiveRecorderOutputDir
+// without spawning a real ffmpeg process.
+type fakeActiveDirHandle struct{ dirs []string }
+
+func (f fakeActiveDirHandle) Start(context.Context) error { return nil }
+func (f fakeActiveDirHandle) Stop() error                 { return nil }
+func (f fakeActiveDirHandle) ActiveOutputDirs() []string  { return f.dirs }
 
 // ---------------------------------------------------------------------------
 // Disk-cap GC
