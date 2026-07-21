@@ -662,6 +662,35 @@ func (s *SegmentStore) DistinctCameraIDs() ([]string, error) {
 	return ids, nil
 }
 
+// AllPaths returns the path of every indexed segment row, across every
+// camera and role, in no particular order — the full "known to be indexed"
+// set the retention task's orphan-file sweep (recorder/retention.go) diffs
+// disk contents against: any *.mp4 file under the recordings tree whose
+// path isn't in this list has no segments-table row at all (e.g. one
+// written by a recorder that crashed/restarted before it could finalize
+// and index the segment), and is therefore a candidate for that sweep to
+// remove, once it's also old enough to be safely past "might still be
+// written to" (see sweepOrphanFiles' grace-period doc comment).
+func (s *SegmentStore) AllPaths() ([]string, error) {
+	s.db.Lock()
+	defer s.db.Unlock()
+
+	stmt, _, err := s.db.Conn().Prepare(`SELECT path FROM segments`)
+	if err != nil {
+		return nil, fmt.Errorf("store: prepare all paths: %w", err)
+	}
+	defer stmt.Close()
+
+	var paths []string
+	for stmt.Step() {
+		paths = append(paths, stmt.ColumnText(0))
+	}
+	if err := stmt.Err(); err != nil {
+		return nil, fmt.Errorf("store: scan all paths: %w", err)
+	}
+	return paths, nil
+}
+
 // pathsOlderThan returns the paths of the segments matching the same
 // predicate used by DeleteOlderThan's DELETE, so the two stay in sync.
 // Internal helper only called from DeleteOlderThan, which already holds

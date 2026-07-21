@@ -60,8 +60,11 @@ package recorder
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
+	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -95,6 +98,22 @@ const bytesPerGB = 1_000_000_000
 // segment/event set often enough to matter for cost.
 const defaultRetentionInterval = 10 * time.Minute
 
+// orphanGrace is how recently a *.mp4 file under
+// "<recordingsDir>/recordings" must have been modified for
+// sweepOrphanFiles to leave it alone even though it has no matching
+// segments-table row. A recorder writes a segment file, then finalizes and
+// indexes it into SegmentStore some short time later (see recorder.go's
+// watchSegments/sweepSegments) — a file that's simply mid-write, or
+// finished writing but not indexed yet, has no row for exactly that
+// ordinary reason and must never be mistaken for an orphan. 5 minutes is
+// comfortably more than 2x defaultSegmentSeconds (60s, manager.go) plus any
+// realistic indexing lag, while still being short enough that a genuinely
+// orphaned file (left behind by a crashed/restarted recorder that never
+// got to finalize/index it — this file's Task 9 review bug: such files sit
+// on disk, uncounted and undeleted, forever) is reclaimed within one
+// retention pass of aging out of that window.
+const orphanGrace = 5 * time.Minute
+
 // ticker abstracts the periodic tick source StartRetention's background loop
 // waits on. Production uses realTicker (wrapping time.Ticker); tests inject
 // a fake whose C() channel they control directly, so a tick can be fired
@@ -122,6 +141,18 @@ type retentionGC struct {
 	segStore   *store.SegmentStore
 	eventStore *store.EventStore
 	vectors    []store.VectorBackend
+
+	// recordingsDir is the resolved base directory new recordings are
+	// written under (plugin.go's p.recordingsDir — the SAME directory
+	// RecorderManager.ConfigureRecording's dataDir and Recorder.outDir's
+	// "<DataDir>/recordings/..." are rooted at), used by sweepOrphanFiles to
+	// find "<recordingsDir>/recordings" and walk it for *.mp4 files with no
+	// segments-table row. Empty (the zero value — every test that doesn't
+	// care about the orphan sweep, and any production build where db failed
+	// to open) makes sweepOrphanFiles an unconditional no-op rather than
+	// walking an unintended directory (e.g. the working directory) or
+	// erroring.
+	recordingsDir string
 
 	// quotaGB, if non-nil, returns the current instance-wide disk cap in
 	// gigabytes (0/negative means uncapped) — called fresh on every
@@ -194,22 +225,32 @@ type retentionGC struct {
 // to hold nothing for a given event is harmless). Passing no vectors at all
 // is valid — there is simply nothing to cascade to.
 //
+// recordingsDir is the resolved recordings base directory (plugin.go's
+// p.recordingsDir) sweepOrphanFiles walks "<recordingsDir>/recordings"
+// under — passed alongside segStore/eventStore (the other on-disk-truth
+// dependencies this GC pass needs) rather than as a trailing option, since
+// every real caller has one available at the same point it has the stores.
+// "" (production: only when store.Open already failed and this is never
+// reached; tests that don't exercise the orphan sweep) disables the sweep
+// entirely — see recordingsDir's own doc comment on retentionGC.
+//
 // Safe to call once, before RunRetentionOnce/StartRetention are ever
 // invoked; calling it again replaces the previous configuration (and, if a
 // ticker was running under the old one, orphans it — callers should
 // StopRetention first if reconfiguring a live manager, though production
 // wiring (plugin.go) only ever calls this once at startup).
-func (m *RecorderManager) ConfigureRetention(segStore *store.SegmentStore, eventStore *store.EventStore, quotaGB func() float64, vectors ...store.VectorBackend) {
+func (m *RecorderManager) ConfigureRetention(segStore *store.SegmentStore, eventStore *store.EventStore, recordingsDir string, quotaGB func() float64, vectors ...store.VectorBackend) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.gc = &retentionGC{
-		segStore:   segStore,
-		eventStore: eventStore,
-		quotaGB:    quotaGB,
-		vectors:    vectors,
-		newTicker:  newRealTicker,
-		logf:       m.logf,
-		warnf:      m.warnf,
+		segStore:      segStore,
+		eventStore:    eventStore,
+		recordingsDir: recordingsDir,
+		quotaGB:       quotaGB,
+		vectors:       vectors,
+		newTicker:     newRealTicker,
+		logf:          m.logf,
+		warnf:         m.warnf,
 	}
 }
 
@@ -281,6 +322,22 @@ func (m *RecorderManager) RunRetentionOnce(nowMs int64) error {
 	}
 	if ageRemovedSegs > 0 {
 		gc.logPass("retention: age gc evicted %d segment(s) (%.2f GB) past their camera's retention window", ageRemovedSegs, float64(ageRemovedBytes)/bytesPerGB)
+	}
+
+	// Orphan sweep, instance-wide: runs after age GC (whose file removals
+	// don't affect it) and before the disk-cap GC below, so bytes an orphan
+	// file's removal frees are already reflected in enforceInstanceQuota's
+	// own fresh fileSize() reads of whatever's left on disk — an orphan file
+	// counts toward "how much are we actually using" the same as an indexed
+	// one, so freeing it first, not after, is what makes the quota's own
+	// pass see accurate usage. See sweepOrphanFiles' doc comment for what
+	// counts as an orphan and why the grace period exists.
+	orphanFiles, orphanBytes, orphanErr := gc.sweepOrphanFiles(nowMs)
+	if orphanErr != nil {
+		errs = append(errs, fmt.Errorf("retention: orphan sweep: %w", orphanErr))
+	}
+	if orphanFiles > 0 {
+		gc.logPass("retention: orphan sweep removed %d untracked segment file(s) (%.2f GB) with no matching segment row", orphanFiles, float64(orphanBytes)/bytesPerGB)
 	}
 
 	if gc.quotaGB != nil {
@@ -576,6 +633,120 @@ func (gc *retentionGC) enforceInstanceQuota(cameraIDs []string, quotaGB float64)
 		gc.logPass("retention: disk-cap gc evicted %d segment(s) (%.2f GB) across %d camera(s) to reclaim quota", evictedSegs, float64(evictedBytes)/bytesPerGB, len(cutoffs))
 	}
 	return errors.Join(errs...)
+}
+
+// sweepOrphanFiles walks "<recordingsDir>/recordings" (recordingsDir being
+// gc.recordingsDir — see its doc comment) and deletes every *.mp4 file
+// under it that has NO row at all in gc.segStore's segments table AND whose
+// mtime is older than orphanGrace relative to nowMs.
+//
+// This is the Task 9 review bug fix: enforceInstanceQuota (and the age GC
+// above) only ever counts/evicts segments that ARE indexed — a recorder
+// that crashes or is restarted mid-segment can leave a finished (or
+// partially-written) .mp4 file on disk that never got finalized/indexed
+// into SegmentStore at all, so it's invisible to both the disk-cap
+// computation (actual disk usage silently exceeds the tracked/enforced
+// total) and every GC path that deletes by segment row. This sweep is the
+// only place such a file is ever found and removed.
+//
+// The grace period exists so a file that's simply mid-write right now, or
+// finished writing moments ago but hasn't been finalized/indexed yet (an
+// entirely normal, momentary state for the newest segment — see
+// recorder.go's watchSegments "skip the newest file" doc comment for the
+// same class of lag elsewhere in this plugin), is never deleted out from
+// under the recorder still writing it or about to index it. Only a file
+// both unindexed AND older than the grace window is treated as a genuine
+// orphan.
+//
+// Returns the count and total pre-removal size (bytes) of files actually
+// removed, for RunRetentionOnce's summary log line. A missing/unreadable
+// recordings directory, or gc.recordingsDir/gc.segStore left unset (""/nil
+// — see their own doc comments), is not an error: there is simply nothing
+// to sweep. Every other per-file error (a failed stat, a failed removal)
+// is collected and returned via errors.Join rather than aborting the walk,
+// so one stubborn file doesn't stop every other orphan in the same pass
+// from being reclaimed.
+func (gc *retentionGC) sweepOrphanFiles(nowMs int64) (removedFiles int, removedBytes int64, err error) {
+	if gc.recordingsDir == "" || gc.segStore == nil {
+		return 0, 0, nil
+	}
+
+	base := filepath.Join(gc.recordingsDir, "recordings")
+	if _, statErr := os.Stat(base); statErr != nil {
+		return 0, 0, nil
+	}
+
+	knownPaths, listErr := gc.segStore.AllPaths()
+	if listErr != nil {
+		return 0, 0, fmt.Errorf("list known segment paths: %w", listErr)
+	}
+	known := make(map[string]struct{}, len(knownPaths))
+	for _, p := range knownPaths {
+		known[normalizeSegmentPath(p)] = struct{}{}
+	}
+
+	cutoff := time.UnixMilli(nowMs).Add(-orphanGrace)
+
+	var errs []error
+	walkErr := filepath.WalkDir(base, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			// A permission error (or similar) on one entry shouldn't abort
+			// sweeping the rest of the tree — recorded and skipped, same
+			// tolerance as every other per-file error below.
+			errs = append(errs, walkErr)
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if !strings.EqualFold(filepath.Ext(path), ".mp4") {
+			return nil
+		}
+		if _, ok := known[normalizeSegmentPath(path)]; ok {
+			return nil
+		}
+
+		info, infoErr := d.Info()
+		if infoErr != nil {
+			errs = append(errs, infoErr)
+			return nil
+		}
+		if info.ModTime().After(cutoff) {
+			// Too recent to be confidently orphaned — may still be being
+			// written, or finished but not yet finalized/indexed. Leave it
+			// for a later pass.
+			return nil
+		}
+
+		size := info.Size()
+		if rmErr := removeFile(path); rmErr != nil {
+			errs = append(errs, rmErr)
+			return nil
+		}
+		removedFiles++
+		removedBytes += size
+		return nil
+	})
+	if walkErr != nil {
+		errs = append(errs, fmt.Errorf("walk recordings dir: %w", walkErr))
+	}
+
+	return removedFiles, removedBytes, errors.Join(errs...)
+}
+
+// normalizeSegmentPath resolves path to an absolute path for
+// sweepOrphanFiles' known-paths comparison, so a segments-table row stored
+// with (e.g.) a relative path still matches the absolute path
+// filepath.WalkDir hands the walk callback. Falls back to path unchanged if
+// it can't be resolved (e.g. an empty string) rather than erroring — worst
+// case, that row simply fails to suppress a match against a real, still-
+// indexed segment, which would surface as a spurious deletion to revisit if
+// ever observed, not a panic or an aborted sweep.
+func normalizeSegmentPath(path string) string {
+	if abs, err := filepath.Abs(path); err == nil {
+		return abs
+	}
+	return path
 }
 
 // fileSize returns path's size in bytes, or 0 if it can't be stat'd

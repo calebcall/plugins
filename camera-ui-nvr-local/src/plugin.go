@@ -492,7 +492,7 @@ func NewPlugin(logger *sdk.Logger, api *sdk.PluginAPI, storage *sdk.DeviceStorag
 		// call when db failed to open above: p.recorder.ConfigureRetention is
 		// simply never reached, so StartRetention below stays a no-op too
 		// (see its own doc comment).
-		p.recorder.ConfigureRetention(p.segments, p.events, p.nvrQuotaGB, db.ClipVectors, db.FaceVectors)
+		p.recorder.ConfigureRetention(p.segments, p.events, p.recordingsDir, p.nvrQuotaGB, db.ClipVectors, db.FaceVectors)
 
 		// Wires detectionEventIngester's thumbnail generation (Task 11,
 		// events_ingest.go's generateThumbnail): p.segments finds each
@@ -805,12 +805,29 @@ func (p *NVRPlugin) attachDetectionIngestion(cam *sdk.CameraDevice) {
 	if p.thumbs != nil {
 		thumbs = p.thumbs
 	}
+	// notifier (FIX C: object-detection push notifications) wraps
+	// p.API.NotificationManager — the SDK's Publish(*sdk.Notification) error
+	// accessor, confirmed in manager_notification.go — into the
+	// eventNotifier interface only when it's actually available: p.API is
+	// nil for any test that builds NVRPlugin directly rather than through
+	// NewPlugin/sdk.Run (see BasePlugin's own doc comment), and even a real
+	// *sdk.PluginAPI's NotificationManager field could in principle be left
+	// unset by a future SDK version, so both are guarded the same way
+	// thumbs above already is.
+	var notifier eventNotifier
+	if p.API != nil && p.API.NotificationManager != nil {
+		notifier = p.API.NotificationManager
+	}
 	// p.segments satisfies recordingCoverageChecker directly (CoversRange).
 	// Like thumbs above, it's only nil when store.Open failed in NewPlugin —
 	// attachDetectionIngestion already returned before this point in that
 	// case (the p.events nil guard above), so p.segments is always non-nil
 	// here; passed as-is (no interface-nil footgun like thumbs's typed-nil
 	// case, since *store.SegmentStore's methods are safe to reach here).
-	ingester := newDetectionEventIngester(p.events, &p.recorders, thumbs, p.segments, p.Logger)
+	// p.recorder (never nil — constructed alongside NVRPlugin itself)
+	// satisfies cameraNamer directly (recorder.RecorderManager.CameraName),
+	// so notify (events_ingest.go) can title a notification with a camera's
+	// real display name instead of falling back to its bare ID.
+	ingester := newDetectionEventIngester(p.events, &p.recorders, thumbs, p.segments, notifier, p.recorder, p.Logger)
 	p.detectionSubs.add(cam.ID(), cam.OnDetectionEvent(ingester.handle))
 }

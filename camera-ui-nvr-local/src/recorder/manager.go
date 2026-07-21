@@ -800,6 +800,23 @@ func (m *RecorderManager) Camera(id string) (*RecorderEntry, bool) {
 	return r, ok
 }
 
+// CameraName returns cameraID's display name — RecorderEntry.Name, itself
+// captured from ManagedCamera.Name() at the most recent Configure/Add call
+// for this camera — or ("", false) if this manager has no entry for it at
+// all (never assigned, or already Removed). Satisfies the parent package's
+// cameraNamer interface (events_ingest.go), which detectionEventIngester's
+// notify uses to title push notifications with a camera's human-readable
+// name (e.g. "Sideyard — Person") instead of falling back to its bare ID.
+func (m *RecorderManager) CameraName(cameraID string) (string, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	r, ok := m.recorders[cameraID]
+	if !ok {
+		return "", false
+	}
+	return r.Name, true
+}
+
 // ManagedCameraIDs returns the IDs of registered cameras whose recording
 // mode is not "off" — i.e. the cameras this instance is actually supposed to
 // be recording, as opposed to every camera merely assigned to the Hub role.

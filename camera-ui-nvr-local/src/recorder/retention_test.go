@@ -173,7 +173,7 @@ func TestRunRetentionOnce_AgeGC_DeletesOnlyExpiredAndCascades(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Configure: %v", err)
 	}
-	m.ConfigureRetention(segStore, eventStore, nil, db.ClipVectors, db.FaceVectors)
+	m.ConfigureRetention(segStore, eventStore, "", nil, db.ClipVectors, db.FaceVectors)
 
 	// cam1: one segment safely past its 1-day cutoff, one well within it.
 	oldSeg := addRetentionSegment(t, segStore, dir, "cam1", "main", cam1Cutoff-5000, cam1Cutoff-1000, 100)
@@ -268,7 +268,7 @@ func TestRunRetentionOnce_MissingSegmentFileToleratesGracefully(t *testing.T) {
 	if err := m.Configure([]ManagedCamera{newRetentionCamera("cam1", 1)}); err != nil {
 		t.Fatal(err)
 	}
-	m.ConfigureRetention(segStore, eventStore, nil)
+	m.ConfigureRetention(segStore, eventStore, "", nil)
 
 	seg := addRetentionSegment(t, segStore, dir, "cam1", "main", cutoff-5000, cutoff-1000, 100)
 	if err := os.Remove(seg.Path); err != nil {
@@ -285,6 +285,151 @@ func TestRunRetentionOnce_MissingSegmentFileToleratesGracefully(t *testing.T) {
 	}
 	if len(remaining) != 0 {
 		t.Errorf("expected the segment row to be removed despite its missing file, got %+v", remaining)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Orphan file sweep (Task 9 review fix: enforceInstanceQuota only ever
+// counted/evicted INDEXED segments — a crashed/restarted recorder can leave
+// a finished .mp4 on disk with no segments-table row at all, invisible to
+// both the disk-cap computation and every row-driven delete path, so actual
+// disk usage silently exceeds the tracked/enforced total).
+// ---------------------------------------------------------------------------
+
+// writeOrphanFile writes a *.mp4 file directly under
+// "<recordingsDir>/recordings/<cameraID>" (mirroring Recorder.outDir's own
+// "<DataDir>/recordings/<cameraId>/..." layout, recorder.go) with NO
+// corresponding segments-table row, then backdates its mtime to atMs via
+// os.Chtimes — so sweepOrphanFiles' grace-period check has a deterministic,
+// test-controlled age to compare against nowMs, independent of the real
+// wall-clock time the test happens to run at.
+func writeOrphanFile(t *testing.T, recordingsDir, cameraID, name string, atMs int64) string {
+	t.Helper()
+
+	camDir := filepath.Join(recordingsDir, "recordings", cameraID)
+	if err := os.MkdirAll(camDir, 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", camDir, err)
+	}
+	path := filepath.Join(camDir, name)
+	if err := os.WriteFile(path, make([]byte, 100), 0o644); err != nil {
+		t.Fatalf("write orphan file %s: %v", path, err)
+	}
+	at := time.UnixMilli(atMs)
+	if err := os.Chtimes(path, at, at); err != nil {
+		t.Fatalf("chtimes %s: %v", path, err)
+	}
+	return path
+}
+
+// TestRunRetentionOnce_OrphanSweep_RemovesOnlyOldUnindexedFiles is the FIX A
+// regression/RED-proof test: seeds a recordings tree with (a) a tracked
+// file that DOES have a matching segments-table row, (b) an old, unindexed
+// (orphaned) file well past orphanGrace, and (c) a very recent unindexed
+// file still within orphanGrace — and proves RunRetentionOnce removes only
+// (b), leaving (a) and (c) untouched.
+func TestRunRetentionOnce_OrphanSweep_RemovesOnlyOldUnindexedFiles(t *testing.T) {
+	recordingsDir := t.TempDir()
+	db, segStore, eventStore := openRetentionStores(t)
+
+	now := time.Date(2024, 6, 15, 0, 0, 0, 0, time.UTC).UnixMilli()
+
+	m := NewRecorderManager()
+	// retentionDays large enough that age GC never fires here — this test
+	// exercises only the orphan sweep.
+	if err := m.Configure([]ManagedCamera{newRetentionCamera("cam1", 365)}); err != nil {
+		t.Fatal(err)
+	}
+	m.ConfigureRetention(segStore, eventStore, recordingsDir, nil, db.ClipVectors, db.FaceVectors)
+
+	// (a) tracked: a real file with a matching segment row — must survive
+	// regardless of age or mtime.
+	trackedPath := filepath.Join(recordingsDir, "recordings", "cam1", "tracked.mp4")
+	if err := os.MkdirAll(filepath.Dir(trackedPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(trackedPath, make([]byte, 100), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := segStore.Add(store.Segment{CameraID: "cam1", Role: "main", Path: trackedPath, StartMs: now - 5000, EndMs: now - 4000, HasVideo: true, Codec: "h264"}); err != nil {
+		t.Fatalf("Add tracked segment: %v", err)
+	}
+
+	// (b) old orphan: no segment row, mtime well past orphanGrace — must be
+	// removed.
+	oldOrphan := writeOrphanFile(t, recordingsDir, "cam1", "orphan-old.mp4", now-int64(30*time.Minute/time.Millisecond))
+
+	// (c) recent orphan: no segment row, mtime within orphanGrace (written
+	// "just now" relative to nowMs) — must survive this pass (might still
+	// be being written or awaiting finalization/indexing).
+	recentOrphan := writeOrphanFile(t, recordingsDir, "cam1", "orphan-recent.mp4", now-int64(1*time.Minute/time.Millisecond))
+
+	if err := m.RunRetentionOnce(now); err != nil {
+		t.Fatalf("RunRetentionOnce: %v", err)
+	}
+
+	if _, err := os.Stat(trackedPath); err != nil {
+		t.Errorf("expected tracked (indexed) file to survive, stat err=%v", err)
+	}
+	if _, err := os.Stat(oldOrphan); !os.IsNotExist(err) {
+		t.Errorf("expected old orphan file %s to be removed, stat err=%v", oldOrphan, err)
+	}
+	if _, err := os.Stat(recentOrphan); err != nil {
+		t.Errorf("expected recent orphan file %s (within grace) to survive, stat err=%v", recentOrphan, err)
+	}
+}
+
+// TestRunRetentionOnce_OrphanSweep_LogsRemovalSummary proves an orphan-sweep
+// pass that actually removes something reports one summary line (count +
+// GB freed) via gc.logf, the same low-noise-logging convention the age/
+// disk-cap GC passes already established.
+func TestRunRetentionOnce_OrphanSweep_LogsRemovalSummary(t *testing.T) {
+	recordingsDir := t.TempDir()
+	_, segStore, eventStore := openRetentionStores(t)
+
+	now := time.Date(2024, 6, 15, 0, 0, 0, 0, time.UTC).UnixMilli()
+
+	m := NewRecorderManager()
+	if err := m.Configure([]ManagedCamera{newRetentionCamera("cam1", 365)}); err != nil {
+		t.Fatal(err)
+	}
+	m.ConfigureRetention(segStore, eventStore, recordingsDir, nil)
+
+	var logs []string
+	m.gc.logf = func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) }
+
+	writeOrphanFile(t, recordingsDir, "cam1", "orphan-old.mp4", now-int64(30*time.Minute/time.Millisecond))
+
+	if err := m.RunRetentionOnce(now); err != nil {
+		t.Fatalf("RunRetentionOnce: %v", err)
+	}
+
+	found := false
+	for _, l := range logs {
+		if strings.Contains(l, "orphan sweep") && strings.Contains(l, "1") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected a log line mentioning the orphan-sweep removal count, got %v", logs)
+	}
+}
+
+// TestRunRetentionOnce_OrphanSweep_NoOpWhenRecordingsDirUnset proves a
+// manager configured with recordingsDir == "" (e.g. db failed to open in
+// NewPlugin, or a test/config that never set one) never touches disk for
+// the orphan sweep at all — RunRetentionOnce must not error or panic.
+func TestRunRetentionOnce_OrphanSweep_NoOpWhenRecordingsDirUnset(t *testing.T) {
+	_, segStore, eventStore := openRetentionStores(t)
+	now := time.Date(2024, 6, 15, 0, 0, 0, 0, time.UTC).UnixMilli()
+
+	m := NewRecorderManager()
+	if err := m.Configure([]ManagedCamera{newRetentionCamera("cam1", 365)}); err != nil {
+		t.Fatal(err)
+	}
+	m.ConfigureRetention(segStore, eventStore, "", nil)
+
+	if err := m.RunRetentionOnce(now); err != nil {
+		t.Fatalf("expected nil error with recordingsDir unset, got %v", err)
 	}
 }
 
@@ -318,7 +463,7 @@ func TestRunRetentionOnce_DiskCapGC_DeletesOldestFirstAcrossCamerasUntilUnderCap
 	// against a 4500-byte cap: removing the 2 globally-oldest (2000 bytes)
 	// brings total usage to 4000, back under the cap.
 	quotaGB := 4500.0 / bytesPerGB
-	m.ConfigureRetention(segStore, eventStore, fixedQuota(quotaGB), db.ClipVectors, db.FaceVectors)
+	m.ConfigureRetention(segStore, eventStore, "", fixedQuota(quotaGB), db.ClipVectors, db.FaceVectors)
 
 	// All six segments are recent relative to "now" (well within the
 	// 365-day age cutoff, so age GC never touches them) — every timestamp
@@ -385,7 +530,7 @@ func TestRunRetentionOnce_DiskCapGC_NoOpWhenUnderQuota(t *testing.T) {
 		t.Fatal(err)
 	}
 	quotaGB := 10000.0 / bytesPerGB // well above the 2000 bytes seeded below
-	m.ConfigureRetention(segStore, eventStore, fixedQuota(quotaGB), db.ClipVectors, db.FaceVectors)
+	m.ConfigureRetention(segStore, eventStore, "", fixedQuota(quotaGB), db.ClipVectors, db.FaceVectors)
 
 	seg1 := addRetentionSegment(t, segStore, dir, "cam1", "main", now-5000, now-4500, 1000)
 	seg2 := addRetentionSegment(t, segStore, dir, "cam2", "main", now-5000, now-4500, 1000)
@@ -434,7 +579,7 @@ func TestStartRetention_TickTriggersRunRetentionOnce(t *testing.T) {
 	if err := m.Configure([]ManagedCamera{newRetentionCamera("cam1", 1)}); err != nil {
 		t.Fatal(err)
 	}
-	m.ConfigureRetention(segStore, eventStore, nil, db.ClipVectors, db.FaceVectors)
+	m.ConfigureRetention(segStore, eventStore, "", nil, db.ClipVectors, db.FaceVectors)
 
 	now := time.Date(2024, 6, 15, 0, 0, 0, 0, time.UTC).UnixMilli()
 	cutoff := now - 1*msPerDay
@@ -484,7 +629,7 @@ func TestStartRetention_NoOpWhenNotConfigured(t *testing.T) {
 func TestStartRetention_SecondStartIsNoop(t *testing.T) {
 	_, segStore, eventStore := openRetentionStores(t)
 	m := NewRecorderManager()
-	m.ConfigureRetention(segStore, eventStore, nil)
+	m.ConfigureRetention(segStore, eventStore, "", nil)
 
 	ft1 := newFakeTicker()
 	m.gc.newTicker = func(time.Duration) ticker { return ft1 }
@@ -516,7 +661,7 @@ func TestStartRetention_SecondStartIsNoop(t *testing.T) {
 func TestStopRetention_CancelsCleanlyWithoutLeaking(t *testing.T) {
 	_, segStore, eventStore := openRetentionStores(t)
 	m := NewRecorderManager()
-	m.ConfigureRetention(segStore, eventStore, nil)
+	m.ConfigureRetention(segStore, eventStore, "", nil)
 
 	ft := newFakeTicker()
 	m.gc.newTicker = func(time.Duration) ticker { return ft }
@@ -584,7 +729,7 @@ func TestStartRetention_RunsImmediatelyAtStartup(t *testing.T) {
 	if err := m.Configure([]ManagedCamera{newRetentionCamera("cam1", 1)}); err != nil {
 		t.Fatal(err)
 	}
-	m.ConfigureRetention(segStore, eventStore, nil)
+	m.ConfigureRetention(segStore, eventStore, "", nil)
 
 	seg := addRetentionSegment(t, segStore, dir, "cam1", "main", cutoff-5000, cutoff-1000, 100)
 
@@ -617,7 +762,7 @@ func TestStartRetention_RunsImmediatelyAtStartup(t *testing.T) {
 func TestStartRetention_StopImmediatelyAfterStartDoesNotHangOrPanic(t *testing.T) {
 	_, segStore, eventStore := openRetentionStores(t)
 	m := NewRecorderManager()
-	m.ConfigureRetention(segStore, eventStore, nil)
+	m.ConfigureRetention(segStore, eventStore, "", nil)
 
 	ft := newFakeTicker()
 	m.gc.newTicker = func(time.Duration) ticker { return ft }
@@ -654,7 +799,7 @@ func TestRunRetentionOnce_AgeGC_LogsEvictionSummary(t *testing.T) {
 	if err := m.Configure([]ManagedCamera{newRetentionCamera("cam1", 1)}); err != nil {
 		t.Fatal(err)
 	}
-	m.ConfigureRetention(segStore, eventStore, nil)
+	m.ConfigureRetention(segStore, eventStore, "", nil)
 
 	var logs []string
 	m.gc.logf = func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) }
@@ -692,7 +837,7 @@ func TestRunRetentionOnce_DiskCapGC_LogsUsageAndEvictionSummary(t *testing.T) {
 		t.Fatal(err)
 	}
 	quotaGB := 1500.0 / bytesPerGB
-	m.ConfigureRetention(segStore, eventStore, fixedQuota(quotaGB), db.ClipVectors, db.FaceVectors)
+	m.ConfigureRetention(segStore, eventStore, "", fixedQuota(quotaGB), db.ClipVectors, db.FaceVectors)
 
 	var logs []string
 	m.gc.logf = func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) }
@@ -738,7 +883,7 @@ func TestStartRetention_WarnsWhenScheduledPassErrors(t *testing.T) {
 	if err := m.Configure([]ManagedCamera{newRetentionCamera("cam1", 1)}); err != nil {
 		t.Fatal(err)
 	}
-	m.ConfigureRetention(segStore, eventStore, nil)
+	m.ConfigureRetention(segStore, eventStore, "", nil)
 
 	// Force RunRetentionOnce's age gc to fail on a file-removal error
 	// (rather than an already-missing file, which is tolerated): the

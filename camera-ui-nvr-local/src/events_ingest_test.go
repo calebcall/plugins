@@ -41,7 +41,7 @@ func (f *fakeEventStore) Upsert(events []store.DetectionEvent) error {
 // a synthetic detection event into the store unchanged.
 func TestDetectionEventIngester_Handle_UpsertsTheEvent(t *testing.T) {
 	fake := &fakeEventStore{}
-	ingester := newDetectionEventIngester(fake, nil, nil, nil, nil)
+	ingester := newDetectionEventIngester(fake, nil, nil, nil, nil, nil, nil)
 
 	event := sdk.DetectionEvent{
 		ID:        "evt-1",
@@ -68,7 +68,7 @@ func TestDetectionEventIngester_Handle_UpsertsTheEvent(t *testing.T) {
 // handler must not skip or coalesce them itself.
 func TestDetectionEventIngester_Handle_ReplacesOnUpdate(t *testing.T) {
 	fake := &fakeEventStore{}
-	ingester := newDetectionEventIngester(fake, nil, nil, nil, nil)
+	ingester := newDetectionEventIngester(fake, nil, nil, nil, nil, nil, nil)
 
 	ingester.handle(sdk.DetectionEventStart, sdk.DetectionEvent{
 		ID: "evt-1", CameraID: "cam1", State: sdk.DetectionEventStateActive, StartTime: 1000,
@@ -93,7 +93,7 @@ func TestDetectionEventIngester_Handle_ReplacesOnUpdate(t *testing.T) {
 // there's nowhere to log to either).
 func TestDetectionEventIngester_Handle_LogsAndSwallowsStoreErrors(t *testing.T) {
 	fake := &fakeEventStore{err: errors.New("boom")}
-	ingester := newDetectionEventIngester(fake, nil, nil, nil, nil)
+	ingester := newDetectionEventIngester(fake, nil, nil, nil, nil, nil, nil)
 
 	ingester.handle(sdk.DetectionEventStart, sdk.DetectionEvent{ID: "evt-1", CameraID: "cam1"})
 }
@@ -140,7 +140,7 @@ func (f *fakeRecorderLookup) RecorderFor(cameraID string) (eventRecorder, bool) 
 func TestDetectionEventIngester_Handle_CallsMarkEventOnRegisteredRecorder(t *testing.T) {
 	spy := &spyRecorder{}
 	lookup := &fakeRecorderLookup{recorders: map[string]eventRecorder{"cam1": spy}}
-	ingester := newDetectionEventIngester(&fakeEventStore{}, lookup, nil, nil, nil)
+	ingester := newDetectionEventIngester(&fakeEventStore{}, lookup, nil, nil, nil, nil, nil)
 
 	ingester.handle(sdk.DetectionEventEnd, sdk.DetectionEvent{
 		ID: "evt-1", CameraID: "cam1", StartTime: 1000, EndTime: 6000,
@@ -166,7 +166,7 @@ func TestDetectionEventIngester_Handle_CallsMarkEventOnRegisteredRecorder(t *tes
 func TestDetectionEventIngester_Handle_StartThenEndLifecycle_CallsMarkEventForBoth(t *testing.T) {
 	spy := &spyRecorder{}
 	lookup := &fakeRecorderLookup{recorders: map[string]eventRecorder{"cam1": spy}}
-	ingester := newDetectionEventIngester(&fakeEventStore{}, lookup, nil, nil, nil)
+	ingester := newDetectionEventIngester(&fakeEventStore{}, lookup, nil, nil, nil, nil, nil)
 
 	ingester.handle(sdk.DetectionEventStart, sdk.DetectionEvent{
 		ID: "evt-1", CameraID: "cam1", State: sdk.DetectionEventStateActive, StartTime: 1000,
@@ -192,7 +192,7 @@ func TestDetectionEventIngester_Handle_StartThenEndLifecycle_CallsMarkEventForBo
 // isn't in events mode — even though a lookup is configured.
 func TestDetectionEventIngester_Handle_SkipsMarkEventWhenNoRecorderRegistered(t *testing.T) {
 	lookup := &fakeRecorderLookup{recorders: map[string]eventRecorder{}}
-	ingester := newDetectionEventIngester(&fakeEventStore{}, lookup, nil, nil, nil)
+	ingester := newDetectionEventIngester(&fakeEventStore{}, lookup, nil, nil, nil, nil, nil)
 
 	ingester.handle(sdk.DetectionEventStart, sdk.DetectionEvent{
 		ID: "evt-1", CameraID: "cam-unregistered", StartTime: 1000,
@@ -206,7 +206,7 @@ func TestDetectionEventIngester_Handle_SkipsMarkEventWhenNoRecorderRegistered(t 
 // doesn't care about event-mode wiring, matching newDetectionEventIngester's
 // doc comment) without panicking.
 func TestDetectionEventIngester_Handle_SkipsMarkEventWhenLookupNil(t *testing.T) {
-	ingester := newDetectionEventIngester(&fakeEventStore{}, nil, nil, nil, nil)
+	ingester := newDetectionEventIngester(&fakeEventStore{}, nil, nil, nil, nil, nil, nil)
 	ingester.handle(sdk.DetectionEventStart, sdk.DetectionEvent{ID: "evt-1", CameraID: "cam1", StartTime: 1000})
 }
 
@@ -248,7 +248,7 @@ func (f *fakeCoverageChecker) CoversRange(cameraID string, startMs, endMs int64)
 func TestDetectionEventIngester_Handle_SetsHasRecordingWhenCovered(t *testing.T) {
 	fake := &fakeEventStore{}
 	coverage := &fakeCoverageChecker{covered: true}
-	ingester := newDetectionEventIngester(fake, nil, nil, coverage, nil)
+	ingester := newDetectionEventIngester(fake, nil, nil, coverage, nil, nil, nil)
 
 	ingester.handle(sdk.DetectionEventStart, sdk.DetectionEvent{
 		ID: "evt-1", CameraID: "cam1", StartTime: 1000,
@@ -268,7 +268,7 @@ func TestDetectionEventIngester_Handle_SetsHasRecordingWhenCovered(t *testing.T)
 func TestDetectionEventIngester_Handle_LeavesHasRecordingFalseWhenNotCovered(t *testing.T) {
 	fake := &fakeEventStore{}
 	coverage := &fakeCoverageChecker{covered: false}
-	ingester := newDetectionEventIngester(fake, nil, nil, coverage, nil)
+	ingester := newDetectionEventIngester(fake, nil, nil, coverage, nil, nil, nil)
 
 	ingester.handle(sdk.DetectionEventStart, sdk.DetectionEvent{
 		ID: "evt-1", CameraID: "cam1", StartTime: 1000,
@@ -289,7 +289,7 @@ func TestDetectionEventIngester_Handle_LeavesHasRecordingFalseWhenNotCovered(t *
 func TestDetectionEventIngester_Handle_RecomputesHasRecordingOnEndMessage(t *testing.T) {
 	fake := &fakeEventStore{}
 	coverage := &fakeCoverageChecker{covered: false}
-	ingester := newDetectionEventIngester(fake, nil, nil, coverage, nil)
+	ingester := newDetectionEventIngester(fake, nil, nil, coverage, nil, nil, nil)
 
 	ingester.handle(sdk.DetectionEventStart, sdk.DetectionEvent{
 		ID: "evt-1", CameraID: "cam1", StartTime: 1000,
@@ -326,7 +326,7 @@ func TestDetectionEventIngester_Handle_RecomputesHasRecordingOnEndMessage(t *tes
 // HasRecording value untouched rather than forcing it to false.
 func TestDetectionEventIngester_Handle_NilCoverageLeavesHasRecordingUnchanged(t *testing.T) {
 	fake := &fakeEventStore{}
-	ingester := newDetectionEventIngester(fake, nil, nil, nil, nil)
+	ingester := newDetectionEventIngester(fake, nil, nil, nil, nil, nil, nil)
 
 	ingester.handle(sdk.DetectionEventStart, sdk.DetectionEvent{
 		ID: "evt-1", CameraID: "cam1", StartTime: 1000, HasRecording: true,
@@ -344,7 +344,7 @@ func TestDetectionEventIngester_Handle_NilCoverageLeavesHasRecordingUnchanged(t 
 func TestDetectionEventIngester_Handle_CoverageErrorLeavesHasRecordingUnchanged(t *testing.T) {
 	fake := &fakeEventStore{}
 	coverage := &fakeCoverageChecker{coverageErr: errors.New("boom")}
-	ingester := newDetectionEventIngester(fake, nil, nil, coverage, nil)
+	ingester := newDetectionEventIngester(fake, nil, nil, coverage, nil, nil, nil)
 
 	ingester.handle(sdk.DetectionEventStart, sdk.DetectionEvent{
 		ID: "evt-1", CameraID: "cam1", StartTime: 1000, HasRecording: true,
@@ -367,7 +367,7 @@ func TestDetectionEventIngester_Handle_ActiveRecordingSetsHasRecordingWithoutCov
 	fake := &fakeEventStore{}
 	coverage := &fakeCoverageChecker{covered: false}
 	lookup := &fakeRecorderLookup{recorders: map[string]eventRecorder{"cam1": &spyRecorder{}}}
-	ingester := newDetectionEventIngester(fake, lookup, nil, coverage, nil)
+	ingester := newDetectionEventIngester(fake, lookup, nil, coverage, nil, nil, nil)
 
 	ingester.handle(sdk.DetectionEventEnd, sdk.DetectionEvent{
 		ID: "evt-1", CameraID: "cam1", State: sdk.DetectionEventStateEnded, StartTime: 1000, EndTime: 5000,
@@ -387,7 +387,7 @@ func TestDetectionEventIngester_Handle_NoActiveRecordingFallsBackToCoverage(t *t
 	fake := &fakeEventStore{}
 	coverage := &fakeCoverageChecker{covered: false}
 	lookup := &fakeRecorderLookup{recorders: map[string]eventRecorder{}}
-	ingester := newDetectionEventIngester(fake, lookup, nil, coverage, nil)
+	ingester := newDetectionEventIngester(fake, lookup, nil, coverage, nil, nil, nil)
 
 	ingester.handle(sdk.DetectionEventStart, sdk.DetectionEvent{
 		ID: "evt-1", CameraID: "cam1", StartTime: 1000,
@@ -418,7 +418,7 @@ func TestDetectionEventIngester_Handle_RealSegmentStore_LinksHasRecordingEndToEn
 		t.Fatalf("segments.Add: %v", err)
 	}
 
-	ingester := newDetectionEventIngester(p.events, nil, nil, p.segments, nil)
+	ingester := newDetectionEventIngester(p.events, nil, nil, p.segments, nil, nil, nil)
 
 	// Covered: cam1's start time (12_000) falls inside the indexed segment.
 	ingester.handle(sdk.DetectionEventStart, sdk.DetectionEvent{

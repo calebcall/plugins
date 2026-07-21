@@ -376,6 +376,66 @@ func TestSegmentStore_AllByCamera(t *testing.T) {
 	}
 }
 
+// TestSegmentStore_AllPaths proves AllPaths returns the path of every
+// indexed segment row, across every camera and role — the "known to be
+// indexed" set retention's orphan sweep (recorder/retention.go,
+// sweepOrphanFiles) diffs disk contents against.
+func TestSegmentStore_AllPaths(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	segs := NewSegmentStore(db)
+
+	want := map[string]bool{
+		"/rec/cam1/a.mp4": true,
+		"/rec/cam1/b.mp4": true,
+		"/rec/cam2/c.mp4": true,
+	}
+	for path := range want {
+		if _, err := segs.Add(Segment{CameraID: "cam1", Role: "main", Path: path, StartMs: 1000, EndMs: 2000}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := segs.AllPaths()
+	if err != nil {
+		t.Fatalf("AllPaths: %v", err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("expected %d paths, got %d: %v", len(want), len(got), got)
+	}
+	for _, p := range got {
+		if !want[p] {
+			t.Errorf("unexpected path %q returned by AllPaths", p)
+		}
+		delete(want, p)
+	}
+	if len(want) != 0 {
+		t.Errorf("AllPaths missing expected paths: %v", want)
+	}
+}
+
+// TestSegmentStore_AllPaths_EmptyStoreReturnsNoError proves AllPaths on a
+// store with no segment rows at all returns (nil, nil) rather than an error.
+func TestSegmentStore_AllPaths_EmptyStoreReturnsNoError(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	got, err := NewSegmentStore(db).AllPaths()
+	if err != nil {
+		t.Fatalf("AllPaths: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("expected no paths, got %v", got)
+	}
+}
+
 // TestSegmentStore_DistinctCameraIDs proves DistinctCameraIDs returns every
 // camera with at least one indexed segment, deduplicated and sorted, and an
 // empty (non-nil) slice for a store with no segments at all.

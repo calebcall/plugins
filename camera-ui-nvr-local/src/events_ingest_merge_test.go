@@ -20,7 +20,7 @@ import (
 // retains the person=0.72 detection.
 func TestDetectionEventIngester_Handle_AccumulatesDetectionsAcrossLifecycle(t *testing.T) {
 	fake := &fakeEventStore{}
-	ingester := newDetectionEventIngester(fake, nil, nil, nil, nil)
+	ingester := newDetectionEventIngester(fake, nil, nil, nil, nil, nil, nil)
 
 	base := sdk.DetectionEvent{ID: "evt-1", CameraID: "cam1", StartTime: 1000, LastUpdate: 1000}
 
@@ -161,7 +161,7 @@ func TestDetectionAccumulator_Merge_UnionsAttributesByTypeAndLabel(t *testing.T)
 // event's synthesized segment still carries it.
 func TestDetectionEventIngester_Handle_PreservesSegmentThumbnailAcrossLifecycle(t *testing.T) {
 	fake := &fakeEventStore{}
-	ingester := newDetectionEventIngester(fake, nil, nil, nil, nil)
+	ingester := newDetectionEventIngester(fake, nil, nil, nil, nil, nil, nil)
 
 	scene := []byte{0xFF, 0xD8, 0xFF, 0xD9} // stand-in JPEG bytes
 
@@ -282,7 +282,7 @@ func TestDetectionAccumulator_Merge_DoesNotGrowUnbounded(t *testing.T) {
 // calls.
 func TestDetectionAccumulator_Merge_ConcurrentHandleCalls(t *testing.T) {
 	fake := &fakeEventStore{}
-	ingester := newDetectionEventIngester(fake, nil, nil, nil, nil)
+	ingester := newDetectionEventIngester(fake, nil, nil, nil, nil, nil, nil)
 
 	var wg sync.WaitGroup
 	const goroutines = 50

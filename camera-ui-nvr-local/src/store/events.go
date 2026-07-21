@@ -162,7 +162,7 @@ func upsertOneEvent(stmt *sqlite3.Stmt, ev DetectionEvent) error {
 	if err := stmt.BindText(5, string(typesJSON)); err != nil {
 		return err
 	}
-	if err := stmt.BindText(6, primaryLabel(ev)); err != nil {
+	if err := stmt.BindText(6, PrimaryLabel(ev)); err != nil {
 		return err
 	}
 	if err := stmt.BindFloat(7, bestConfidence(ev)); err != nil {
@@ -194,21 +194,80 @@ func upsertOneEvent(stmt *sqlite3.Stmt, ev DetectionEvent) error {
 	return nil
 }
 
-// primaryLabel picks a best-effort single label for the event's indexed
-// `label` column (used only as a coarse hint; Query's Types/Triggers
-// filters decode the full raw JSON rather than relying on this column).
-// Prefers the first detection type, falling back to the first trigger's
-// label.
-func primaryLabel(ev DetectionEvent) string {
-	if len(ev.Types) > 0 {
-		return ev.Types[0]
+// PrimaryLabel picks a best-effort single label for the event's indexed
+// `label` column (used as a coarse hint for Query's own MinConfidence-style
+// SQL filters and, since detectionEventIngester (events_ingest.go) reuses it
+// for push-notification titles, the human-facing label a person sees for the
+// event) — Query's Types/Triggers filters themselves decode the full raw
+// JSON rather than relying on this column.
+//
+// Exported (was primaryLabel) specifically so events_ingest.go's
+// notification path computes the exact same label the stored/indexed event
+// carries, rather than duplicating (and risking drifting from) this
+// ranking.
+//
+// Ranked, in order:
+//
+//  1. The Label of whichever segment detection (ev.Segments[].Detections)
+//     has the highest Score, skipping any with an empty Label — the actual
+//     detected object (person/vehicle/animal/...), when one was reported.
+//  2. The first ev.Types entry that is NOT "motion", "audio", or "clip" —
+//     an object-detection type name, when no per-segment detection is
+//     available but Types still names the object. This is the fix for the
+//     bug PrimaryLabel replaces: ev.Types is alphabetically sorted (not
+//     lifecycle-ordered), so a person event carrying
+//     ["clip","motion","person"] previously returned Types[0] == "clip"
+//     unconditionally, never "person".
+//  3. The first non-empty trigger Label (ev.Triggers) — e.g. an audio
+//     classifier's own label ("doorbell"), for events with neither a
+//     segment detection nor a non-motion/audio/clip type.
+//  4. ev.Types[0], if Types is non-empty — the previous (buggy) behavior's
+//     fallback, kept as a last resort so a motion-only event still reports
+//     "motion" rather than "".
+//  5. "" — no Types, no Triggers, no Segments at all.
+func PrimaryLabel(ev DetectionEvent) string {
+	if label := bestDetectionLabel(ev); label != "" {
+		return label
+	}
+	for _, t := range ev.Types {
+		if t != "motion" && t != "audio" && t != "clip" {
+			return t
+		}
 	}
 	for _, t := range ev.Triggers {
 		if t.Label != "" {
 			return t.Label
 		}
 	}
+	if len(ev.Types) > 0 {
+		return ev.Types[0]
+	}
 	return ""
+}
+
+// bestDetectionLabel returns the Label of the highest-Score EventDetection
+// across every segment in ev.Segments, skipping any with an empty Label, or
+// "" if there is no such candidate at all. Ties keep whichever candidate was
+// seen first (stable, since ">" not ">=" only replaces on a strictly higher
+// score) — segments/detections carry no other tie-break signal worth
+// preferring one over another for this purpose.
+func bestDetectionLabel(ev DetectionEvent) string {
+	var bestLabel string
+	var bestScore float64
+	haveCandidate := false
+	for _, seg := range ev.Segments {
+		for _, d := range seg.Detections {
+			if d.Label == "" {
+				continue
+			}
+			if !haveCandidate || d.Score > bestScore {
+				bestLabel = d.Label
+				bestScore = d.Score
+				haveCandidate = true
+			}
+		}
+	}
+	return bestLabel
 }
 
 // bestConfidence returns the highest confidence score across the event's
@@ -620,7 +679,7 @@ func matchesFilters(ev DetectionEvent, opts GetEventsOptions) bool {
 			return false
 		}
 	}
-	if opts.HasDetections != nil && eventHasDetections(ev) != *opts.HasDetections {
+	if opts.HasDetections != nil && EventHasDetections(ev) != *opts.HasDetections {
 		return false
 	}
 	if opts.Search != "" && !matchesSearch(ev, opts.Search) {
@@ -669,7 +728,7 @@ func matchLogic(haystack, needles []string, logic string) bool {
 	return hasAny(haystack, needles)
 }
 
-// eventHasDetections reports whether the event represents an object
+// EventHasDetections reports whether the event represents an object
 // detection (person/vehicle/animal/package/face/etc.) as opposed to a
 // motion-only or audio-only trigger.
 //
@@ -682,7 +741,12 @@ func matchLogic(haystack, needles []string, logic string) bool {
 // and object events), so the previous segment-based check filtered out ALL
 // events under hasDetections:true — including the person/vehicle events the
 // Recordings/home views default-request — leaving those views empty.
-func eventHasDetections(ev DetectionEvent) bool {
+//
+// Exported (was eventHasDetections) so events_ingest.go's push-notification
+// gate (only notify on an actual object-detection event, never a
+// motion-only or audio-only one) reuses this exact predicate rather than a
+// second, potentially drifting copy of it.
+func EventHasDetections(ev DetectionEvent) bool {
 	for _, t := range ev.Types {
 		if t != "motion" && t != "audio" {
 			return true
