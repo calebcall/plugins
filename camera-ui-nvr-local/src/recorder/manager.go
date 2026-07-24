@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 
 	sdk "github.com/cameraui/sdk/go"
 )
@@ -149,6 +150,17 @@ type RecorderEntry struct {
 	// narrow/fall-back Config.Roles to what this camera's sources actually
 	// offer, well after the original ManagedCamera has gone out of scope.
 	SourceRoles []string
+
+	// Storage is the camera's own DeviceStorage (ManagedCamera.Storage()),
+	// captured at newRecorder time so the periodic reconcile pass
+	// (reconcile.go) can RE-READ the camera's recording config (mode/roles/…)
+	// long after the original ManagedCamera has gone out of scope — the same
+	// "capture what later passes need off the entry" rationale as StreamURL/
+	// SourceRoles above. This is what lets Reconcile pick up a recordingMode
+	// change (e.g. a freshly re-added camera flipped from the default "off" to
+	// "continuous" in the UI) with no SDK config-changed hook to trigger it.
+	// May be nil for entries built by tests that don't supply storage.
+	Storage CameraStorage
 }
 
 // RecorderHandle is the lifecycle surface RecorderManager needs from a live
@@ -264,6 +276,19 @@ type RecorderManager struct {
 	// instance is small).
 	camLocksMu sync.Mutex
 	camLocks   map[string]*sync.Mutex
+
+	// reconcile* back the periodic reconciliation ticker (reconcile.go:
+	// StartReconcile/StopReconcile/Reconcile). Same cancel-then-wait shape as
+	// retention's gc ticker, guarded by its own reconcileMu (not m.mu) so a
+	// running Reconcile pass — which itself takes m.mu/camLocks — never
+	// contends with Start/StopReconcile. reconcileNewTicker is nil in
+	// production (defaults to newRealTicker) and injectable by tests for
+	// deterministic ticking.
+	reconcileMu        sync.Mutex
+	reconcileRunning   bool
+	reconcileCancel    func()
+	reconcileDone      chan struct{}
+	reconcileNewTicker func(time.Duration) ticker
 
 	// log reports recorder lifecycle events (started/stopped/restarted,
 	// StartAll summaries, start failures) — see logf/warnf. nil (the zero
@@ -900,6 +925,7 @@ func newRecorder(cam ManagedCamera) *RecorderEntry {
 		Config:      readRecordingConfig(cam.Storage()),
 		StreamURL:   cam.StreamURL,
 		SourceRoles: cam.SourceRoles(),
+		Storage:     cam.Storage(),
 	}
 }
 

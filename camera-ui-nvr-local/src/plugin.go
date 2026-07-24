@@ -568,6 +568,16 @@ func NewPlugin(logger *sdk.Logger, api *sdk.PluginAPI, storage *sdk.DeviceStorag
 		if err := p.recorder.StartAll(); err != nil {
 			p.Logger.Error("nvr-local: start recorders failed:", err)
 		}
+		// StartReconcile (recorder/reconcile.go) runs a periodic pass that
+		// re-reads each managed camera's stored recording config and starts/
+		// stops recorders to match. This is what makes runtime camera changes
+		// take effect WITHOUT a plugin restart: a camera adopted at runtime
+		// (OnCameraAdded) whose recordingMode was still the default "off" at
+		// add time, then set to "continuous"/"events" in the UI, has no SDK
+		// config-changed hook to trigger its recorder — the reconcile pass
+		// picks it up on its next tick (also retries a camera whose stream
+		// wasn't ready when it was first added).
+		p.recorder.StartReconcile(0)
 	})
 	api.On(string(sdk.APIEventShutdown), func(...any) {
 		p.Logger.Log("nvr-local: shutdown")
@@ -576,6 +586,7 @@ func NewPlugin(logger *sdk.Logger, api *sdk.PluginAPI, storage *sdk.DeviceStorag
 		// goroutines) — deliberately before StopRetention/db.Close, so
 		// nothing is still indexing segments into p.segments/p.db by the
 		// time the database is closed.
+		p.recorder.StopReconcile()
 		p.recorder.StopAll()
 		p.recorder.StopRetention()
 		if p.db != nil {
